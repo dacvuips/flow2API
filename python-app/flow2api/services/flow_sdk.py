@@ -945,12 +945,30 @@ def parse_media_poll_result(data: dict) -> tuple[dict[str, str], bool, bool]:
     return completed, all_done, any_failed
 
 
+def _get_media_http_error(resp: dict, status: int) -> str:
+    data = resp.get("data")
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        msg = data["error"].get("message") or data["error"].get("status")
+        if msg:
+            return str(msg)
+    err = resp.get("error")
+    if err:
+        return str(err)
+    return f"HTTP_{status}"
+
+
 async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | None:
     """GET /v1/media/{id} — Lower Priority / workflow models return MP4 inline."""
     resp = await client.get_media(media_id)
     status = int(resp.get("status") or 0)
-    if status >= 400:
+    if status == 500:
         return None
+    if status >= 400:
+        raise FlowApiError(
+            _get_media_http_error(resp, status),
+            step="get_media",
+            raw=resp,
+        )
     payload = resp.get("data") or resp
     if isinstance(payload, dict) and "video" not in payload and isinstance(payload.get("data"), dict):
         payload = payload["data"]
