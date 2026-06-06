@@ -1,0 +1,130 @@
+# Flow2API — Python (cài đặt từ source)
+
+Ứng dụng Python thay thế `Flow2API-Agent.exe`, tương thích **Chrome Extension Bridge** và **Dashboard** có sẵn trong repo.
+
+## Kiến trúc (phân tích từ source hiện tại)
+
+```mermaid
+flowchart LR
+  subgraph client [Client / Cloudflare]
+    CURL[curl / Python client]
+    CF[Zero Trust domain]
+  end
+  subgraph agent [Flow2API Agent Python]
+    HTTP[FastAPI :1994]
+    WS[WebSocket :1609]
+    W[Worker queue]
+    SDK[flow_sdk]
+    FC[flow_client]
+  end
+  subgraph browser [Chrome]
+    EXT[Extension Bridge]
+    FLOW[labs.google Flow]
+  end
+  CURL --> CF --> HTTP
+  HTTP --> W --> SDK --> FC
+  FC --> WS --> EXT
+  EXT --> FLOW
+  EXT -->|POST /api/ext/callback| HTTP
+```
+
+| Thành phần | Vai trò |
+|-----------|---------|
+| **Extension** (`extension/`) | Bắt Bearer `ya29.*`, giải reCAPTCHA, proxy `aisandbox-pa.googleapis.com` |
+| **Agent HTTP** | API công khai: `POST/GET /api/requests`, health, admin keys |
+| **Agent WS** `ws://127.0.0.1:1609` | Extension kết nối, nhận `api_request` / `trpc_request` |
+| **Callback** `POST /api/ext/callback` | Extension trả kết quả (header `X-Callback-Secret`) |
+| **Worker** | Xử lý hàng đợi: `gen_image`, `gen_text_video`, `gen_video`, … |
+| **Dashboard** (`frontend/dashboard.html`) | UI Generate / Tasks / API Builder |
+| **Admin** `/admin` | Tạo API key `f2api_...` |
+
+### Cổng mặc định
+
+| Dịch vụ | Port | Ghi chú |
+|---------|------|---------|
+| HTTP API + Dashboard | **1994** | Extension manifest trỏ `1994` |
+| WebSocket extension | **1609** | `AGENT_WS_URL` trong `extension/background.js` |
+
+Nếu bạn muốn **1993** (như ví dụ curl), đặt biến môi trường và cập nhật extension:
+
+```powershell
+set FLOW2API_HTTP_PORT=1993
+```
+
+Sửa `extension/background.js`: `CALLBACK_URL` → `http://127.0.0.1:1993/api/ext/callback` và `manifest.json` host_permissions.
+
+## Cài đặt (Windows)
+
+1. Cài [Python 3.11+](https://www.python.org/downloads/)
+2. Mở Chrome → `chrome://extensions` → Load unpacked → chọn thư mục `extension/`
+3. Đăng nhập [Google Flow](https://labs.google/fx/tools/flow) (để extension bắt token)
+4. Trong thư mục `python-app`:
+
+```bat
+install.bat
+run.bat
+```
+
+5. Tạo API key: http://127.0.0.1:1994/admin (mặc định `admin` / `admin`)
+6. Mở dashboard: http://127.0.0.1:1994/
+
+## Gọi API (giống API Builder trên UI)
+
+### Tạo ảnh
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"type\":\"gen_image\",\"params\":{\"prompt\":\"A cinematic fashion photo, realistic lighting\",\"aspect_ratio\":\"16:9\",\"image_model\":\"NANO_BANANA_PRO\",\"variant_count\":1}}"
+```
+
+### Kiểm tra trạng thái
+
+```bash
+curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/REQUEST_ID"
+```
+
+### Python client
+
+```python
+from client.flow2api_client import Flow2APIClient
+
+client = Flow2APIClient("http://127.0.0.1:1994", "f2api_...")
+job = client.create_image(prompt="A cinematic fashion photo", aspect_ratio="16:9")
+print(client.wait(job["id"]))
+```
+
+Hoặc chạy: `python client/example_gen_image.py` (đặt `FLOW2API_TOKEN`).
+
+## Cloudflare Zero Trust
+
+Tunnel trỏ domain (ví dụ `flow2.aitipmart.site`) → `http://127.0.0.1:1994`. Client bên ngoài gọi:
+
+`https://flow2.aitipmart.site/api/requests` với Bearer `f2api_...`.
+
+## Biến môi trường
+
+| Biến | Mặc định |
+|------|----------|
+| `FLOW2API_HTTP_PORT` | `1994` |
+| `FLOW2API_HTTP_HOST` | `0.0.0.0` |
+| `FLOW2API_EXT_WS_PORT` | `1609` |
+| `FLOW2API_ADMIN_USER` | `admin` |
+| `FLOW2API_ADMIN_PASSWORD` | `admin` |
+| `FLOW2API_DB` | `python-app/storage/flow2api.db` |
+
+## So với bản `.exe`
+
+Source Python này được **reverse-engineer** từ `Flow2API-Agent.exe` + mở rộng từ [flowkit](https://github.com/crisng95/flowkit). Một số tính năng nâng cao của bản đóng gói (storyboard, vision classify, pipeline đầy đủ) có thể chưa có — lõi **gen_image / gen_text_video** và admin key đã được implement.
+
+## Cấu trúc thư mục
+
+```
+python-app/
+  flow2api/          # Agent FastAPI + worker + SDK
+  client/            # SDK gọi API từ script khác
+  run.py / run.bat
+  install.bat
+  requirements.txt
+```

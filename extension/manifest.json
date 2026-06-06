@@ -1,0 +1,71 @@
+{
+    "manifest_version":  3,
+    "name":  "Flow2API Bridge",
+    "version":  "0.0.5",
+    "description":  "Local bridge that proxies Flow2API agent requests to authenticated labs.google sessions.",
+    "permissions":  [
+                        "storage",
+                        "alarms",
+                        "tabs",
+                        "webRequest",
+                        "scripting",
+                        "declarativeNetRequest"
+                    ],
+    "host_permissions":  [
+                             "https://aisandbox-pa.googleapis.com/*",
+                             "https://labs.google/*",
+                             "http://127.0.0.1:1994/*",
+                             "http://localhost:1994/*"
+                         ],
+    "background":  {
+                       "service_worker":  "background.js"
+                   },
+    "action":  {
+                   "default_title":  "Flow2API Bridge",
+                   "default_popup":  "popup.html",
+                   "default_icon":  {
+                                        "16":  "icons/icon16.png",
+                                        "32":  "icons/icon32.png",
+                                        "48":  "icons/icon48.png",
+                                        "128":  "icons/icon128.png"
+                                    }
+               },
+    "content_scripts":  [
+                            {
+                                "matches":  [
+                                                "https://labs.google/fx/tools/flow*",
+                                                "https://labs.google/fx/*/tools/flow*"
+                                            ],
+                                "js":  [
+                                           "content.js"
+                                       ],
+                                "run_at":  "document_start"
+                            }
+                        ],
+    "web_accessible_resources":  [
+                                     {
+                                         "resources":  [
+                                                           "injected.js"
+                                                       ],
+                                         "matches":  [
+                                                         "https://labs.google/*"
+                                                     ]
+                                     }
+                                 ],
+    "declarative_net_request":  {
+                                    "rule_resources":  [
+                                                           {
+                                                               "id":  "flow2api_rules",
+                                                               "enabled":  true,
+                                                               "path":  "rules.json"
+                                                           }
+                                                       ]
+                                },
+    "icons":  {
+                  "16":  "icons/icon16.png",
+                  "32":  "icons/icon32.png",
+                  "48":  "icons/icon48.png",
+                  "128":  "icons/icon128.png"
+              }
+}
+

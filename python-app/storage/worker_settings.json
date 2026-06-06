@@ -1,0 +1,9 @@
+{
+    "max_concurrent": 3,
+  "task_stagger_s": 0.0,
+  "profile_default_max_concurrent": 1,
+  "profile_limits": {
+    "auto-68a32ed935": 3,
+    "de6b03a3-255f-4547-b68d-168277654ee2": 3
+  }
+}
