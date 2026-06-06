@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from flow2api.config import ACTIVITY_LIST_LIMIT
 from flow2api.services import activity
 from flow2api.services.result_media import with_base64_media
+from flow2api.services.task_counters import reset_counters
 from flow2api.services.task_retention import purge_old_requests
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
@@ -28,9 +29,15 @@ async def list_activity(
         await with_base64_media(activity.record_to_public(r), embed=False) for r in rows
     ]
     if summary:
-        stats = activity.summary_stats()
+        stats = activity.summary_stats(list_rows=rows)
         return {"items": items, "summary": stats}
     return {"items": items}
+
+
+@router.post("/kpi/reset")
+async def reset_kpi_counters(_: str = Depends(_bearer)):
+    counters = reset_counters()
+    return {"ok": True, "summary": counters.to_dict()}
 
 
 @router.get("/{request_id}")

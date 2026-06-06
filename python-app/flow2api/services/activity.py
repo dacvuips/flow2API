@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from flow2api.config import ACTIVITY_LIST_LIMIT
 from flow2api.db.models import RequestRecord, SessionLocal
+from flow2api.services import task_counters
 
 
 def create_request(
@@ -30,6 +31,7 @@ def create_request(
         db.add(row)
         db.commit()
         db.refresh(row)
+        task_counters.increment_total()
         return row
     finally:
         db.close()
@@ -41,6 +43,7 @@ def update_request(rid: str, **fields: Any) -> None:
         row = db.get(RequestRecord, rid)
         if not row:
             return
+        old_status = row.status
         for k, v in fields.items():
             if k == "result" and isinstance(v, dict):
                 row.result_json = json.dumps(v, ensure_ascii=False)
@@ -50,6 +53,8 @@ def update_request(rid: str, **fields: Any) -> None:
                 setattr(row, k, v)
         row.updated_at = datetime.utcnow()
         db.commit()
+        if "status" in fields:
+            task_counters.on_status_transition(old_status, row.status)
     finally:
         db.close()
 
@@ -114,17 +119,13 @@ def count_queued() -> int:
         db.close()
 
 
-def summary_stats() -> dict[str, int]:
-    db = SessionLocal()
-    try:
-        rows = db.query(RequestRecord).all()
-        total = len(rows)
-        done = sum(1 for r in rows if r.status == "done")
-        failed = sum(1 for r in rows if r.status.startswith("failed"))
-        running = sum(1 for r in rows if r.status in ("running", "queued"))
-        return {"total": total, "done": done, "failed": failed, "running": running}
-    finally:
-        db.close()
+def summary_stats(*, list_rows: list[RequestRecord] | None = None) -> dict[str, int]:
+    c = task_counters.get_counters()
+    if list_rows is not None:
+        running = sum(1 for r in list_rows if r.status in ("queued", "running"))
+    else:
+        running = count_queued() + count_running()
+    return {"total": c.total, "done": c.done, "failed": c.failed, "running": running}
 
 
 def record_to_public(row: RequestRecord) -> dict:

@@ -21,6 +21,7 @@ from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
 from flow2api.services.ws_server import run_ws_server
 from flow2api.config import ACTIVITY_LIST_LIMIT
+from flow2api.services.task_counters import bootstrap_from_requests_if_empty
 from flow2api.services.task_retention import purge_old_requests
 from flow2api.worker.processor import get_worker
 
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        bootstrap_from_requests_if_empty()
+    except Exception as exc:
+        logger.warning("task counter bootstrap failed: %s", exc)
     try:
         purged = purge_old_requests(ACTIVITY_LIST_LIMIT)
         if purged:
