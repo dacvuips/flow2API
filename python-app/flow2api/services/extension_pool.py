@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from flow2api.services.api_trace import record_api_call
 from flow2api.services.dashboard_events import events
+from flow2api.services.request_logs import append_request_log
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,14 @@ class ExtensionSession:
             timeout=timeout,
         )
         status = int(resp.get("status") or 0)
+        level = "error" if status >= 400 or resp.get("error") else "info"
+        append_request_log(
+            self.trace_request_id,
+            "trpc",
+            f"TRPC {path} → {status}",
+            level=level,
+            data={"url": url, "request_body": body, "response": resp.get("data") or resp},
+        )
         if status >= 400:
             raise RuntimeError(resp.get("error") or f"TRPC_{status}")
         return resp.get("data") or resp
@@ -321,6 +330,13 @@ class ExtensionPool:
             self._ws_to_profile[id(ws)] = pid
         await session.send_json({"type": "callback_secret", "secret": self.callback_secret})
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})
+        append_request_log(
+            None,
+            "profile",
+            f"Chrome profile connected: {session.display_name()}",
+            level="info",
+            data={"profile_id": pid},
+        )
         return session
 
     async def unregister_ws(self, ws: Any) -> None:
@@ -331,6 +347,13 @@ class ExtensionPool:
         if session:
             session.detach_ws()
             events.publish("profile_disconnected", {"profile_id": pid})
+            append_request_log(
+                None,
+                "profile",
+                f"Chrome profile disconnected: {session.display_name()}",
+                level="warn",
+                data={"profile_id": pid},
+            )
 
     async def handle_ws_message(self, ws: Any, data: dict) -> Optional[ExtensionSession]:
         pid = self._ws_to_profile.get(id(ws))

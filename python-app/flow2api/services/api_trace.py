@@ -79,3 +79,12 @@ def record_api_call(request_id: str | None, url: str, method: str, body: Any, re
     buf.append(entry)
     if len(buf) > 30:
         del buf[:-30]
+
+    from flow2api.services.request_logs import append_request_log
+
+    status = int(resp.get("status") or 0)
+    level = "error" if status >= 400 or resp.get("error") else "info"
+    msg = f"{label} {method} → {status}"
+    if resp.get("error"):
+        msg += f" — {resp.get('error')}"
+    append_request_log(request_id, label, msg, level=level, data=entry)

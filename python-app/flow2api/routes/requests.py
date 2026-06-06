@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from flow2api.services import activity
 from flow2api.services.auth_keys import get_api_key_by_token
+from flow2api.services.request_logs import append_request_log
 from flow2api.services.dashboard_events import events
 from flow2api.services.result_media import with_base64_media
 from flow2api.short_id import new_request_id
@@ -56,6 +57,13 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
     model = params.get("image_model") or params.get("video_quality") or ""
     rid = new_request_id()
     activity.create_request(rid, body.type, prompt, str(model), params, api_key_id=api_key_id)
+    append_request_log(
+        rid,
+        "http",
+        f"POST /api/requests type={body.type} model={model or '-'}",
+        level="info",
+        data={"type": body.type, "params": params},
+    )
     return {"id": rid, "status": "queued"}
 
 
@@ -76,6 +84,7 @@ async def cancel_request(request_id: str, _=Depends(_auth_key_id)):
     if row.status not in ("queued", "running"):
         raise HTTPException(409, f"cannot cancel (status={row.status})")
     get_worker().request_cancel(request_id)
+    append_request_log(request_id, "http", "DELETE /api/requests — cancel", level="warn")
     activity.update_request(
         request_id,
         status="failed: canceled",

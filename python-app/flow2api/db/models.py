@@ -26,6 +26,16 @@ class ApiKey(Base):
     activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    token_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class AdminConfig(Base):
+    __tablename__ = "admin_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), default="admin")
+    password_hash: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class RequestRecord(Base):
@@ -64,3 +74,6 @@ def init_db() -> None:
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(requests)")).fetchall()}
         if "logs_json" not in cols:
             conn.execute(text("ALTER TABLE requests ADD COLUMN logs_json TEXT DEFAULT '[]'"))
+        key_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(api_keys)")).fetchall()}
+        if "token_enc" not in key_cols:
+            conn.execute(text("ALTER TABLE api_keys ADD COLUMN token_enc TEXT"))

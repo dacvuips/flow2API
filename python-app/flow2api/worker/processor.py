@@ -13,6 +13,7 @@ from flow2api.services.api_trace import begin_api_trace, end_api_trace
 from flow2api.services.flow_sdk import FlowApiError, format_api_error
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
+from flow2api.services.request_logs import append_request_log
 from flow2api.services.flow_client import (
     bind_task_profile,
     get_flow_client,
@@ -246,11 +247,19 @@ class WorkerController:
         client = get_flow_client()
         client.trace_request_id = rid
         begin_api_trace(rid)
+        append_request_log(
+            rid,
+            "worker",
+            f"Job started type={row.type} model={row.model or '-'}",
+            level="info",
+            data={"profile_id": profile_id},
+        )
         try:
             self._raise_if_cancelled(rid)
             await self._process_one(rid)
         except RequestCancelled:
             end_api_trace(rid)
+            append_request_log(rid, "worker", "Job canceled", level="warn")
             cur = activity.get_request(rid)
             if cur and cur.status in ("queued", "running"):
                 activity.update_request(
@@ -283,6 +292,7 @@ class WorkerController:
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
+            append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
                 "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
                 "error": msg,
@@ -309,7 +319,14 @@ class WorkerController:
             )
             events.publish("request_finished", {"id": rid, "status": "failed"})
         else:
-            end_api_trace(rid)
+            api_trace = end_api_trace(rid)
+            append_request_log(
+                rid,
+                "worker",
+                "Job completed",
+                level="info",
+                data={"api_calls": len(api_trace)} if api_trace else None,
+            )
         finally:
             client.trace_request_id = None
             unbind_task_profile()
@@ -332,6 +349,7 @@ class WorkerController:
 
         profile_id = str(params.get("profile_id") or "")
         project_id = await self._ensure_project(profile_id)
+        append_request_log(rid, "worker", f"Project ready: {project_id[:12]}…", level="info")
         req_type = row.type
 
         if req_type == "gen_image":

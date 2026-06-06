@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from flow2api.db.models import ApiKey, SessionLocal
+from flow2api.services.token_cipher import decrypt_token, encrypt_token
 
 
 def _hash(token: str) -> str:
@@ -22,6 +23,7 @@ def create_api_key(label: str, package_days: Optional[int]) -> tuple[ApiKey, str
             label=label.strip() or "key",
             token_hash=_hash(raw),
             token_prefix=raw[:16] + "...",
+            token_enc=encrypt_token(raw),
             package_days=package_days,
             expires_at=expires,
             status="active",
@@ -100,6 +102,20 @@ def extend_key(key_id: int, days: int) -> None:
         row.expires_at = base + timedelta(days=days)
         row.status = "active"
         db.commit()
+    finally:
+        db.close()
+
+
+def get_key_token(key_id: int) -> Optional[str]:
+    db = SessionLocal()
+    try:
+        row = db.get(ApiKey, key_id)
+        if not row or not row.token_enc:
+            return None
+        try:
+            return decrypt_token(row.token_enc)
+        except Exception:
+            return None
     finally:
         db.close()
 
