@@ -132,6 +132,13 @@ class WorkerController:
         self._persist_params(rid, params)
         return ids[0], ids[1]
 
+    def _has_video_input_media(self, params: dict[str, Any]) -> bool:
+        if params.get("start_media_id") or params.get("end_media_id"):
+            return True
+        if params.get("reference_media_ids"):
+            return True
+        return any(bool(x) for x in (params.get("image_base64s") or []))
+
     async def _resolve_reference_media_ids(
         self,
         rid: str,
@@ -405,6 +412,17 @@ class WorkerController:
         prompt = params.get("prompt", "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
         video_quality = params.get("video_quality", "fast")
+
+        if not self._has_video_input_media(params):
+            raw = await flow_sdk.gen_text_video(
+                client,
+                project_id=project_id,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                video_quality=video_quality,
+            )
+            await self._poll_video(rid, raw, project_id)
+            return
 
         if video_mode == "component":
             ref_ids = await self._resolve_reference_media_ids(
