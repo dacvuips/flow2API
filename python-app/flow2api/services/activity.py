@@ -147,7 +147,6 @@ def record_to_public(row: RequestRecord) -> dict:
         "params": params,
         "result": result,
         "error": row.error,
-        "logs": json.loads(row.logs_json or "[]"),
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
     }

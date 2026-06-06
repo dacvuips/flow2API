@@ -83,7 +83,7 @@ def record_api_call(request_id: str | None, url: str, method: str, body: Any, re
     from flow2api.services.request_logs import append_request_log
 
     status = int(resp.get("status") or 0)
-    if label == "get_media" and status == 500:
+    if label == "get_media" and status in (404, 500):
         level = "warn"
     else:
         level = "error" if status >= 400 or resp.get("error") else "info"

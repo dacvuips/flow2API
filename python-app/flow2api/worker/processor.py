@@ -10,7 +10,7 @@ from flow2api.config import IMAGE_POLL_MAX, POLL_INTERVAL_S, RECAPTCHA_RETRY_MAX
 from flow2api.services.worker_settings import get_worker_settings
 from flow2api.services import activity, flow_sdk
 from flow2api.services.api_trace import begin_api_trace, end_api_trace
-from flow2api.services.flow_sdk import FlowApiError, format_api_error
+from flow2api.services.flow_sdk import FlowApiError, format_api_error, is_get_media_404_error
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
@@ -298,6 +298,23 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
+            get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
+            if is_get_media_404_error(exc) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
+                retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
+                activity.update_request(
+                    rid,
+                    status="queued",
+                    params=retry_params,
+                    error=msg,
+                )
+                logger.warning(
+                    "get_media 404 retry %s/%s rid=%s — đưa lại queue, thử lại",
+                    get_media_404_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                )
+                events.publish("request_finished", {"id": rid, "status": "queued"})
+                return
             logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
@@ -373,8 +390,9 @@ class WorkerController:
             urls = flow_sdk.extract_image_urls(raw)
             media_ids = flow_sdk.extract_image_media_ids(raw)
             result = {"image_urls": urls, "media_ids": media_ids}
-            if params.get("recaptcha_retry_count"):
+            if params.get("recaptcha_retry_count") or params.get("get_media_404_retry_count"):
                 params.pop("recaptcha_retry_count", None)
+                params.pop("get_media_404_retry_count", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result)
             events.publish("request_finished", {"id": rid, "status": "done"})
@@ -505,7 +523,9 @@ class WorkerController:
             row_done = activity.get_request(rid)
             if row_done:
                 done_params = json.loads(row_done.params_json or "{}")
-                if done_params.pop("recaptcha_retry_count", None) is not None:
+                if done_params.pop("recaptcha_retry_count", None) is not None or done_params.pop(
+                    "get_media_404_retry_count", None
+                ) is not None:
                     activity.update_request(rid, params=done_params)
             activity.update_request(rid, status="done", result=result)
             events.publish("request_finished", {"id": rid, "status": "done"})

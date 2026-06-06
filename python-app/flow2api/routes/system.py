@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import json
-
-from typing import Optional
-
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from flow2api.config import VIDEOS_DIR
@@ -15,12 +11,6 @@ from flow2api.services.worker_settings import get_worker_settings
 from flow2api.worker.processor import get_worker
 
 router = APIRouter(tags=["system"])
-
-
-def _bearer(authorization: str | None = Header(default=None)) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "missing_bearer_token")
-    return authorization.split(" ", 1)[1].strip()
 
 
 @router.get("/api/health")
@@ -79,17 +69,6 @@ async def serve_local_video(media_id: str):
     if not path.is_file():
         raise HTTPException(404, "not_found")
     return FileResponse(path, media_type="video/mp4")
-
-
-@router.get("/api/logs")
-async def runtime_logs(
-    limit: int = Query(200, ge=1, le=600),
-    request_id: Optional[str] = None,
-    _: str = Depends(_bearer),
-):
-    from flow2api.services.request_logs import list_combined_logs
-
-    return {"items": list_combined_logs(limit=limit, request_id=request_id or None)}
 
 
 @router.get("/api/events")

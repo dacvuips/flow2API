@@ -539,6 +539,23 @@ class FlowApiError(RuntimeError):
         self.attempts = attempts or []
 
 
+class GetMedia404Error(FlowApiError):
+    """GET /v1/media/{id} returned 404 — worker may requeue the job."""
+
+    def __init__(self, message: str, *, raw: Any = None) -> None:
+        super().__init__(message, step="get_media", raw=raw)
+
+
+def is_get_media_404_error(exc: Exception) -> bool:
+    if isinstance(exc, GetMedia404Error):
+        return True
+    if isinstance(exc, FlowApiError) and exc.step == "get_media":
+        raw = exc.raw
+        if isinstance(raw, dict) and int(raw.get("status") or 0) == 404:
+            return True
+    return "HTTP_404" in str(exc)
+
+
 def compact_api_response(resp: Any, label: str = "") -> dict:
     """Shrink extension callback for logs / task result (keep structure, drop huge blobs)."""
     if not isinstance(resp, dict):
@@ -963,6 +980,8 @@ async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | 
     status = int(resp.get("status") or 0)
     if status == 500:
         return None
+    if status == 404:
+        raise GetMedia404Error(_get_media_http_error(resp, status), raw=resp)
     if status >= 400:
         raise FlowApiError(
             _get_media_http_error(resp, status),
