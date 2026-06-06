@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
+from flow2api.config import ACTIVITY_LIST_LIMIT
 from flow2api.db.models import RequestRecord, SessionLocal
 
 
@@ -61,7 +62,7 @@ def get_request(rid: str) -> Optional[RequestRecord]:
         db.close()
 
 
-def list_requests(limit: int = 50) -> list[RequestRecord]:
+def list_requests(limit: int = ACTIVITY_LIST_LIMIT) -> list[RequestRecord]:
     db = SessionLocal()
     try:
         return db.query(RequestRecord).order_by(RequestRecord.created_at.desc()).limit(limit).all()

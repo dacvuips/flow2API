@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from flow2api.config import ACTIVITY_LIST_LIMIT
 from flow2api.services import activity
 from flow2api.services.result_media import with_base64_media
+from flow2api.services.task_retention import purge_old_requests
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 
@@ -16,10 +18,11 @@ def _bearer(authorization: str | None = Header(default=None)) -> str:
 
 @router.get("")
 async def list_activity(
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(ACTIVITY_LIST_LIMIT, ge=1, le=100),
     summary: bool = False,
     _: str = Depends(_bearer),
 ):
+    purge_old_requests(ACTIVITY_LIST_LIMIT)
     rows = activity.list_requests(limit=limit)
     items = [
         await with_base64_media(activity.record_to_public(r), embed=False) for r in rows

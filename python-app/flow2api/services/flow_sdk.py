@@ -551,9 +551,61 @@ def is_get_media_404_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, FlowApiError) and exc.step == "get_media":
         raw = exc.raw
-        if isinstance(raw, dict) and int(raw.get("status") or 0) == 404:
+        if isinstance(raw, dict) and get_media_http_status(raw) == 404:
             return True
+    text = str(exc).lower()
+    if "requested entity was not found" in text:
+        return True
     return "HTTP_404" in str(exc)
+
+
+def get_media_http_status(resp: dict) -> int:
+    """Resolve HTTP status from extension callback or compact api_trace entry."""
+    status = int(resp.get("status") or resp.get("http_status") or 0)
+    if status:
+        return status
+    data = resp.get("data")
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            if code is not None:
+                try:
+                    return int(code)
+                except (TypeError, ValueError):
+                    pass
+            if str(err.get("status") or "").upper() == "NOT_FOUND":
+                return 404
+    return 0
+
+
+def is_get_media_404_message(msg: str) -> bool:
+    text = str(msg or "").lower()
+    return "requested entity was not found" in text or "http_404" in text
+
+
+def is_get_media_404_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    if is_get_media_404_error(exc):
+        return True
+    if is_get_media_404_message(msg):
+        return True
+    for entry in api_trace or []:
+        if entry.get("label") != "get_media":
+            continue
+        if int(entry.get("http_status") or 0) == 404:
+            return True
+        data = entry.get("data")
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict) and int(err.get("code") or 0) == 404:
+                return True
+            if str(err.get("status") or "").upper() == "NOT_FOUND":
+                return True
+    return False
 
 
 def compact_api_response(resp: Any, label: str = "") -> dict:
@@ -977,7 +1029,7 @@ def _get_media_http_error(resp: dict, status: int) -> str:
 async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | None:
     """GET /v1/media/{id} — Lower Priority / workflow models return MP4 inline."""
     resp = await client.get_media(media_id)
-    status = int(resp.get("status") or 0)
+    status = get_media_http_status(resp)
     if status == 500:
         return None
     if status == 404:

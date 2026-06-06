@@ -10,7 +10,12 @@ from flow2api.config import IMAGE_POLL_MAX, POLL_INTERVAL_S, RECAPTCHA_RETRY_MAX
 from flow2api.services.worker_settings import get_worker_settings
 from flow2api.services import activity, flow_sdk
 from flow2api.services.api_trace import begin_api_trace, end_api_trace
-from flow2api.services.flow_sdk import FlowApiError, format_api_error, is_get_media_404_error
+from flow2api.services.flow_sdk import (
+    FlowApiError,
+    GetMedia404Error,
+    format_api_error,
+    is_get_media_404_failure,
+)
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
@@ -299,7 +304,7 @@ class WorkerController:
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
-            if is_get_media_404_error(exc) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
+            if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
                 activity.update_request(
                     rid,
@@ -545,6 +550,8 @@ class WorkerController:
                 return
             except RequestCancelled:
                 raise
+            except GetMedia404Error:
+                raise
             except RuntimeError as exc:
                 msg = str(exc)
                 if msg == "video_generation_failed":
@@ -619,6 +626,8 @@ class WorkerController:
                             return
                     except RequestCancelled:
                         raise
+                    except GetMedia404Error:
+                        raise
                     except RuntimeError:
                         pass
                 if workflow_ops:
@@ -647,6 +656,8 @@ class WorkerController:
                         return
                 except RequestCancelled:
                     raise
+                except GetMedia404Error:
+                    raise
                 except RuntimeError:
                     pass
             elif workflow_ops and round_idx % 5 == 4:
@@ -671,6 +682,8 @@ class WorkerController:
                     await _finish(urls, media, recovered_from="media_poll")
                     return
             except RequestCancelled:
+                raise
+            except GetMedia404Error:
                 raise
             except RuntimeError:
                 pass

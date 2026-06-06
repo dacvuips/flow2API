@@ -20,6 +20,8 @@ from flow2api.routes.requests import router as requests_router
 from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
 from flow2api.services.ws_server import run_ws_server
+from flow2api.config import ACTIVITY_LIST_LIMIT
+from flow2api.services.task_retention import purge_old_requests
 from flow2api.worker.processor import get_worker
 
 logging.basicConfig(
@@ -32,6 +34,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        purged = purge_old_requests(ACTIVITY_LIST_LIMIT)
+        if purged:
+            logger.info("startup retention purge removed %s old task(s)", purged)
+    except Exception as exc:
+        logger.warning("startup retention purge failed: %s", exc)
     ws_task = asyncio.create_task(run_ws_server())
     worker = get_worker()
     worker_task = asyncio.create_task(worker.start())

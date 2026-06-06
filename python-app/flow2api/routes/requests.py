@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -35,6 +36,21 @@ class CreateRequestBody(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+_RETRY_DROP_KEYS = frozenset(
+    {
+        "profile_id",
+        "profile_label",
+        "profile_email",
+        "recaptcha_retry_count",
+        "get_media_404_retry_count",
+    }
+)
+
+
+def _params_for_retry(params: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in params.items() if k not in _RETRY_DROP_KEYS}
+
+
 def _bearer(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing_bearer_token")
@@ -65,6 +81,25 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
         data={"type": body.type, "params": params},
     )
     return {"id": rid, "status": "queued"}
+
+
+@router.post("/{request_id}/retry")
+async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)):
+    row = activity.get_request(request_id)
+    if not row:
+        raise HTTPException(404, "not_found")
+    params = _params_for_retry(json.loads(row.params_json or "{}"))
+    rid = new_request_id()
+    activity.create_request(rid, row.type, row.prompt, row.model, params, api_key_id=api_key_id)
+    append_request_log(
+        rid,
+        "http",
+        f"POST /api/requests/{request_id}/retry",
+        level="info",
+        data={"source_id": request_id, "type": row.type},
+    )
+    events.publish("request_finished", {"id": rid, "status": "queued"})
+    return {"id": rid, "status": "queued", "source_id": request_id}
 
 
 @router.get("/{request_id}")
