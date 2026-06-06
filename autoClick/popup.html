@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Speed Auto Clicker</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-top">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">▶</span>
+          <h1>Speed Auto Clicker</h1>
+        </div>
+        <span class="version-badge">v3.5</span>
+      </div>
+      <div class="header-meta">
+        <span class="meta-url">local extension</span>
+        <span class="saved-badge" id="savedBadge">saved</span>
+      </div>
+    </header>
+
+    <nav class="tab-nav" role="tablist">
+      <button type="button" class="tab-btn active" data-tab="clicker" role="tab" aria-selected="true">Click</button>
+      <button type="button" class="tab-btn" data-tab="refresh" role="tab" aria-selected="false">Refresh</button>
+      <button type="button" class="tab-btn" data-tab="clear" role="tab" aria-selected="false">Clear Data</button>
+    </nav>
+
+    <div id="tabClicker" class="tab-panel active" role="tabpanel">
+    <section class="panel status-panel">
+      <div class="status-row">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">Paused</span>
+      </div>
+      <div class="status-actions">
+        <button type="button" class="btn btn-outline btn-reset" id="btnReset" title="Reset stats">
+          <span class="btn-icon">↻</span> Reset
+        </button>
+        <button type="button" class="btn btn-outline btn-widget" id="btnWidget" title="Hiện widget kéo thả trên trang">
+          <span class="btn-icon target-sm"></span> Widget
+        </button>
+      </div>
+    </section>
+
+    <section class="panel stats-panel">
+      <div class="stat">
+        <span class="stat-value" id="statPoints">0</span>
+        <span class="stat-label">TARGETS</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statCycles">0</span>
+        <span class="stat-label">CYCLES</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statClicks">0</span>
+        <span class="stat-label">CLICKS</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statTime">00:00</span>
+        <span class="stat-label">TIME</span>
+      </div>
+    </section>
+
+    <section class="panel interval-panel">
+      <div class="interval-control">
+        <div class="interval-center">
+          <input
+            type="number"
+            id="intervalInput"
+            class="delay-input delay-input-lg"
+            min="0.1"
+            max="300"
+            step="0.1"
+            value="1.0"
+            aria-label="Default delay (seconds)"
+          />
+          <span class="interval-unit">sec</span>
+        </div>
+      </div>
+      <span class="interval-label">DEFAULT DELAY</span>
+      <span class="interval-hint">cho point mới</span>
+      <div class="humanize-wrap">
+        <label class="toggle" title="Randomize interval ±10%">
+          <input type="checkbox" id="humanizeToggle" checked />
+          <span class="toggle-slider"></span>
+        </label>
+        <div class="humanize-text">
+          <span class="humanize-pct">±10%</span>
+          <span class="humanize-label">HUMANIZE</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel click-mode-panel">
+      <p class="section-title">Chế độ click khi chạy</p>
+      <div class="click-mode-row">
+        <button type="button" class="mode-chip active" data-mode="coords">Tọa độ</button>
+        <button type="button" class="mode-chip" data-mode="text">Chữ</button>
+        <button type="button" class="mode-chip" data-mode="both">Cả hai</button>
+      </div>
+    </section>
+
+    <section class="actions-row actions-row-triple">
+      <button type="button" class="btn btn-primary btn-add" id="btnAddPoints">
+        <span>+ ĐIỂM</span>
+        <kbd class="kbd">Alt+X</kbd>
+      </button>
+      <button type="button" class="btn btn-text-add" id="btnAddText">
+        <span>+ CHỮ</span>
+        <kbd class="kbd">Alt+T</kbd>
+      </button>
+      <button type="button" class="btn btn-resume" id="btnToggle">
+        <span id="toggleIcon">▶</span>
+        <span id="toggleLabel">RESUME</span>
+      </button>
+    </section>
+
+    <section class="panel points-section">
+      <div class="points-header">
+        <span class="points-title">POINTS <span class="points-sub">(delay sau mỗi click)</span></span>
+        <div class="points-header-actions">
+          <button type="button" class="btn btn-apply-default" id="btnApplyDefault" title="Gán default delay cho mọi point">↻ All</button>
+          <button type="button" class="btn btn-clear" id="btnClearPoints">
+            <span>🗑</span> Clear
+          </button>
+        </div>
+      </div>
+      <ul class="points-list" id="pointsList">
+        <li class="points-empty" id="pointsEmpty">Chưa có điểm. Bấm + ĐIỂM.</li>
+      </ul>
+    </section>
+
+    <section class="panel points-section text-targets-section">
+      <div class="points-header">
+        <span class="points-title">TEXT <span class="points-sub text-sub">(click chữ trên trang)</span></span>
+        <div class="points-header-actions">
+          <button type="button" class="btn btn-apply-default btn-apply-text" id="btnApplyTextDefault" title="Gán default delay cho mọi chữ">↻ All</button>
+          <button type="button" class="btn btn-clear" id="btnClearText">
+            <span>🗑</span> Clear
+          </button>
+        </div>
+      </div>
+      <ul class="points-list" id="textList">
+        <li class="points-empty" id="textEmpty">Chưa có chữ. Bấm + CHỮ rồi click chữ trên trang.</li>
+      </ul>
+    </section>
+
+    <footer class="footer">
+      <p class="rating-text">Enjoying Speed Auto Clicker? Rate us. It helps a lot.</p>
+      <div class="stars" aria-hidden="true">★★★★★</div>
+      <div class="footer-links">
+        <button type="button" class="link-btn" id="linkShortcuts">Shortcuts</button>
+        <button type="button" class="link-btn" id="linkSupport">Support</button>
+        <button type="button" class="link-btn" id="linkDonate">☕ Donate</button>
+        <button type="button" class="gear-btn" id="btnSettings" title="Settings">⚙</button>
+      </div>
+    </footer>
+    </div>
+
+    <div id="tabRefresh" class="tab-panel" role="tabpanel" hidden>
+      <section class="panel status-panel">
+        <div class="status-row">
+          <span class="status-dot" id="refreshStatusDot"></span>
+          <span class="status-text" id="refreshStatusText">Stopped</span>
+        </div>
+        <button type="button" class="btn btn-outline btn-reset" id="btnRefreshReset" title="Reset refresh count">↻ Reset</button>
+      </section>
+
+      <section class="panel refresh-stats">
+        <div class="stat">
+          <span class="stat-value" id="refreshCount">0</span>
+          <span class="stat-label">REFRESHES</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="refreshIntervalLabel">10s</span>
+          <span class="stat-label">INTERVAL</span>
+        </div>
+        <div class="stat stat-wide">
+          <span class="stat-value" id="refreshCountdown">—</span>
+          <span class="stat-label">NEXT IN</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <p class="section-title">Chọn nhanh</p>
+        <div class="preset-grid">
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="5">5s</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="10">10s</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="20">20s</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="60">1p</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="120">2p</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="300">5p</button>
+          <button type="button" class="preset-btn refresh-preset-btn" data-sec="600">10p</button>
+        </div>
+      </section>
+
+      <section class="panel refresh-custom">
+        <p class="section-title">Tùy chỉnh (giây)</p>
+        <div class="refresh-custom-row">
+          <input
+            type="number"
+            id="refreshCustomInput"
+            class="delay-input delay-input-lg"
+            min="1"
+            max="3600"
+            step="1"
+            value="10"
+            aria-label="Refresh interval seconds"
+          />
+          <span class="interval-unit">giây</span>
+        </div>
+      </section>
+
+      <section class="actions-row">
+        <button type="button" class="btn btn-primary btn-add" id="btnRefreshStart">
+          ▶ BẮT ĐẦU
+        </button>
+        <button type="button" class="btn btn-resume paused-mode" id="btnRefreshStop" disabled>
+          ⏹ DỪNG
+        </button>
+      </section>
+
+      <p class="refresh-hint" id="refreshHint">Refresh tab trang web đang mở. Mở trang http/https trước khi bấm BẮT ĐẦU.</p>
+    </div>
+
+    <div id="tabClear" class="tab-panel" role="tabpanel" hidden>
+      <section class="panel status-panel">
+        <div class="status-row">
+          <span class="status-dot" id="clearStatusDot"></span>
+          <span class="status-text" id="clearStatusText">Stopped</span>
+        </div>
+        <button type="button" class="btn btn-outline btn-reset" id="btnClearReset" title="Reset clear count">↻ Reset</button>
+      </section>
+
+      <section class="panel refresh-stats">
+        <div class="stat">
+          <span class="stat-value" id="clearCount">0</span>
+          <span class="stat-label">CLEARED</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="clearIntervalLabel">10s</span>
+          <span class="stat-label">INTERVAL</span>
+        </div>
+        <div class="stat stat-wide">
+          <span class="stat-value" id="clearCountdown">—</span>
+          <span class="stat-label">NEXT IN</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <p class="section-title">Chọn nhanh</p>
+        <div class="preset-grid">
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="5">5s</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="10">10s</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="20">20s</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="60">1p</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="120">2p</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="300">5p</button>
+          <button type="button" class="preset-btn clear-preset-btn" data-sec="600">10p</button>
+        </div>
+      </section>
+
+      <section class="panel refresh-custom">
+        <p class="section-title">Tùy chỉnh (giây)</p>
+        <div class="refresh-custom-row">
+          <input
+            type="number"
+            id="clearCustomInput"
+            class="delay-input delay-input-lg"
+            min="1"
+            max="3600"
+            step="1"
+            value="10"
+            aria-label="Clear interval seconds"
+          />
+          <span class="interval-unit">giây</span>
+        </div>
+      </section>
+
+      <p class="clear-scope-hint">Xóa cookies, cache, localStorage, IndexedDB… của <strong>domain tab hiện tại</strong>, sau đó reload trang.</p>
+
+      <section class="actions-row">
+        <button type="button" class="btn btn-primary btn-add" id="btnClearStart">
+          ▶ BẮT ĐẦU
+        </button>
+        <button type="button" class="btn btn-resume paused-mode" id="btnClearStop" disabled>
+          ⏹ DỪNG
+        </button>
+      </section>
+
+      <p class="refresh-hint" id="clearHint">Mở tab http/https trước khi bấm BẮT ĐẦU.</p>
+    </div>
+  </div>
+
+  <dialog class="modal" id="settingsModal">
+    <form method="dialog" class="modal-inner">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Max cycles (0 = infinite)</span>
+        <input type="number" id="maxCycles" min="0" step="1" value="0" />
+      </label>
+      <label class="field">
+        <span>Interval step (seconds)</span>
+        <input type="number" id="intervalStep" min="0.1" step="0.1" value="0.1" />
+      </label>
+      <label class="field checkbox-field">
+        <input type="checkbox" id="showMarkers" checked />
+        <span>Show crosshair markers on page</span>
+      </label>
+      <label class="field checkbox-field">
+        <input type="checkbox" id="clickSequence" checked />
+        <span>Click through all points each cycle</span>
+      </label>
+      <div class="modal-actions">
+        <button type="submit" class="btn btn-resume">Save</button>
+        <button type="button" class="btn btn-outline" id="settingsCancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="shortcutsModal">
+    <form method="dialog" class="modal-inner">
+      <h2>Keyboard shortcuts</h2>
+      <ul class="shortcut-list">
+        <li><kbd>Alt+X</kbd> — Thêm điểm tọa độ</li>
+        <li><kbd>Alt+T</kbd> — Thêm chữ (click chữ trên trang)</li>
+        <li><kbd>Alt+C</kbd> — Start / Pause auto clicker</li>
+        <li><kbd>Esc</kbd> — Thoát chế độ thêm điểm/chữ</li>
+        <li>Mỗi point: chỉnh <strong>delay</strong> (giây chờ sau khi click point đó)</li>
+      </ul>
+      <p class="hint">Customize at <code>chrome://extensions/shortcuts</code></p>
+      <button type="submit" class="btn btn-resume">Close</button>
+    </form>
+  </dialog>
+
+  <script src="popup.js"></script>
+</body>
+</html>
