@@ -254,12 +254,13 @@ function unixTimestamp(v){
   if(/^\d+(\.\d+)?$/.test(String(v))){const n=Number(v);return String(Math.floor(n<1e12?n:n/1000))}
   const d=new Date(v);return Number.isNaN(d.getTime())?String(v):String(Math.floor(d.getTime()/1000));
 }
-function renderApiDebug(result,taskError){
+function renderApiDebug(result,taskError,taskStatus){
   if(!result||typeof result!=='object')result={};
   const attempts=result.api_attempts;
   const last=result.api_last_response;
   const step=result.api_step;
-  const err=result.error||taskError;
+  const status=String(taskStatus||'').toLowerCase();
+  const err=result.error||(status==='done'?'':taskError);
   const ver=result.debug_version;
   if(attempts?.length){
     return `<div class="detail-section"><h4>Google Flow API response (debug)${ver?` <span class="cfg-d">v${esc(String(ver))}</span>`:''}</h4>${step?`<div class="cfg-d" style="margin-bottom:8px">Bước lỗi: <code>${esc(step)}</code></div>`:''}<pre class="detail-pre">${esc(JSON.stringify(compactTaskJson(attempts),null,2))}</pre></div>`;
@@ -311,7 +312,7 @@ async function openLogDetail(i){
     body.innerHTML=`
       <div class="detail-grid">
         <div class="detail-item"><b>Task ID</b><span>${detailVal(j.id||j.task_id||id)}</span></div>
-        <div class="detail-item"><b>Status</b><span>${statusHtml(cleanDisplayError(j.error||j.status||'-'))}</span></div>
+        <div class="detail-item"><b>Status</b><span>${statusDetailHtml(j.status,j.error)}</span></div>
         <div class="detail-item"><b>Profile</b><span>${detailVal(j.profile_label||j.profile_email||input.profile_label||'-')}</span></div>
         <div class="detail-item"><b>Model</b><code>${detailVal(displayModel(j.model||input.model||result.Model))}</code></div>
         <div class="detail-item"><b>Created</b><span>${esc(formatCreated(j.created_at||j.timestamp))}</span></div>
@@ -319,7 +320,7 @@ async function openLogDetail(i){
       ${mediaGrid('Input',inputMedia)}
       ${mediaGrid('Output',outputs)}
       <div class="detail-section"><h4>Prompt</h4><pre class="detail-pre">${esc(prompt)}</pre></div>
-      ${renderApiDebug(result,j.error)}
+      ${renderApiDebug(result,j.error,j.status)}
       <div class="detail-section"><h4>Result object</h4><pre class="detail-pre">${esc(JSON.stringify(compactTaskJson(result),null,2))}</pre></div>`;
   }catch(e){body.innerHTML=`<div class="empty">Cannot load task detail: ${esc(e.message||e)}</div>`;setText('logSub','Lỗi tải detail')}
 }

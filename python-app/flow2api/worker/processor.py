@@ -399,7 +399,7 @@ class WorkerController:
                 params.pop("recaptcha_retry_count", None)
                 params.pop("get_media_404_retry_count", None)
                 self._persist_params(rid, params)
-            activity.update_request(rid, status="done", result=result)
+            activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -532,7 +532,7 @@ class WorkerController:
                     "get_media_404_retry_count", None
                 ) is not None:
                     activity.update_request(rid, params=done_params)
-            activity.update_request(rid, status="done", result=result)
+            activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})
 
         workflow_mode = all(op.get("_workflow_mode") for op in operations)
