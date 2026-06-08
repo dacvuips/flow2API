@@ -130,6 +130,8 @@ class ExtensionSession:
         await self._ws.send(json.dumps({"id": req_id, "method": method, "params": params}))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("extension_timeout") from exc
         finally:
             self._pending.pop(req_id, None)
 

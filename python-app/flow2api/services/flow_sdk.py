@@ -957,6 +957,39 @@ def _poll_entry_failed(status: str) -> bool:
     return "FAILED" in st or st == "MEDIA_GENERATION_STATUS_FAILED"
 
 
+def _extract_poll_status(entry: dict) -> str:
+    """Read generation status from Flow poll payloads (operations or media entries)."""
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("status",):
+        val = entry.get(key)
+        if val:
+            return str(val)
+    op = entry.get("operation")
+    if isinstance(op, dict) and op.get("status"):
+        return str(op["status"])
+    meta = entry.get("mediaMetadata") or {}
+    if isinstance(meta, dict):
+        media_status = meta.get("mediaStatus") or {}
+        if isinstance(media_status, dict):
+            for key in ("mediaGenerationStatus", "status"):
+                val = media_status.get(key)
+                if val:
+                    return str(val)
+    return ""
+
+
+def _media_local_path_exists(media_id: str) -> bool:
+    return (VIDEOS_DIR / f"{media_id}.mp4").is_file()
+
+
+def _media_url_is_resolved(url: str, media_id: str) -> bool:
+    text = str(url or "").strip()
+    if text and not text.startswith("/media/"):
+        return True
+    return _media_local_path_exists(media_id)
+
+
 def parse_media_poll_result(data: dict) -> tuple[dict[str, str], bool, bool]:
     """Return completed media_id→url map, all_done, any_failed."""
     completed: dict[str, str] = {}
@@ -992,7 +1025,7 @@ def parse_media_poll_result(data: dict) -> tuple[dict[str, str], bool, bool]:
         mid = str(entry.get("name") or entry.get("mediaId") or "")
         if not mid:
             continue
-        status = entry.get("status") or ""
+        status = _extract_poll_status(entry)
         video_block = entry.get("video") or {}
         url = _video_url_from_block(video_block)
         encoded = ""
@@ -1024,6 +1057,66 @@ def _get_media_http_error(resp: dict, status: int) -> str:
     if err:
         return str(err)
     return f"HTTP_{status}"
+
+
+async def try_fetch_media_video_url_with_retry(
+    client: FlowClient,
+    media_id: str,
+    *,
+    max_attempts: int = 8,
+    retry_404: bool = True,
+) -> str | None:
+    """GET /v1/media/{id} with backoff — poll SUCCESSFUL often precedes media API readiness."""
+    last_404: GetMedia404Error | None = None
+    for attempt in range(max(1, max_attempts)):
+        try:
+            return await try_fetch_media_video_url(client, media_id)
+        except GetMedia404Error as exc:
+            last_404 = exc
+            if not retry_404 or attempt >= max_attempts - 1:
+                raise
+            await asyncio.sleep(min(12.0, POLL_INTERVAL_S * (attempt + 2)))
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            if attempt >= max_attempts - 1:
+                raise FlowApiError("extension_timeout_get_media", step="get_media") from exc
+            await asyncio.sleep(POLL_INTERVAL_S)
+    if last_404:
+        raise last_404
+    return None
+
+
+async def _resolve_all_media_urls(
+    client: FlowClient,
+    completed: dict[str, str],
+    pending: list[str],
+    *,
+    fetch_attempts: int = 6,
+) -> bool:
+    """Upgrade /media/{id} placeholders to real URLs or saved local MP4."""
+    ok = True
+    for mid in pending:
+        url = completed.get(mid, "")
+        if _media_url_is_resolved(url, mid):
+            if str(url).startswith("/media/") or not url:
+                completed[mid] = f"/media/{mid}"
+            continue
+        try:
+            fetched = await try_fetch_media_video_url_with_retry(
+                client,
+                mid,
+                max_attempts=fetch_attempts,
+                retry_404=True,
+            )
+        except FlowApiError:
+            raise
+        except GetMedia404Error:
+            ok = False
+            continue
+        if fetched:
+            completed[mid] = fetched
+        else:
+            ok = False
+    return ok
 
 
 async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | None:
@@ -1113,11 +1206,25 @@ async def poll_video_by_media(
         done_map, all_done, any_failed = parse_media_poll_result(poll)
         completed.update(done_map)
 
-        if interleave_get_media and round_idx % 3 == 2:
-            for mid in remaining:
-                if mid in completed:
+        if interleave_get_media:
+            for mid in list(remaining):
+                if _media_url_is_resolved(completed.get(mid, ""), mid):
                     continue
-                url = await try_fetch_media_video_url(client, mid)
+                poll_status = ""
+                for entry in poll.get("media") or []:
+                    if isinstance(entry, dict) and str(
+                        entry.get("name") or entry.get("mediaId") or ""
+                    ) == mid:
+                        poll_status = _extract_poll_status(entry)
+                        break
+                if not _poll_entry_done(poll_status, False) and mid not in completed:
+                    continue
+                try:
+                    url = await try_fetch_media_video_url_with_retry(
+                        client, mid, max_attempts=4, retry_404=True
+                    )
+                except GetMedia404Error:
+                    continue
                 if url:
                     completed[mid] = url
 
@@ -1134,13 +1241,14 @@ async def poll_video_by_media(
                 attempts=poll_snapshots,
             )
         if all_done or (completed and len(completed) >= len(pending)):
-            return list(completed.values()), list(completed.keys())
+            if await _resolve_all_media_urls(client, completed, pending):
+                return list(completed.values()), list(completed.keys())
 
         if round_idx % 10 == 9:
             logger.info("media poll round %s/%s done=%s", round_idx + 1, max_rounds, len(completed))
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    if completed:
+    if completed and await _resolve_all_media_urls(client, completed, pending):
         return list(completed.values()), list(completed.keys())
     raise FlowApiError(
         "timeout_waiting_video",
@@ -1254,9 +1362,14 @@ async def poll_workflow_videos(
         if should_abort:
             should_abort()
         for mid in list(pending):
-            if mid in completed:
+            if _media_url_is_resolved(completed.get(mid, ""), mid):
                 continue
-            url = await try_fetch_media_video_url(client, mid)
+            try:
+                url = await try_fetch_media_video_url_with_retry(
+                    client, mid, max_attempts=4, retry_404=True
+                )
+            except GetMedia404Error:
+                continue
             if url:
                 completed[mid] = url
 
@@ -1313,6 +1426,12 @@ def summarize_video_poll(data: dict) -> list[dict]:
 
 def format_api_error(err: Any) -> str:
     """Shorten HTML / huge API errors for dashboard display."""
+    if isinstance(err, FlowApiError) and err.args and str(err.args[0]).strip():
+        return str(err.args[0]).strip()
+    if isinstance(err, (asyncio.TimeoutError, TimeoutError)):
+        return "extension_timeout"
+    if isinstance(err, ConnectionError):
+        return "extension_disconnected"
     if isinstance(err, dict):
         inner = err.get("error")
         if isinstance(inner, dict) and inner.get("message"):
@@ -1330,4 +1449,9 @@ def format_api_error(err: Any) -> str:
             return m.group(1).strip()
     if len(text) > 400:
         return text[:397] + "..."
-    return text
+    if text.strip():
+        return text
+    name = type(err).__name__ if err is not None else "unknown_error"
+    if name in ("TimeoutError", "CancelledError"):
+        return "extension_timeout"
+    return name or "unknown_error"

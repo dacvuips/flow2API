@@ -358,7 +358,7 @@ class WorkerController:
             ):
                 return
             api_trace = end_api_trace(rid)
-            msg = format_api_error(exc)
+            msg = format_api_error(exc).strip() or "unknown_error"
             cur = activity.get_request(rid)
             retry_params = json.loads(cur.params_json or "{}") if cur else {}
             recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
@@ -404,14 +404,18 @@ class WorkerController:
                 "error": msg,
                 "debug_version": 2,
             }
+            if isinstance(exc, FlowApiError) and exc.step:
+                fail_result["api_step"] = exc.step
             if api_trace:
                 fail_result["api_attempts"] = api_trace
-                fail_result["api_step"] = api_trace[-1].get("label") or "api_error"
-            elif isinstance(exc, FlowApiError):
-                fail_result["api_step"] = exc.step
-                if exc.attempts:
+                if not fail_result.get("api_step"):
+                    fail_result["api_step"] = api_trace[-1].get("label") or "api_error"
+            if isinstance(exc, FlowApiError):
+                if not fail_result.get("api_step"):
+                    fail_result["api_step"] = exc.step
+                if exc.attempts and not fail_result.get("api_attempts"):
                     fail_result["api_attempts"] = exc.attempts
-                elif exc.raw:
+                elif exc.raw and not fail_result.get("api_last_response"):
                     from flow2api.services.flow_sdk import compact_api_response
 
                     fail_result["api_last_response"] = compact_api_response(
