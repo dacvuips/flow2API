@@ -67,10 +67,24 @@ def get_request(rid: str) -> Optional[RequestRecord]:
         db.close()
 
 
-def list_requests(limit: int = ACTIVITY_LIST_LIMIT) -> list[RequestRecord]:
+def count_requests() -> int:
     db = SessionLocal()
     try:
-        return db.query(RequestRecord).order_by(RequestRecord.created_at.desc()).limit(limit).all()
+        return db.query(RequestRecord).count()
+    finally:
+        db.close()
+
+
+def list_requests(
+    limit: int = ACTIVITY_LIST_LIMIT,
+    offset: int = 0,
+) -> list[RequestRecord]:
+    db = SessionLocal()
+    try:
+        q = db.query(RequestRecord).order_by(RequestRecord.created_at.desc())
+        if offset > 0:
+            q = q.offset(offset)
+        return q.limit(limit).all()
     finally:
         db.close()
 
@@ -105,6 +119,32 @@ def count_running() -> int:
         )
     finally:
         db.close()
+
+
+def list_running_requests() -> list[RequestRecord]:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(RequestRecord)
+            .filter(RequestRecord.status == "running")
+            .order_by(RequestRecord.created_at.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def running_age_seconds(row: RequestRecord) -> float:
+    params = json.loads(row.params_json or "{}")
+    raw = params.get("running_started_at")
+    if raw:
+        try:
+            text = str(raw).strip().replace("Z", "")
+            started = datetime.fromisoformat(text)
+            return max(0.0, (datetime.utcnow() - started).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, (datetime.utcnow() - row.updated_at).total_seconds())
 
 
 def count_queued() -> int:

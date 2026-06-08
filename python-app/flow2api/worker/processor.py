@@ -4,9 +4,16 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
-from flow2api.config import IMAGE_POLL_MAX, POLL_INTERVAL_S, RECAPTCHA_RETRY_MAX, VIDEO_POLL_MAX
+from flow2api.config import (
+    IMAGE_POLL_MAX,
+    POLL_INTERVAL_S,
+    RECAPTCHA_RETRY_MAX,
+    TASK_RUNNING_TIMEOUT_S,
+    VIDEO_POLL_MAX,
+)
 from flow2api.services.worker_settings import get_worker_settings
 from flow2api.services import activity, flow_sdk
 from flow2api.services.api_trace import begin_api_trace, end_api_trace
@@ -51,10 +58,14 @@ class RequestCancelled(RuntimeError):
     """Raised when user stops a queued/running request."""
 
 
+TASK_TIMEOUT_ERROR = "task_timeout_10m"
+
+
 class WorkerController:
     def __init__(self) -> None:
         self._scheduler_task: asyncio.Task | None = None
         self._running: dict[str, asyncio.Task] = {}
+        self._running_since: dict[str, float] = {}
         self._stop = asyncio.Event()
         self._project_by_profile: dict[str, str] = {}
         self._cancelled: set[str] = set()
@@ -68,10 +79,46 @@ class WorkerController:
         done = [rid for rid, task in self._running.items() if task.done()]
         for rid in done:
             self._running.pop(rid, None)
+            self._running_since.pop(rid, None)
             self._cancelled.discard(rid)
 
     def request_cancel(self, rid: str) -> None:
         self._cancelled.add(rid)
+
+    def _cancel_timed_out(self, rid: str) -> None:
+        row = activity.get_request(rid)
+        if not row or row.status != "running":
+            return
+        activity.update_request(
+            rid,
+            status=f"failed: {TASK_TIMEOUT_ERROR}",
+            error=TASK_TIMEOUT_ERROR,
+            result={"error": TASK_TIMEOUT_ERROR},
+        )
+        append_request_log(
+            rid,
+            "worker",
+            f"Job timed out after {TASK_RUNNING_TIMEOUT_S // 60}m",
+            level="warn",
+        )
+        events.publish("request_finished", {"id": rid, "status": "failed"})
+        logger.warning("task timed out rid=%s after %ss", rid[:8], TASK_RUNNING_TIMEOUT_S)
+        self.request_cancel(rid)
+        task = self._running.get(rid)
+        if task and not task.done():
+            task.cancel()
+
+    def _expire_stale_running(self) -> None:
+        limit = max(60, int(TASK_RUNNING_TIMEOUT_S or 600))
+        now = time.monotonic()
+        for rid, started in list(self._running_since.items()):
+            if now - started >= limit:
+                self._cancel_timed_out(rid)
+        for row in activity.list_running_requests():
+            if row.id in self._running_since:
+                continue
+            if activity.running_age_seconds(row) >= limit:
+                self._cancel_timed_out(row.id)
 
     def _raise_if_cancelled(self, rid: str) -> None:
         if rid in self._cancelled:
@@ -173,6 +220,7 @@ class WorkerController:
         if self._scheduler_task and not self._scheduler_task.done():
             return
         self._stop.clear()
+        self._expire_stale_running()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def stop(self) -> None:
@@ -210,6 +258,7 @@ class WorkerController:
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             self._prune_running()
+            self._expire_stale_running()
             settings = get_worker_settings()
             slots = settings.max_concurrent - len(self._running)
             started = 0
@@ -236,8 +285,10 @@ class WorkerController:
                         wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
                         if wait_s > 0:
                             await asyncio.sleep(wait_s)
-                    activity.update_request(row.id, status="running")
+                    row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
+                    activity.update_request(row.id, status="running", params=row_params)
                     events.publish("request_started", {"id": row.id})
+                    self._running_since[row.id] = time.monotonic()
                     self._running[row.id] = asyncio.create_task(self._run_job(row.id))
                     self._last_start_monotonic = time.monotonic()
                     started += 1
@@ -281,7 +332,31 @@ class WorkerController:
                     result={"error": "canceled"},
                 )
             events.publish("request_finished", {"id": rid, "status": "canceled"})
+        except asyncio.CancelledError:
+            end_api_trace(rid)
+            cur = activity.get_request(rid)
+            if cur and cur.status == "running":
+                activity.update_request(
+                    rid,
+                    status=f"failed: {TASK_TIMEOUT_ERROR}",
+                    error=TASK_TIMEOUT_ERROR,
+                    result={"error": TASK_TIMEOUT_ERROR},
+                )
+                append_request_log(
+                    rid,
+                    "worker",
+                    f"Job canceled (timeout {TASK_RUNNING_TIMEOUT_S // 60}m)",
+                    level="warn",
+                )
+                events.publish("request_finished", {"id": rid, "status": "failed"})
+            raise
         except Exception as exc:
+            cur = activity.get_request(rid)
+            if cur and (
+                cur.status.startswith("failed:")
+                or cur.error in (TASK_TIMEOUT_ERROR, "canceled")
+            ):
+                return
             api_trace = end_api_trace(rid)
             msg = format_api_error(exc)
             cur = activity.get_request(rid)
@@ -289,6 +364,7 @@ class WorkerController:
             recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
             if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
+                retry_params.pop("running_started_at", None)
                 activity.update_request(
                     rid,
                     status="queued",
@@ -306,6 +382,7 @@ class WorkerController:
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
             if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
+                retry_params.pop("running_started_at", None)
                 activity.update_request(
                     rid,
                     status="queued",
@@ -361,6 +438,7 @@ class WorkerController:
             unbind_task_profile()
             pool.job_finished(profile_id)
             self._cancelled.discard(rid)
+            self._running_since.pop(rid, None)
 
     async def _process_one(self, rid: str) -> None:
         self._raise_if_cancelled(rid)
