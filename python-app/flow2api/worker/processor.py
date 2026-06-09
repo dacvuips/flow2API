@@ -326,6 +326,9 @@ class WorkerController:
                     if row.id in self._running:
                         continue
                     row_params = json.loads(row.params_json or "{}")
+                    retry_not_before = float(row_params.get("retry_not_before") or 0)
+                    if retry_not_before > time.time():
+                        continue
                     if not pick_profile_for_task(row_params.get("profile_id")):
                         continue
                     stagger = settings.task_stagger_s
@@ -333,6 +336,7 @@ class WorkerController:
                         wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
                         if wait_s > 0:
                             await asyncio.sleep(wait_s)
+                    row_params.pop("retry_not_before", None)
                     row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
                     activity.update_request(row.id, status="running", params=row_params)
                     events.publish("request_started", {"id": row.id})
@@ -417,7 +421,9 @@ class WorkerController:
             retry_params = json.loads(cur.params_json or "{}") if cur else {}
             recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
             if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
+                delay_s = flow_sdk.recaptcha_retry_delay(recaptcha_retry)
                 retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
                 retry_params.pop("running_started_at", None)
                 activity.update_request(
                     rid,
@@ -426,10 +432,11 @@ class WorkerController:
                     error=msg,
                 )
                 logger.warning(
-                    "reCAPTCHA retry %s/%s rid=%s — giữ media upload, thử lại",
+                    "reCAPTCHA retry %s/%s rid=%s — chờ %.1fs rồi thử lại (giữ media upload)",
                     recaptcha_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
+                    delay_s,
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
@@ -531,9 +538,14 @@ class WorkerController:
             urls = flow_sdk.extract_image_urls(raw)
             media_ids = flow_sdk.extract_image_media_ids(raw)
             result = {"image_urls": urls, "media_ids": media_ids}
-            if params.get("recaptcha_retry_count") or params.get("get_media_404_retry_count"):
+            if (
+                params.get("recaptcha_retry_count")
+                or params.get("get_media_404_retry_count")
+                or params.get("retry_not_before")
+            ):
                 params.pop("recaptcha_retry_count", None)
                 params.pop("get_media_404_retry_count", None)
+                params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})
@@ -664,9 +676,11 @@ class WorkerController:
             row_done = activity.get_request(rid)
             if row_done:
                 done_params = json.loads(row_done.params_json or "{}")
-                if done_params.pop("recaptcha_retry_count", None) is not None or done_params.pop(
-                    "get_media_404_retry_count", None
-                ) is not None:
+                if (
+                    done_params.pop("recaptcha_retry_count", None) is not None
+                    or done_params.pop("get_media_404_retry_count", None) is not None
+                    or done_params.pop("retry_not_before", None) is not None
+                ):
                     activity.update_request(rid, params=done_params)
             activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})

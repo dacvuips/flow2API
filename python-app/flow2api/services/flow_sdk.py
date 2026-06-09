@@ -6,6 +6,7 @@ Ported from Flow2API / flowkit patterns.
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 import uuid
@@ -650,8 +651,14 @@ def is_recaptcha_error(msg: str) -> bool:
     return bool(_RECAPTCHA_ERR_RE.search(text))
 
 
+def recaptcha_retry_delay(attempt: int = 0) -> float:
+    """Chờ ngẫu nhiên 5–10s trước mỗi lần retry reCAPTCHA (không retry ngay)."""
+    del attempt
+    return random.uniform(5.0, 10.0)
+
+
 def _recaptcha_retry_delay(attempt: int) -> float:
-    return float(min(30, (attempt + 1) * 2))
+    return recaptcha_retry_delay(attempt)
 
 
 def error_from_response(resp: dict) -> str:
