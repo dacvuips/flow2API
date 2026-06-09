@@ -286,6 +286,17 @@ async def upload_image(
             )
             await asyncio.sleep(delay)
             continue
+        if is_upload_image_internal_error(resp) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = _recaptcha_retry_delay(attempt)
+            logger.warning(
+                "upload internal error retry %s/%s: %s — wait %ss",
+                attempt + 1,
+                RECAPTCHA_RETRY_MAX,
+                last_err,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
         break
     raise RuntimeError(f"upload_image_failed: {last_err} ({last_resp})")
 
@@ -638,6 +649,38 @@ def compact_api_response(resp: Any, label: str = "") -> dict:
 def is_transient_flow_error(msg: str) -> bool:
     low = str(msg or "").lower()
     return any(m in low for m in _TRANSIENT_MARKERS)
+
+
+def is_upload_image_internal_error(resp: dict) -> bool:
+    """HTTP 500 INTERNAL from /v1/flow/uploadImage — transient Google backend fault."""
+    status = int(resp.get("status") or 0)
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return False
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return False
+    code = int(err.get("code") or 0)
+    if status != 500 and code != 500:
+        return False
+    msg = str(err.get("message") or "").strip().lower()
+    err_status = str(err.get("status") or "").strip().upper()
+    return err_status == "INTERNAL" or msg == "internal error encountered."
+
+
+def is_upload_image_internal_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    for entry in api_trace or []:
+        if entry.get("label") != "upload_image":
+            continue
+        pseudo = {"status": entry.get("http_status"), "data": entry.get("data")}
+        if is_upload_image_internal_error(pseudo):
+            return True
+    text = str(msg or exc or "").lower()
+    return "upload_image_failed" in text and "internal error encountered" in text
 
 
 _RECAPTCHA_ERR_RE = re.compile(r"re\s*[-_]?\s*captcha|captcha", re.IGNORECASE)

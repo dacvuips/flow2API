@@ -23,6 +23,7 @@ from flow2api.services.flow_sdk import (
     GetMedia404Error,
     format_api_error,
     is_get_media_404_failure,
+    is_upload_image_internal_failure,
 )
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
@@ -458,6 +459,30 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
+            upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
+            if (
+                is_upload_image_internal_failure(exc, msg, api_trace)
+                and upload_internal_retry < RECAPTCHA_RETRY_MAX
+            ):
+                delay_s = flow_sdk.recaptcha_retry_delay(upload_internal_retry)
+                retry_params["upload_internal_retry_count"] = upload_internal_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params.pop("running_started_at", None)
+                activity.update_request(
+                    rid,
+                    status="queued",
+                    params=retry_params,
+                    error=msg,
+                )
+                logger.warning(
+                    "upload_image internal error retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    upload_internal_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                )
+                events.publish("request_finished", {"id": rid, "status": "queued"})
+                return
             logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
@@ -541,10 +566,12 @@ class WorkerController:
             if (
                 params.get("recaptcha_retry_count")
                 or params.get("get_media_404_retry_count")
+                or params.get("upload_internal_retry_count")
                 or params.get("retry_not_before")
             ):
                 params.pop("recaptcha_retry_count", None)
                 params.pop("get_media_404_retry_count", None)
+                params.pop("upload_internal_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
@@ -679,6 +706,7 @@ class WorkerController:
                 if (
                     done_params.pop("recaptcha_retry_count", None) is not None
                     or done_params.pop("get_media_404_retry_count", None) is not None
+                    or done_params.pop("upload_internal_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
                     activity.update_request(rid, params=done_params)
