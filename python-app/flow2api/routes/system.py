@@ -27,6 +27,7 @@ async def health():
             **worker_cfg.to_dict(),
             "running_slots": worker.running_count(),
             "queued": activity.count_queued(),
+            "scheduler_alive": worker.scheduler_alive(),
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
         },

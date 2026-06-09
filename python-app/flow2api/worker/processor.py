@@ -14,6 +14,7 @@ from flow2api.config import (
     TASK_RUNNING_TIMEOUT_MAX_RETRIES,
     TASK_RUNNING_TIMEOUT_S,
     VIDEO_POLL_MAX,
+    WORKER_NUDGE_STUCK_S,
 )
 from flow2api.services.worker_settings import get_worker_settings
 from flow2api.services import activity, flow_sdk
@@ -158,17 +159,83 @@ class WorkerController:
             task.cancel()
         self._running.pop(rid, None)
 
-    def _expire_stale_running(self) -> None:
-        limit = max(60, int(TASK_RUNNING_TIMEOUT_S or 300))
-        now = time.monotonic()
-        for rid, started in list(self._running_since.items()):
-            if now - started >= limit:
-                self._handle_running_stuck(rid)
+    def _expire_stale_running(
+        self,
+        *,
+        limit_s: int | None = None,
+        orphans_only: bool = False,
+    ) -> list[str]:
+        active_limit = max(60, int(TASK_RUNNING_TIMEOUT_S or 300))
+        orphan_limit = max(60, int(limit_s or active_limit))
+        handled: list[str] = []
+        if not orphans_only:
+            now = time.monotonic()
+            for rid, started in list(self._running_since.items()):
+                if now - started >= active_limit:
+                    self._handle_running_stuck(rid)
+                    handled.append(rid)
         for row in activity.list_running_requests():
             if row.id in self._running_since:
                 continue
-            if activity.running_age_seconds(row) >= limit:
+            if activity.running_age_seconds(row) >= orphan_limit:
                 self._handle_running_stuck(row.id)
+                handled.append(row.id)
+        return handled
+
+    def _count_running_by_profile(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for rid in self._running:
+            row = activity.get_request(rid)
+            if not row:
+                continue
+            params = json.loads(row.params_json or "{}")
+            profile_id = str(params.get("profile_id") or "")
+            if profile_id:
+                counts[profile_id] = counts.get(profile_id, 0) + 1
+        return counts
+
+    def scheduler_alive(self) -> bool:
+        return self._scheduler_task is not None and not self._scheduler_task.done()
+
+    async def nudge(self) -> dict[str, Any]:
+        actions: list[str] = []
+        self._prune_running()
+
+        if not self.scheduler_alive():
+            if self._scheduler_task and self._scheduler_task.done():
+                exc = self._scheduler_task.exception()
+                if exc:
+                    logger.error("scheduler died: %s", exc, exc_info=exc)
+            await self.start()
+            actions.append("scheduler_restarted")
+
+        pool = get_extension_pool()
+        drift = pool.reconcile_active_jobs(self._count_running_by_profile())
+        if drift:
+            actions.append("active_jobs_reconciled")
+            logger.warning("active_jobs drift fixed: %s", drift)
+
+        stuck = self._expire_stale_running(
+            limit_s=WORKER_NUDGE_STUCK_S,
+            orphans_only=True,
+        )
+        if stuck:
+            actions.append(f"orphan_running_requeued:{len(stuck)}")
+
+        try:
+            await pool.broadcast({"type": "nudge"})
+        except Exception as exc:
+            logger.warning("extension nudge broadcast failed: %s", exc)
+
+        return {
+            "ok": True,
+            "actions": actions,
+            "queued": activity.count_queued(),
+            "running_slots": self.running_count(),
+            "scheduler_alive": self.scheduler_alive(),
+            "active_jobs_drift": drift,
+            "stale_handled": stuck,
+        }
 
     def _raise_if_cancelled(self, rid: str) -> None:
         if rid in self._cancelled:
@@ -307,50 +374,57 @@ class WorkerController:
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
-            self._prune_running()
-            self._expire_stale_running()
-            settings = get_worker_settings()
-            slots = settings.max_concurrent - len(self._running)
-            started = 0
-            pool = get_extension_pool()
-            if slots > 0 and pool.ready_count() == 0:
-                await asyncio.sleep(POLL_INTERVAL_S)
+            try:
+                started = await self._scheduler_tick()
+            except Exception:
+                logger.exception("scheduler tick failed")
+                await asyncio.sleep(1)
                 continue
-            if slots > 0 and not pool.has_available_profile():
-                await asyncio.sleep(POLL_INTERVAL_S)
-                continue
-            if slots > 0:
-                rows = activity.next_queued_batch(max(slots * 2, slots))
-                started_this_round = 0
-                for row in rows:
-                    if started_this_round >= slots:
-                        break
-                    if row.id in self._running:
-                        continue
-                    row_params = json.loads(row.params_json or "{}")
-                    retry_not_before = float(row_params.get("retry_not_before") or 0)
-                    if retry_not_before > time.time():
-                        continue
-                    if not pick_profile_for_task(row_params.get("profile_id")):
-                        continue
-                    stagger = settings.task_stagger_s
-                    if stagger > 0 and self._last_start_monotonic > 0:
-                        wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
-                        if wait_s > 0:
-                            await asyncio.sleep(wait_s)
-                    row_params.pop("retry_not_before", None)
-                    row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
-                    activity.update_request(row.id, status="running", params=row_params)
-                    events.publish("request_started", {"id": row.id})
-                    self._running_since[row.id] = time.monotonic()
-                    self._running[row.id] = asyncio.create_task(self._run_job(row.id))
-                    self._last_start_monotonic = time.monotonic()
-                    started += 1
-                    started_this_round += 1
             if started == 0 and not self._running:
                 await asyncio.sleep(POLL_INTERVAL_S)
             else:
                 await asyncio.sleep(0.25)
+
+    async def _scheduler_tick(self) -> int:
+        self._prune_running()
+        self._expire_stale_running()
+        settings = get_worker_settings()
+        slots = settings.max_concurrent - len(self._running)
+        started = 0
+        pool = get_extension_pool()
+        if slots > 0 and pool.ready_count() == 0:
+            return 0
+        if slots > 0 and not pool.has_available_profile():
+            return 0
+        if slots > 0:
+            rows = activity.next_queued_batch(max(slots * 2, slots))
+            started_this_round = 0
+            for row in rows:
+                if started_this_round >= slots:
+                    break
+                if row.id in self._running:
+                    continue
+                row_params = json.loads(row.params_json or "{}")
+                retry_not_before = float(row_params.get("retry_not_before") or 0)
+                if retry_not_before > time.time():
+                    continue
+                if not pick_profile_for_task(row_params.get("profile_id")):
+                    continue
+                stagger = settings.task_stagger_s
+                if stagger > 0 and self._last_start_monotonic > 0:
+                    wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+                row_params.pop("retry_not_before", None)
+                row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
+                activity.update_request(row.id, status="running", params=row_params)
+                events.publish("request_started", {"id": row.id})
+                self._running_since[row.id] = time.monotonic()
+                self._running[row.id] = asyncio.create_task(self._run_job(row.id))
+                self._last_start_monotonic = time.monotonic()
+                started += 1
+                started_this_round += 1
+        return started
 
     async def _run_job(self, rid: str) -> None:
         row = activity.get_request(rid)

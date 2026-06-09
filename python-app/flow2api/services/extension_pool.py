@@ -417,6 +417,21 @@ class ExtensionPool:
         if session and session.active_jobs > 0:
             session.active_jobs -= 1
 
+    def reconcile_active_jobs(self, actual_by_profile: dict[str, int]) -> dict[str, dict[str, int]]:
+        """Reset profile slot counters to match worker tasks actually running."""
+        drift: dict[str, dict[str, int]] = {}
+        for session in self._sessions.values():
+            if session.profile_id.startswith("_"):
+                continue
+            actual = max(0, int(actual_by_profile.get(session.profile_id, 0)))
+            if session.active_jobs != actual:
+                drift[session.profile_id] = {
+                    "reported": session.active_jobs,
+                    "actual": actual,
+                }
+                session.active_jobs = actual
+        return drift
+
     async def broadcast(self, payload: dict) -> None:
         for session in self._sessions.values():
             if session.profile_id.startswith("_"):

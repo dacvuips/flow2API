@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from flow2api.config import FRONTEND_DIR, HTTP_HOST, HTTP_PORT, RELOAD
+from flow2api.config import FRONTEND_DIR, HTTP_HOST, HTTP_PORT, RELOAD, WORKER_NUDGE_INTERVAL_S
 from flow2api.db import init_db
 from flow2api.routes.activity import router as activity_router
 from flow2api.routes.admin import router as admin_router
@@ -32,6 +32,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _worker_watchdog() -> None:
+    worker = get_worker()
+    interval = max(30, int(WORKER_NUDGE_INTERVAL_S or 120))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            result = await worker.nudge()
+            if result.get("actions"):
+                logger.info(
+                    "worker nudge (%ss): %s queued=%s running=%s",
+                    interval,
+                    result.get("actions"),
+                    result.get("queued"),
+                    result.get("running_slots"),
+                )
+        except Exception as exc:
+            logger.warning("worker nudge failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -48,13 +67,19 @@ async def lifespan(app: FastAPI):
     ws_task = asyncio.create_task(run_ws_server())
     worker = get_worker()
     worker_task = asyncio.create_task(worker.start())
-    logger.info("flow2api agent started (http:%s + ws:1609 + worker)", HTTP_PORT)
+    watchdog_task = asyncio.create_task(_worker_watchdog())
+    logger.info(
+        "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
+        HTTP_PORT,
+        WORKER_NUDGE_INTERVAL_S,
+    )
     yield
     await worker.stop()
     ws_task.cancel()
     worker_task.cancel()
+    watchdog_task.cancel()
     try:
-        await asyncio.gather(ws_task, worker_task, return_exceptions=True)
+        await asyncio.gather(ws_task, worker_task, watchdog_task, return_exceptions=True)
     except Exception:
         pass
 

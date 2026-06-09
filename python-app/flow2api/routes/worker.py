@@ -86,6 +86,12 @@ async def update_profile_limits(body: ProfileLimitsBulkBody, _=Depends(_auth_key
     return {**saved.to_dict(), "profiles": get_extension_pool().list_public(), "ok": True}
 
 
+@router.post("/nudge")
+async def nudge_worker(_=Depends(_auth_key_id)):
+    worker = get_worker()
+    return await worker.nudge()
+
+
 @router.put("/profile-limits/{profile_id}")
 async def update_one_profile_limit(
     profile_id: str,
