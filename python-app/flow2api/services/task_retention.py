@@ -91,20 +91,28 @@ def purge_old_requests(keep: int | None = None) -> int:
     db = SessionLocal()
     deleted = 0
     try:
-        rows = (
-            db.query(RequestRecord)
-            .order_by(RequestRecord.created_at.desc())
-            .all()
-        )
-        if len(rows) <= limit:
+        total = db.query(RequestRecord).count()
+        if total <= limit:
             return 0
 
-        keep_ids = {row.id for row in rows[:limit]}
+        keep_rows = (
+            db.query(RequestRecord)
+            .order_by(RequestRecord.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        keep_ids = {row.id for row in keep_rows}
         remaining_media: set[str] = set()
-        for row in rows[:limit]:
+        for row in keep_rows:
             remaining_media |= collect_request_media_ids(row)
 
-        for row in rows[limit:]:
+        old_rows = (
+            db.query(RequestRecord)
+            .order_by(RequestRecord.created_at.desc())
+            .offset(limit)
+            .all()
+        )
+        for row in old_rows:
             if row.id in keep_ids:
                 continue
             if row.status in _ACTIVE_STATUSES:

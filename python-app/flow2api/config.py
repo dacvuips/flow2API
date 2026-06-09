@@ -43,6 +43,10 @@ TASK_RUNNING_TIMEOUT_MAX_RETRIES = int(
 )
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))
+# Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
+HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
+HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))
+PURGE_INTERVAL_S = int(os.environ.get("FLOW2API_PURGE_INTERVAL_S", "300"))
 
 VIDEOS_DIR = STORAGE_DIR / "videos"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)

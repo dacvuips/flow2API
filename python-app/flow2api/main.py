@@ -11,7 +11,15 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from flow2api.config import FRONTEND_DIR, HTTP_HOST, HTTP_PORT, RELOAD, WORKER_NUDGE_INTERVAL_S
+from flow2api.config import (
+    ACTIVITY_LIST_LIMIT,
+    FRONTEND_DIR,
+    HTTP_HOST,
+    HTTP_PORT,
+    PURGE_INTERVAL_S,
+    RELOAD,
+    WORKER_NUDGE_INTERVAL_S,
+)
 from flow2api.db import init_db
 from flow2api.routes.activity import router as activity_router
 from flow2api.routes.admin import router as admin_router
@@ -20,7 +28,6 @@ from flow2api.routes.requests import router as requests_router
 from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
 from flow2api.services.ws_server import run_ws_server
-from flow2api.config import ACTIVITY_LIST_LIMIT
 from flow2api.services.task_counters import bootstrap_from_requests_if_empty
 from flow2api.services.task_retention import purge_old_requests
 from flow2api.worker.processor import get_worker
@@ -30,6 +37,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+async def _retention_loop() -> None:
+    interval = max(60, int(PURGE_INTERVAL_S or 300))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deleted = await asyncio.to_thread(purge_old_requests, ACTIVITY_LIST_LIMIT)
+            if deleted:
+                logger.info("background retention purge removed %s task(s)", deleted)
+        except Exception as exc:
+            logger.warning("background retention purge failed: %s", exc)
 
 
 async def _worker_watchdog() -> None:
@@ -59,7 +78,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("task counter bootstrap failed: %s", exc)
     try:
-        purged = purge_old_requests(ACTIVITY_LIST_LIMIT)
+        purged = await asyncio.to_thread(purge_old_requests, ACTIVITY_LIST_LIMIT)
         if purged:
             logger.info("startup retention purge removed %s old task(s)", purged)
     except Exception as exc:
@@ -68,6 +87,7 @@ async def lifespan(app: FastAPI):
     worker = get_worker()
     worker_task = asyncio.create_task(worker.start())
     watchdog_task = asyncio.create_task(_worker_watchdog())
+    retention_task = asyncio.create_task(_retention_loop())
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,
@@ -78,8 +98,11 @@ async def lifespan(app: FastAPI):
     ws_task.cancel()
     worker_task.cancel()
     watchdog_task.cancel()
+    retention_task.cancel()
     try:
-        await asyncio.gather(ws_task, worker_task, watchdog_task, return_exceptions=True)
+        await asyncio.gather(
+            ws_task, worker_task, watchdog_task, retention_task, return_exceptions=True
+        )
     except Exception:
         pass
 

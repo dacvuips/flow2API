@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import httpx
 
-from flow2api.config import VIDEOS_DIR
+from flow2api.config import HTTP_HANDLER_TIMEOUT_S, VIDEOS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ def _read_local_video_bytes(media_id: str) -> Optional[bytes]:
 
 async def _fetch_url_bytes(url: str) -> Optional[bytes]:
     try:
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        cap = max(10.0, min(60.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2))
+        async with httpx.AsyncClient(timeout=cap, follow_redirects=True) as client:
             resp = await client.get(url)
             if resp.status_code == 200 and resp.content:
                 return resp.content

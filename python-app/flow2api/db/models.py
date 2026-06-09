@@ -71,6 +71,9 @@ def init_db() -> None:
     from sqlalchemy import text
 
     with engine.begin() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA synchronous=NORMAL"))
+        conn.execute(text("PRAGMA busy_timeout=5000"))
         cols = {row[1] for row in conn.execute(text("PRAGMA table_info(requests)")).fetchall()}
         if "logs_json" not in cols:
             conn.execute(text("ALTER TABLE requests ADD COLUMN logs_json TEXT DEFAULT '[]'"))

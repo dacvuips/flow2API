@@ -582,7 +582,16 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
-            logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
+            if isinstance(exc, FlowApiError):
+                logger.error(
+                    "worker failed rid=%s step=%s err=%s api_trace=%s",
+                    rid,
+                    exc.step,
+                    msg,
+                    len(api_trace),
+                )
+            else:
+                logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
                 "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
@@ -628,6 +637,10 @@ class WorkerController:
             pool.job_finished(profile_id)
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
+            try:
+                activity.maybe_strip_heavy_params(rid)
+            except Exception as exc:
+                logger.warning("strip heavy params failed rid=%s: %s", rid[:8], exc)
 
     async def _process_one(self, rid: str) -> None:
         self._raise_if_cancelled(rid)

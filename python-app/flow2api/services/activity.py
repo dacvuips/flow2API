@@ -159,6 +159,66 @@ def count_queued() -> int:
         db.close()
 
 
+_LIST_HEAVY_PARAM_KEYS = frozenset(
+    {
+        "image_base64",
+        "imageBase64",
+        "image_base64s",
+        "imageBase64s",
+        "video_base64",
+        "videoBase64",
+        "encoded_video",
+        "encodedVideo",
+        "raw",
+        "raw_dispatch",
+        "last_poll",
+    }
+)
+
+
+def strip_heavy_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Remove large blobs from persisted params (after upload or for API list)."""
+    if not any(k in params for k in _LIST_HEAVY_PARAM_KEYS):
+        return params
+    return slim_params_for_list(params)
+
+
+def slim_params_for_list(params: dict[str, Any]) -> dict[str, Any]:
+    out = {k: v for k, v in params.items() if k not in _LIST_HEAVY_PARAM_KEYS}
+    if params.get("image_base64s"):
+        out["image_base64s_count"] = len(params["image_base64s"])
+    elif params.get("imageBase64s"):
+        out["image_base64s_count"] = len(params["imageBase64s"])
+    return out
+
+
+def maybe_strip_heavy_params(rid: str) -> None:
+    row = get_request(rid)
+    if not row:
+        return
+    params = json.loads(row.params_json or "{}")
+    if not any(k in params for k in _LIST_HEAVY_PARAM_KEYS):
+        return
+    update_request(rid, params=strip_heavy_params(params))
+
+
+def fetch_list_page(page: int, page_size: int) -> tuple[int, list[RequestRecord]]:
+    db = SessionLocal()
+    try:
+        total = db.query(RequestRecord).count()
+        offset = max(0, (page - 1) * page_size)
+        rows = (
+            db.query(RequestRecord)
+            .order_by(RequestRecord.created_at.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+        return total, rows
+    finally:
+        db.close()
+
+
 def summary_stats(*, list_rows: list[RequestRecord] | None = None) -> dict[str, int]:
     c = task_counters.get_counters()
     if list_rows is not None:
@@ -168,7 +228,7 @@ def summary_stats(*, list_rows: list[RequestRecord] | None = None) -> dict[str, 
     return {"total": c.total, "done": c.done, "failed": c.failed, "running": running}
 
 
-def record_to_public(row: RequestRecord) -> dict:
+def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
     result = json.loads(row.result_json or "{}")
     params = json.loads(row.params_json or "{}")
     profile_label = (
@@ -177,6 +237,11 @@ def record_to_public(row: RequestRecord) -> dict:
         or params.get("profile_id")
         or ""
     )
+    if for_list:
+        from flow2api.services.result_media import slim_result_for_list
+
+        params = slim_params_for_list(params)
+        result = slim_result_for_list(result)
     return {
         "id": row.id,
         "type": row.type,

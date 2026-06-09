@@ -3,52 +3,32 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from flow2api.config import VIDEOS_DIR
-from flow2api.services import activity
+import asyncio
+
+from flow2api.config import HTTP_HANDLER_TIMEOUT_S, VIDEOS_DIR
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
-from flow2api.services.worker_settings import get_worker_settings
-from flow2api.worker.processor import get_worker
+from flow2api.services.health_cache import get_health_payload
 
 router = APIRouter(tags=["system"])
 
 
 @router.get("/api/health")
 async def health():
-    pool = get_extension_pool()
-    stats = activity.summary_stats()
-    worker_cfg = get_worker_settings()
-    worker = get_worker()
-    profiles = pool.list_public()
-    first_ready = pool.first_ready()
-    return {
-        "ok": True,
-        "worker": {
-            **worker_cfg.to_dict(),
-            "running_slots": worker.running_count(),
-            "queued": activity.count_queued(),
-            "scheduler_alive": worker.scheduler_alive(),
+    timeout = max(3.0, float(HTTP_HANDLER_TIMEOUT_S or 25))
+    try:
+        return await asyncio.wait_for(get_health_payload(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pool = get_extension_pool()
+        return {
+            "ok": False,
+            "degraded": True,
+            "error": "health_timeout",
+            "extension_connected": pool.any_connected(),
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
-        },
-        "profiles": profiles,
-        "extension": {
-            "connected": pool.any_connected(),
-            "flow_key_present": bool(first_ready and first_ready.flow_key),
-            "token_age_s": first_ready.to_public_dict().get("token_age_s") if first_ready else None,
-            "profiles_online": pool.online_count(),
-            "profiles_ready": pool.ready_count(),
-        },
-        "extension_connected": pool.any_connected(),
-        "ws_stats": {
-            "connected": pool.any_connected(),
-            "profiles_online": pool.online_count(),
-            "profiles_ready": pool.ready_count(),
-            "accounts": profiles,
-        },
-        "queue": stats,
-        "debug_version": 3,
-    }
+            "debug_version": 4,
+        }
 
 
 @router.post("/api/ext/callback")
