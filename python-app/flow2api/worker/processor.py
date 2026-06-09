@@ -22,6 +22,7 @@ from flow2api.services.flow_sdk import (
     FlowApiError,
     GetMedia404Error,
     format_api_error,
+    is_extension_timeout_error,
     is_get_media_404_failure,
     is_upload_image_internal_failure,
 )
@@ -483,6 +484,30 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
+            extension_timeout_retry = int(retry_params.get("extension_timeout_retry_count") or 0)
+            if (
+                is_extension_timeout_error(msg, exc)
+                and extension_timeout_retry < RECAPTCHA_RETRY_MAX
+            ):
+                delay_s = flow_sdk.recaptcha_retry_delay(extension_timeout_retry)
+                retry_params["extension_timeout_retry_count"] = extension_timeout_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params.pop("running_started_at", None)
+                activity.update_request(
+                    rid,
+                    status="queued",
+                    params=retry_params,
+                    error=msg,
+                )
+                logger.warning(
+                    "extension_timeout retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    extension_timeout_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                )
+                events.publish("request_finished", {"id": rid, "status": "queued"})
+                return
             logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
@@ -567,11 +592,13 @@ class WorkerController:
                 params.get("recaptcha_retry_count")
                 or params.get("get_media_404_retry_count")
                 or params.get("upload_internal_retry_count")
+                or params.get("extension_timeout_retry_count")
                 or params.get("retry_not_before")
             ):
                 params.pop("recaptcha_retry_count", None)
                 params.pop("get_media_404_retry_count", None)
                 params.pop("upload_internal_retry_count", None)
+                params.pop("extension_timeout_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
@@ -707,6 +734,7 @@ class WorkerController:
                     done_params.pop("recaptcha_retry_count", None) is not None
                     or done_params.pop("get_media_404_retry_count", None) is not None
                     or done_params.pop("upload_internal_retry_count", None) is not None
+                    or done_params.pop("extension_timeout_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
                     activity.update_request(rid, params=done_params)

@@ -683,6 +683,18 @@ def is_upload_image_internal_failure(
     return "upload_image_failed" in text and "internal error encountered" in text
 
 
+def is_extension_timeout_error(msg: str = "", exc: Exception | None = None) -> bool:
+    """Extension bridge did not respond in time — safe to retry after a short wait."""
+    text = str(msg or "").strip().lower()
+    if text == "extension_timeout" or text.startswith("extension_timeout"):
+        return True
+    if exc is None:
+        return False
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    return "extension_timeout" in str(exc).lower()
+
+
 _RECAPTCHA_ERR_RE = re.compile(r"re\s*[-_]?\s*captcha|captcha", re.IGNORECASE)
 
 
