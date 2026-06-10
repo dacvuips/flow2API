@@ -45,6 +45,7 @@ _RETRY_DROP_KEYS = frozenset(
         "get_media_404_retry_count",
         "upload_internal_retry_count",
         "extension_timeout_retry_count",
+        "prominent_people_retry_count",
         "retry_not_before",
     }
 )

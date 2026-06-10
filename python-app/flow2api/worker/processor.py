@@ -25,6 +25,7 @@ from flow2api.services.flow_sdk import (
     format_api_error,
     is_extension_timeout_error,
     is_get_media_404_failure,
+    is_prominent_people_filter_failure,
     is_upload_image_internal_failure,
 )
 from flow2api.services.dashboard_events import events
@@ -582,6 +583,30 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
+            prominent_people_retry = int(retry_params.get("prominent_people_retry_count") or 0)
+            if (
+                is_prominent_people_filter_failure(exc, msg, api_trace)
+                and prominent_people_retry < RECAPTCHA_RETRY_MAX
+            ):
+                delay_s = flow_sdk.recaptcha_retry_delay(prominent_people_retry)
+                retry_params["prominent_people_retry_count"] = prominent_people_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params.pop("running_started_at", None)
+                activity.update_request(
+                    rid,
+                    status="queued",
+                    params=retry_params,
+                    error=msg,
+                )
+                logger.warning(
+                    "prominent_people filter retry %s/%s rid=%s — chờ %.1fs rồi submit lại",
+                    prominent_people_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                )
+                events.publish("request_finished", {"id": rid, "status": "queued"})
+                return
             if isinstance(exc, FlowApiError):
                 logger.error(
                     "worker failed rid=%s step=%s err=%s api_trace=%s",
@@ -680,12 +705,14 @@ class WorkerController:
                 or params.get("get_media_404_retry_count")
                 or params.get("upload_internal_retry_count")
                 or params.get("extension_timeout_retry_count")
+                or params.get("prominent_people_retry_count")
                 or params.get("retry_not_before")
             ):
                 params.pop("recaptcha_retry_count", None)
                 params.pop("get_media_404_retry_count", None)
                 params.pop("upload_internal_retry_count", None)
                 params.pop("extension_timeout_retry_count", None)
+                params.pop("prominent_people_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
@@ -822,6 +849,7 @@ class WorkerController:
                     or done_params.pop("get_media_404_retry_count", None) is not None
                     or done_params.pop("upload_internal_retry_count", None) is not None
                     or done_params.pop("extension_timeout_retry_count", None) is not None
+                    or done_params.pop("prominent_people_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
                     activity.update_request(rid, params=done_params)
@@ -847,7 +875,7 @@ class WorkerController:
                 raise
             except RuntimeError as exc:
                 msg = str(exc)
-                if msg == "video_generation_failed":
+                if msg == "video_generation_failed" or is_prominent_people_filter_failure(exc, msg, None):
                     raise
                 if workflow_ops:
                     urls, media = await flow_sdk.poll_workflow_videos(

@@ -6,6 +6,7 @@ Ported from Flow2API / flowkit patterns.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 import time
@@ -1109,6 +1110,98 @@ def parse_media_poll_result(data: dict) -> tuple[dict[str, str], bool, bool]:
     return completed, all_done, any_failed
 
 
+def _poll_entry_failure_message(entry: dict) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    meta = entry.get("mediaMetadata") or {}
+    if isinstance(meta, dict):
+        media_status = meta.get("mediaStatus") or {}
+        if isinstance(media_status, dict):
+            err = media_status.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("status")
+                if msg:
+                    return str(msg)
+    op = entry.get("operation") or entry
+    if isinstance(op, dict):
+        err = entry.get("error") or op.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("status")
+            if msg:
+                return str(msg)
+        if err:
+            return str(err)
+    return ""
+
+
+def extract_media_poll_failure_error(data: dict) -> str:
+    """First API error message from a failed video media poll response."""
+    if not isinstance(data, dict):
+        return ""
+    for entry in data.get("media") or []:
+        if not isinstance(entry, dict):
+            continue
+        if not _poll_entry_failed(_extract_poll_status(entry)):
+            continue
+        msg = _poll_entry_failure_message(entry)
+        if msg:
+            return msg
+    for entry in data.get("operations") or []:
+        if not isinstance(entry, dict):
+            continue
+        op = entry.get("operation") or entry
+        status = entry.get("status") or op.get("status") or ""
+        if not _poll_entry_failed(status):
+            continue
+        msg = _poll_entry_failure_message(entry)
+        if msg:
+            return msg
+    return ""
+
+
+def _payload_has_prominent_people_filter(payload: Any) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        text = json.dumps(payload, ensure_ascii=False)
+    else:
+        text = str(payload)
+    upper = text.upper()
+    return (
+        "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in upper
+        or "PROMINENT_PERSON" in upper
+    )
+
+
+def is_prominent_people_filter_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    if _payload_has_prominent_people_filter(msg):
+        return True
+    if exc is not None and _payload_has_prominent_people_filter(str(exc)):
+        return True
+    if isinstance(exc, FlowApiError):
+        for attempt in exc.attempts or []:
+            if _payload_has_prominent_people_filter(attempt):
+                return True
+            response = attempt.get("response") if isinstance(attempt, dict) else None
+            if isinstance(response, dict):
+                data = response.get("data")
+                if _payload_has_prominent_people_filter(data):
+                    return True
+    for entry in api_trace or []:
+        label = str(entry.get("label") or "")
+        if label and "poll" not in label.lower() and label != "video_poll_media":
+            continue
+        if _payload_has_prominent_people_filter(entry.get("data")):
+            return True
+        if _payload_has_prominent_people_filter(entry):
+            return True
+    return False
+
+
 def _get_media_http_error(resp: dict, status: int) -> str:
     data = resp.get("data")
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
@@ -1298,7 +1391,7 @@ async def poll_video_by_media(
 
         if any_failed and not completed:
             raise FlowApiError(
-                "video_generation_failed",
+                extract_media_poll_failure_error(poll) or "video_generation_failed",
                 step="video_poll_media",
                 attempts=poll_snapshots,
             )
