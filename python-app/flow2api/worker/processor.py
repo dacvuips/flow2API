@@ -90,6 +90,18 @@ class WorkerController:
     def request_cancel(self, rid: str) -> None:
         self._cancelled.add(rid)
 
+    def prepare_retry(self, rid: str) -> None:
+        """Stop in-flight work so the same request id can run again."""
+        self._prune_running()
+        task = self._running.get(rid)
+        self._running_since.pop(rid, None)
+        if task and not task.done():
+            self.request_cancel(rid)
+            task.cancel()
+        else:
+            self._cancelled.discard(rid)
+            self._running.pop(rid, None)
+
     def _handle_running_stuck(self, rid: str) -> None:
         """Requeue running task when stuck; fail after max retries."""
         row = activity.get_request(rid)

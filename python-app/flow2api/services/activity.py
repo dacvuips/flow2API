@@ -37,6 +37,27 @@ def create_request(
         db.close()
 
 
+def requeue_request(rid: str, params: dict[str, Any]) -> Optional[RequestRecord]:
+    """Reset an existing request to queued (same id) for manual retry."""
+    db = SessionLocal()
+    try:
+        row = db.get(RequestRecord, rid)
+        if not row:
+            return None
+        old_status = row.status
+        row.status = "queued"
+        row.params_json = json.dumps(params, ensure_ascii=False)
+        row.result_json = "{}"
+        row.error = None
+        row.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(row)
+        task_counters.on_status_transition(old_status, "queued")
+        return row
+    finally:
+        db.close()
+
+
 def update_request(rid: str, **fields: Any) -> None:
     db = SessionLocal()
     try:

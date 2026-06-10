@@ -47,6 +47,8 @@ _RETRY_DROP_KEYS = frozenset(
         "extension_timeout_retry_count",
         "prominent_people_retry_count",
         "retry_not_before",
+        "running_started_at",
+        "running_timeout_retry_count",
     }
 )
 
@@ -93,17 +95,17 @@ async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)
     if not row:
         raise HTTPException(404, "not_found")
     params = _params_for_retry(json.loads(row.params_json or "{}"))
-    rid = new_request_id()
-    activity.create_request(rid, row.type, row.prompt, row.model, params, api_key_id=api_key_id)
+    activity.requeue_request(request_id, params)
+    get_worker().prepare_retry(request_id)
     append_request_log(
-        rid,
+        request_id,
         "http",
         f"POST /api/requests/{request_id}/retry",
         level="info",
-        data={"source_id": request_id, "type": row.type},
+        data={"type": row.type},
     )
-    events.publish("request_finished", {"id": rid, "status": "queued"})
-    return {"id": rid, "status": "queued", "source_id": request_id}
+    events.publish("request_finished", {"id": request_id, "status": "queued"})
+    return {"id": request_id, "status": "queued"}
 
 
 @router.get("/{request_id}")
