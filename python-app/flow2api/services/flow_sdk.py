@@ -396,13 +396,80 @@ def _iter_generated_images(data: dict) -> list[dict]:
     return out
 
 
+def _image_entry_url(entry: dict) -> str | None:
+    url = entry.get("fifeUrl") or entry.get("imageUri") or entry.get("url")
+    if url:
+        return str(url)
+    encoded = entry.get("encodedImage")
+    if encoded:
+        return f"data:image/jpeg;base64,{encoded}"
+    return None
+
+
 def extract_image_urls(data: dict) -> list[str]:
     urls: list[str] = []
     for entry in _iter_generated_images(data):
-        url = entry.get("fifeUrl") or entry.get("url")
+        url = _image_entry_url(entry)
         if url:
             urls.append(url)
     return urls
+
+
+def build_image_media_entries(data: dict) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for entry in _iter_generated_images(data):
+        url = _image_entry_url(entry)
+        mid = entry.get("mediaId") or entry.get("name")
+        if url or mid:
+            entries.append({"url": url, "media_id": mid, "kind": "image"})
+    return entries
+
+
+def _unwrap_get_media_payload(resp: dict) -> dict:
+    payload = resp.get("data") or resp
+    if not isinstance(payload, dict):
+        return {}
+    if "video" not in payload and "image" not in payload:
+        inner = payload.get("data")
+        if isinstance(inner, dict):
+            payload = inner
+    return payload if isinstance(payload, dict) else {}
+
+
+def parse_get_media_image(resp: dict) -> tuple[str | None, bytes | None, str]:
+    """Return (remote_url, raw_bytes, mime_type) from GET /v1/media/{id}."""
+    payload = _unwrap_get_media_payload(resp)
+    image_block = (payload.get("image") or {}) if isinstance(payload, dict) else {}
+    generated = (
+        (image_block.get("generatedImage") or {})
+        if isinstance(image_block, dict)
+        else {}
+    )
+    url = (
+        generated.get("fifeUrl")
+        or generated.get("imageUri")
+        or image_block.get("fifeUrl")
+        or (payload.get("fifeUrl") if isinstance(payload, dict) else None)
+    )
+    encoded = (
+        generated.get("encodedImage")
+        or image_block.get("encodedImage")
+        or ""
+    )
+    if encoded:
+        try:
+            raw = base64.b64decode(encoded)
+            mime = (
+                "image/png"
+                if raw[:8] == b"\x89PNG\r\n\x1a\n"
+                else "image/jpeg"
+            )
+            return None, raw, mime
+        except Exception:
+            pass
+    if url:
+        return str(url), None, "image/jpeg"
+    return None, None, "image/jpeg"
 
 
 def extract_image_media_ids(data: dict) -> list[str]:

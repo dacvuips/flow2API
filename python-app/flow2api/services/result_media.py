@@ -111,6 +111,40 @@ async def _media_ids_to_base64(media_ids: Any) -> list[str]:
     return out
 
 
+async def _media_id_image_to_base64(media_id: str) -> Optional[str]:
+    from flow2api.services.flow_client import get_flow_client
+    from flow2api.services.flow_sdk import parse_get_media_image
+
+    client = get_flow_client()
+    if not client.connected:
+        return None
+    try:
+        resp = await client.get_media(media_id)
+        url, raw, _mime = parse_get_media_image(resp if isinstance(resp, dict) else {})
+        if raw:
+            return base64.b64encode(raw).decode("ascii")
+        if url:
+            data = await _fetch_url_bytes(url)
+            if data:
+                return base64.b64encode(data).decode("ascii")
+    except Exception as exc:
+        logger.warning("get_media image embed failed %s: %s", media_id[:12], exc)
+    return None
+
+
+async def _image_media_ids_to_base64(media_ids: Any) -> list[str]:
+    if not isinstance(media_ids, list):
+        return []
+    out: list[str] = []
+    for mid in media_ids:
+        if not mid:
+            continue
+        b64 = await _media_id_image_to_base64(str(mid))
+        if b64:
+            out.append(b64)
+    return out
+
+
 async def embed_result_base64(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         return result
@@ -129,6 +163,8 @@ async def embed_result_base64(result: dict[str, Any]) -> dict[str, Any]:
         video_b64 = await _urls_to_base64(video_sources)
 
     image_b64 = await _urls_to_base64(out.get("image_urls"))
+    if not image_b64 and isinstance(out.get("media_ids"), list):
+        image_b64 = await _image_media_ids_to_base64(out["media_ids"])
 
     if video_b64:
         out["video_urls"] = video_b64

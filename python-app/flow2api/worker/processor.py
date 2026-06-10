@@ -711,7 +711,12 @@ class WorkerController:
             )
             urls = flow_sdk.extract_image_urls(raw)
             media_ids = flow_sdk.extract_image_media_ids(raw)
-            result = {"image_urls": urls, "media_ids": media_ids}
+            media_entries = flow_sdk.build_image_media_entries(raw)
+            result = {
+                "image_urls": urls,
+                "media_ids": media_ids,
+                "media_entries": media_entries,
+            }
             if (
                 params.get("recaptcha_retry_count")
                 or params.get("get_media_404_retry_count")
