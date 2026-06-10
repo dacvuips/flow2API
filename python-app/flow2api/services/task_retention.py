@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Any
 
-from flow2api.config import ACTIVITY_LIST_LIMIT, VIDEOS_DIR
+from flow2api.config import ACTIVITY_LIST_LIMIT, INPUTS_DIR, VIDEOS_DIR
 from flow2api.db.models import RequestRecord, SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,19 @@ def _delete_local_video(media_id: str) -> None:
         logger.warning("failed to delete video %s: %s", media_id[:8], exc)
 
 
+def _delete_input_previews(request_id: str) -> None:
+    import shutil
+
+    dir_path = INPUTS_DIR / request_id
+    if not dir_path.is_dir():
+        return
+    try:
+        shutil.rmtree(dir_path)
+        logger.info("purged input previews %s", request_id[:8])
+    except OSError as exc:
+        logger.warning("failed to delete input previews %s: %s", request_id[:8], exc)
+
+
 def purge_old_requests(keep: int | None = None) -> int:
     """Delete finished tasks older than the newest `keep` rows (+ their media)."""
     limit = max(1, int(keep or ACTIVITY_LIST_LIMIT))
@@ -121,6 +134,7 @@ def purge_old_requests(keep: int | None = None) -> int:
             purge_media = collect_request_media_ids(row) - remaining_media
             for mid in purge_media:
                 _delete_local_video(mid)
+            _delete_input_previews(row.id)
 
             db.delete(row)
             deleted += 1

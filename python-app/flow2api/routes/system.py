@@ -8,7 +8,7 @@ import logging
 
 import httpx
 
-from flow2api.config import HTTP_HANDLER_TIMEOUT_S, VIDEOS_DIR
+from flow2api.config import HTTP_HANDLER_TIMEOUT_S, INPUTS_DIR, VIDEOS_DIR
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.flow_client import get_flow_client
@@ -49,6 +49,23 @@ async def ext_callback(
     payload = await request.json()
     pool.resolve_callback(payload)
     return {"ok": True}
+
+
+@router.get("/inputs/{request_id}/{filename}")
+async def serve_input_image(request_id: str, filename: str):
+    if ".." in request_id or ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "invalid path")
+    path = INPUTS_DIR / request_id / filename
+    if not path.is_file():
+        raise HTTPException(404, "not_found")
+    ext = path.suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=mime)
 
 
 @router.get("/media/{media_id:path}")

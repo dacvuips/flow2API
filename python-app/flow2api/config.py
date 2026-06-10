@@ -49,6 +49,8 @@ HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))
 PURGE_INTERVAL_S = int(os.environ.get("FLOW2API_PURGE_INTERVAL_S", "300"))
 
 VIDEOS_DIR = STORAGE_DIR / "videos"
+INPUTS_DIR = STORAGE_DIR / "inputs"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+INPUTS_DIR.mkdir(parents=True, exist_ok=True)
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)

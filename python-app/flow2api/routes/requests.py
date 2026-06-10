@@ -79,6 +79,13 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
     prompt = str(params.get("prompt") or "")
     model = params.get("image_model") or params.get("video_quality") or ""
     rid = new_request_id()
+    image_base64s = params.get("image_base64s") or params.get("imageBase64s") or []
+    if image_base64s:
+        from flow2api.services.result_media import persist_input_previews
+
+        preview_urls = persist_input_previews(rid, image_base64s)
+        if preview_urls:
+            params["input_preview_urls"] = preview_urls
     activity.create_request(rid, body.type, prompt, str(model), params, api_key_id=api_key_id)
     append_request_log(
         rid,

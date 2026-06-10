@@ -292,13 +292,19 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
         or ""
     )
     if for_list:
-        from flow2api.services.result_media import preview_items_from_result, slim_result_for_list
+        from flow2api.services.result_media import (
+            input_preview_items_from_params,
+            preview_items_from_result,
+            slim_result_for_list,
+        )
 
         preview_items = preview_items_from_result(result, row.type)
+        input_preview_items = input_preview_items_from_params(params)
         params = slim_params_for_list(params)
         result = slim_result_for_list(result)
     else:
         preview_items = []
+        input_preview_items = []
     payload = {
         "id": row.id,
         "type": row.type,
@@ -317,4 +323,6 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
     if for_list:
         payload["preview_items"] = preview_items
         payload["output_count"] = len(preview_items)
+        payload["input_preview_items"] = input_preview_items
+        payload["input_count"] = len(input_preview_items)
     return payload

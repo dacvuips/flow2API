@@ -255,6 +255,109 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     return items[:4]
 
 
+def _decode_image_bytes(b64: str) -> tuple[bytes, str] | None:
+    s = str(b64 or "").strip()
+    if not s:
+        return None
+    if s.startswith("data:"):
+        header, _, payload = s.partition(",")
+        mime = "image/jpeg"
+        lower = header.lower()
+        if "png" in lower:
+            mime = "image/png"
+        elif "webp" in lower:
+            mime = "image/webp"
+        try:
+            return base64.b64decode(payload), mime
+        except Exception:
+            return None
+    if _is_probably_pure_base64(s):
+        try:
+            raw = base64.b64decode(s)
+            mime = (
+                "image/png"
+                if raw[:8] == b"\x89PNG\r\n\x1a\n"
+                else "image/jpeg"
+            )
+            return raw, mime
+        except Exception:
+            return None
+    return None
+
+
+def persist_input_previews(
+    request_id: str,
+    image_base64s: list[str],
+    *,
+    max_items: int = 3,
+) -> list[str]:
+    """Save input images locally for lightweight list previews."""
+    from flow2api.config import INPUTS_DIR
+
+    if not image_base64s:
+        return []
+    out_dir = INPUTS_DIR / request_id
+    urls: list[str] = []
+    for idx, b64 in enumerate(image_base64s[:max_items]):
+        decoded = _decode_image_bytes(b64)
+        if not decoded:
+            continue
+        raw, mime = decoded
+        ext = (
+            "png"
+            if mime == "image/png"
+            else ("webp" if mime == "image/webp" else "jpg")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{idx}.{ext}"
+        (out_dir / filename).write_bytes(raw)
+        urls.append(f"/inputs/{request_id}/{filename}")
+    return urls
+
+
+def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:
+    """Lightweight input previews for task list (URLs only)."""
+    if not isinstance(params, dict):
+        return []
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(url: str, media_id: str = "") -> None:
+        u = str(url or "").strip()
+        if not u or u in seen:
+            return
+        if u.startswith("data:") or _is_probably_pure_base64(u):
+            return
+        seen.add(u)
+        item: dict[str, str] = {"url": u, "kind": "image"}
+        mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
+        if mid:
+            item["media_id"] = mid
+        items.append(item)
+
+    start = str(params.get("start_media_id") or "").strip()
+    end = str(params.get("end_media_id") or "").strip()
+    ref_ids = [
+        str(mid or "").strip()
+        for mid in (params.get("reference_media_ids") or [])
+        if str(mid or "").strip()
+    ]
+    has_media_ids = bool(start or end or ref_ids)
+
+    if has_media_ids:
+        if start:
+            add(f"/media/{start}", start)
+        if end:
+            add(f"/media/{end}", end)
+        for mid_s in ref_ids:
+            add(f"/media/{mid_s}", mid_s)
+    else:
+        for u in params.get("input_preview_urls") or []:
+            add(str(u))
+
+    return items[:3]
+
+
 async def with_base64_media(
     payload: dict[str, Any],
     *,
