@@ -6,7 +6,7 @@ Agent phân bổ task round-robin qua ExtensionPool.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from flow2api.services.extension_pool import ExtensionSession, get_extension_pool
 
@@ -50,3 +50,53 @@ def pick_profile_for_task(existing_profile_id: Optional[str] = None) -> Optional
                 return existing_profile_id
         return None
     return pool.pick_round_robin()
+
+
+def pick_profile_for_retry(current_profile_id: str) -> Optional[str]:
+    return get_extension_pool().pick_profile_for_retry(current_profile_id)
+
+
+def profile_available_for_queue(params: dict[str, Any]) -> bool:
+    pid = params.get("profile_id")
+    if pid:
+        return bool(pick_profile_for_task(str(pid)))
+    exclude = params.get("retry_exclude_profile_id")
+    if exclude:
+        return bool(pick_profile_for_retry(str(exclude)))
+    return bool(pick_profile_for_task(None))
+
+
+def apply_retry_profile_rotation(params: dict[str, Any]) -> dict[str, Any]:
+    """Advance retry to the next profile in ring order (idle first; same profile after full cycle)."""
+    out = dict(params or {})
+    current = str(
+        out.get("profile_id") or out.get("retry_exclude_profile_id") or ""
+    ).strip()
+    if not current:
+        out.pop("retry_exclude_profile_id", None)
+        return out
+
+    pool = get_extension_pool()
+    next_id = pool.pick_profile_for_retry(current)
+
+    if not next_id:
+        out.pop("profile_id", None)
+        out.pop("profile_label", None)
+        out.pop("profile_email", None)
+        out["retry_exclude_profile_id"] = current
+        return out
+
+    if next_id != current:
+        for media_key in ("start_media_id", "end_media_id", "reference_media_ids"):
+            out.pop(media_key, None)
+
+    session = pool.get(next_id)
+    out["profile_id"] = next_id
+    if session:
+        out["profile_label"] = session.display_name()
+        if session.email:
+            out["profile_email"] = session.email
+        else:
+            out.pop("profile_email", None)
+    out.pop("retry_exclude_profile_id", None)
+    return out

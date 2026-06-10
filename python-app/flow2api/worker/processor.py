@@ -33,9 +33,12 @@ from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.flow_client import (
+    apply_retry_profile_rotation,
     bind_task_profile,
     get_flow_client,
+    pick_profile_for_retry,
     pick_profile_for_task,
+    profile_available_for_queue,
     unbind_task_profile,
 )
 logger = logging.getLogger(__name__)
@@ -117,6 +120,7 @@ class WorkerController:
 
         if retry_count < max_retries:
             params["running_timeout_retry_count"] = retry_count + 1
+            params = apply_retry_profile_rotation(params)
             params.pop("running_started_at", None)
             activity.update_request(
                 rid,
@@ -374,17 +378,39 @@ class WorkerController:
 
     def _assign_profile(self, rid: str, params: dict[str, Any]) -> str:
         existing = params.get("profile_id")
-        profile_id = pick_profile_for_task(str(existing) if existing else None)
+        exclude = params.get("retry_exclude_profile_id")
+        if existing:
+            profile_id = pick_profile_for_task(str(existing))
+        elif exclude:
+            profile_id = pick_profile_for_retry(str(exclude))
+        else:
+            profile_id = pick_profile_for_task(None)
         if not profile_id:
             raise RuntimeError("no_extension_profile_online")
         session = get_extension_pool().get(profile_id)
         params["profile_id"] = profile_id
+        params.pop("retry_exclude_profile_id", None)
         if session:
             params["profile_label"] = session.display_name()
             if session.email:
                 params["profile_email"] = session.email
+            else:
+                params.pop("profile_email", None)
         self._persist_params(rid, params)
         return profile_id
+
+    def _requeue_for_retry(
+        self,
+        rid: str,
+        params: dict[str, Any],
+        *,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        params = apply_retry_profile_rotation(params)
+        params.pop("running_started_at", None)
+        activity.update_request(rid, status="queued", params=params, error=error)
+        events.publish("request_finished", {"id": rid, "status": "queued"})
+        return params
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
@@ -422,7 +448,7 @@ class WorkerController:
                 retry_not_before = float(row_params.get("retry_not_before") or 0)
                 if retry_not_before > time.time():
                     continue
-                if not pick_profile_for_task(row_params.get("profile_id")):
+                if not profile_available_for_queue(row_params):
                     continue
                 stagger = settings.task_stagger_s
                 if stagger > 0 and self._last_start_monotonic > 0:
@@ -514,39 +540,27 @@ class WorkerController:
                 delay_s = flow_sdk.recaptcha_retry_delay(recaptcha_retry)
                 retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "reCAPTCHA retry %s/%s rid=%s — chờ %.1fs rồi thử lại (giữ media upload)",
+                    "reCAPTCHA retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     recaptcha_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
             if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "get_media 404 retry %s/%s rid=%s — đưa lại queue, thử lại",
+                    "get_media 404 retry %s/%s rid=%s — profile=%s",
                     get_media_404_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
             if (
@@ -556,21 +570,15 @@ class WorkerController:
                 delay_s = flow_sdk.recaptcha_retry_delay(upload_internal_retry)
                 retry_params["upload_internal_retry_count"] = upload_internal_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "upload_image internal error retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    "upload_image internal error retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     upload_internal_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             extension_timeout_retry = int(retry_params.get("extension_timeout_retry_count") or 0)
             if (
@@ -580,21 +588,15 @@ class WorkerController:
                 delay_s = flow_sdk.recaptcha_retry_delay(extension_timeout_retry)
                 retry_params["extension_timeout_retry_count"] = extension_timeout_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "extension_timeout retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    "extension_timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     extension_timeout_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             prominent_people_retry = int(retry_params.get("prominent_people_retry_count") or 0)
             if (
@@ -604,21 +606,15 @@ class WorkerController:
                 delay_s = flow_sdk.recaptcha_retry_delay(prominent_people_retry)
                 retry_params["prominent_people_retry_count"] = prominent_people_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "prominent_people filter retry %s/%s rid=%s — chờ %.1fs rồi submit lại",
+                    "prominent_people filter retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     prominent_people_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             invalid_argument_retry = int(retry_params.get("invalid_argument_retry_count") or 0)
             if (
@@ -628,21 +624,15 @@ class WorkerController:
                 delay_s = flow_sdk.recaptcha_retry_delay(invalid_argument_retry)
                 retry_params["invalid_argument_retry_count"] = invalid_argument_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params.pop("running_started_at", None)
-                activity.update_request(
-                    rid,
-                    status="queued",
-                    params=retry_params,
-                    error=msg,
-                )
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 logger.warning(
-                    "INVALID_ARGUMENT / PUBLIC_ERROR_MINOR retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    "INVALID_ARGUMENT / PUBLIC_ERROR_MINOR retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     invalid_argument_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
-                events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
             if isinstance(exc, FlowApiError):
                 logger.error(

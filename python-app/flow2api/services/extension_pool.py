@@ -407,6 +407,37 @@ class ExtensionPool:
         pick.assigned_total += 1
         return pick.profile_id
 
+    def pick_profile_for_retry(self, current_profile_id: str) -> Optional[str]:
+        """Next profile in stable ring order; idle first; *current* only after full cycle."""
+        from flow2api.services.worker_settings import get_profile_max_concurrent
+
+        current = (current_profile_id or "").strip()
+        eligible: list[ExtensionSession] = []
+        for session in self.ready_sessions():
+            if session.profile_id.startswith("_"):
+                continue
+            limit = get_profile_max_concurrent(session.profile_id)
+            if session.active_jobs < limit:
+                eligible.append(session)
+        if not eligible:
+            return None
+
+        eligible.sort(key=lambda s: s.profile_id)
+        ids = [s.profile_id for s in eligible]
+        by_id = {s.profile_id: s for s in eligible}
+
+        if current not in ids:
+            idle = [s for s in eligible if s.active_jobs == 0]
+            return (idle[0] if idle else eligible[0]).profile_id
+
+        start = ids.index(current)
+        # Offsets 1..n: walk the list in order; offset n returns to *current*.
+        for offset in range(1, len(ids) + 1):
+            pid = ids[(start + offset) % len(ids)]
+            if by_id[pid].active_jobs == 0:
+                return pid
+        return ids[(start + 1) % len(ids)]
+
     def job_started(self, profile_id: str) -> None:
         session = self._sessions.get(profile_id)
         if session:

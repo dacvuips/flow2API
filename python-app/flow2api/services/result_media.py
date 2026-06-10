@@ -382,6 +382,7 @@ def prepare_params_for_manual_retry(params: dict[str, Any], request_id: str) -> 
         "retry_not_before",
         "running_started_at",
         "running_timeout_retry_count",
+        "retry_exclude_profile_id",
     ):
         out.pop(key, None)
     # profile_id/label/email dropped so scheduler can reassign profile

@@ -50,6 +50,7 @@ _RETRY_DROP_KEYS = frozenset(
         "retry_not_before",
         "running_started_at",
         "running_timeout_retry_count",
+        "retry_exclude_profile_id",
         "start_media_id",
         "end_media_id",
         "reference_media_ids",
