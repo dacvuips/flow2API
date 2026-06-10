@@ -751,6 +751,47 @@ def is_upload_image_internal_failure(
     return "upload_image_failed" in text and "internal error encountered" in text
 
 
+def _payload_has_trpc_401(payload: Any) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        text = json.dumps(payload, ensure_ascii=False)
+    else:
+        text = str(payload)
+    upper = text.upper()
+    return "TRPC_401" in upper
+
+
+def is_trpc_401_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    if _payload_has_trpc_401(msg):
+        return True
+    if exc is not None:
+        if _payload_has_trpc_401(str(exc)):
+            return True
+        if isinstance(exc, FlowApiError):
+            if _payload_has_trpc_401(exc.raw):
+                return True
+            for attempt in exc.attempts or []:
+                if _payload_has_trpc_401(attempt):
+                    return True
+                response = attempt.get("response") if isinstance(attempt, dict) else None
+                if isinstance(response, dict):
+                    if _payload_has_trpc_401(response):
+                        return True
+                    if _payload_has_trpc_401(response.get("data")):
+                        return True
+    for entry in api_trace or []:
+        if _payload_has_trpc_401(entry.get("data")):
+            return True
+        if _payload_has_trpc_401(entry):
+            return True
+    return False
+
+
 def is_extension_timeout_error(msg: str = "", exc: Exception | None = None) -> bool:
     """Extension bridge did not respond in time — safe to retry after a short wait."""
     text = str(msg or "").strip().lower()

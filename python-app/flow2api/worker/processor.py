@@ -27,6 +27,7 @@ from flow2api.services.flow_sdk import (
     is_get_media_404_failure,
     is_invalid_argument_retry_failure,
     is_prominent_people_filter_failure,
+    is_trpc_401_failure,
     is_upload_image_internal_failure,
 )
 from flow2api.services.dashboard_events import events
@@ -634,6 +635,21 @@ class WorkerController:
                     str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
                 return
+            trpc_401_retry = int(retry_params.get("trpc_401_retry_count") or 0)
+            if is_trpc_401_failure(exc, msg, api_trace) and trpc_401_retry < RECAPTCHA_RETRY_MAX:
+                delay_s = flow_sdk.recaptcha_retry_delay(trpc_401_retry)
+                retry_params["trpc_401_retry_count"] = trpc_401_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                logger.warning(
+                    "TRPC_401 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                    trpc_401_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                )
+                return
             if isinstance(exc, FlowApiError):
                 logger.error(
                     "worker failed rid=%s step=%s err=%s api_trace=%s",
@@ -739,6 +755,7 @@ class WorkerController:
                 or params.get("extension_timeout_retry_count")
                 or params.get("prominent_people_retry_count")
                 or params.get("invalid_argument_retry_count")
+                or params.get("trpc_401_retry_count")
                 or params.get("retry_not_before")
             ):
                 params.pop("recaptcha_retry_count", None)
@@ -747,6 +764,7 @@ class WorkerController:
                 params.pop("extension_timeout_retry_count", None)
                 params.pop("prominent_people_retry_count", None)
                 params.pop("invalid_argument_retry_count", None)
+                params.pop("trpc_401_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
@@ -885,6 +903,7 @@ class WorkerController:
                     or done_params.pop("extension_timeout_retry_count", None) is not None
                     or done_params.pop("prominent_people_retry_count", None) is not None
                     or done_params.pop("invalid_argument_retry_count", None) is not None
+                    or done_params.pop("trpc_401_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
                     activity.update_request(rid, params=done_params)

@@ -379,6 +379,7 @@ def prepare_params_for_manual_retry(params: dict[str, Any], request_id: str) -> 
         "extension_timeout_retry_count",
         "prominent_people_retry_count",
         "invalid_argument_retry_count",
+        "trpc_401_retry_count",
         "retry_not_before",
         "running_started_at",
         "running_timeout_retry_count",
