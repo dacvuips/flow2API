@@ -35,9 +35,12 @@ async def _list_activity_payload(
     page: int,
     page_size: int,
     summary: bool,
+    status_filter: str | None = None,
 ) -> dict:
     _maybe_schedule_purge()
-    total, rows = await asyncio.to_thread(activity.fetch_list_page, page, page_size)
+    total, rows = await asyncio.to_thread(
+        activity.fetch_list_page, page, page_size, status_filter
+    )
     offset = (page - 1) * page_size
     items = [activity.record_to_public(r, for_list=True) for r in rows]
     total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
@@ -49,6 +52,7 @@ async def _list_activity_payload(
             "page_size": page_size,
             "total_pages": total_pages,
             "offset": offset,
+            "status_filter": status_filter or "all",
         },
     }
     if summary:
@@ -67,12 +71,17 @@ async def list_activity(
     page: int = Query(1, ge=1),
     page_size: int = Query(ACTIVITY_PAGE_SIZE, ge=1, le=100),
     summary: bool = False,
+    status: str | None = Query(None, description="all|queued|running|done|failed|active"),
     _: str = Depends(_bearer),
 ):
+    try:
+        status_filter = activity.parse_status_filter(status)
+    except ValueError:
+        raise HTTPException(400, "invalid_status_filter") from None
     timeout = max(5.0, float(HTTP_HANDLER_TIMEOUT_S or 25))
     try:
         return await asyncio.wait_for(
-            _list_activity_payload(page, page_size, summary),
+            _list_activity_payload(page, page_size, summary, status_filter),
             timeout=timeout,
         )
     except asyncio.TimeoutError:

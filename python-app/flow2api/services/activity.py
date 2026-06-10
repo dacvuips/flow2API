@@ -223,14 +223,47 @@ def maybe_strip_heavy_params(rid: str) -> None:
     update_request(rid, params=strip_heavy_params(params))
 
 
-def fetch_list_page(page: int, page_size: int) -> tuple[int, list[RequestRecord]]:
+_STATUS_FILTERS = frozenset({"queued", "running", "done", "failed", "active"})
+
+
+def parse_status_filter(value: str | None) -> str | None:
+    raw = (value or "").strip().lower()
+    if not raw or raw == "all":
+        return None
+    if raw not in _STATUS_FILTERS:
+        raise ValueError(raw)
+    return raw
+
+
+def _apply_status_filter(query, status_filter: str | None):
+    if not status_filter:
+        return query
+    if status_filter == "queued":
+        return query.filter(RequestRecord.status == "queued")
+    if status_filter == "running":
+        return query.filter(RequestRecord.status == "running")
+    if status_filter == "done":
+        return query.filter(RequestRecord.status == "done")
+    if status_filter == "failed":
+        return query.filter(RequestRecord.status.like("failed%"))
+    if status_filter == "active":
+        return query.filter(RequestRecord.status.in_(("queued", "running")))
+    return query
+
+
+def fetch_list_page(
+    page: int,
+    page_size: int,
+    status_filter: str | None = None,
+) -> tuple[int, list[RequestRecord]]:
     db = SessionLocal()
     try:
-        total = db.query(RequestRecord).count()
+        q = db.query(RequestRecord)
+        q = _apply_status_filter(q, status_filter)
+        total = q.count()
         offset = max(0, (page - 1) * page_size)
         rows = (
-            db.query(RequestRecord)
-            .order_by(RequestRecord.created_at.desc())
+            q.order_by(RequestRecord.created_at.desc())
             .offset(offset)
             .limit(page_size)
             .all()
@@ -259,11 +292,14 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
         or ""
     )
     if for_list:
-        from flow2api.services.result_media import slim_result_for_list
+        from flow2api.services.result_media import preview_items_from_result, slim_result_for_list
 
+        preview_items = preview_items_from_result(result, row.type)
         params = slim_params_for_list(params)
         result = slim_result_for_list(result)
-    return {
+    else:
+        preview_items = []
+    payload = {
         "id": row.id,
         "type": row.type,
         "status": row.status,
@@ -278,3 +314,7 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
     }
+    if for_list:
+        payload["preview_items"] = preview_items
+        payload["output_count"] = len(preview_items)
+    return payload
