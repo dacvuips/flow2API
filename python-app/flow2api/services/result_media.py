@@ -201,6 +201,26 @@ def slim_result_for_list(result: Any) -> Any:
     return out
 
 
+def _local_video_exists(media_id: str) -> bool:
+    return (VIDEOS_DIR / f"{media_id}.mp4").is_file()
+
+
+def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
+    """Skip bare /media/{uuid} placeholders that are not cached locally."""
+    u = str(url or "").strip()
+    if not u:
+        return False
+    if u.startswith(("http://", "https://", "/inputs/")):
+        return True
+    mid = _extract_media_id(u)
+    if mid and u.startswith("/media/"):
+        kind_l = str(kind or "").lower()
+        if kind_l == "video" or u.endswith(".mp4"):
+            return _local_video_exists(mid)
+        return False
+    return True
+
+
 def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[str, str]]:
     """Lightweight media previews for task list (URLs only, no base64)."""
     if not isinstance(result, dict):
@@ -216,10 +236,16 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             return
         if u.startswith("data:") or _is_probably_pure_base64(u):
             return
+        k = kind or default_kind
+        if not _list_preview_url_allowed(u, k):
+            return
         seen.add(u)
         mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
-        item: dict[str, str] = {"url": u, "kind": kind or default_kind}
-        if mid:
+        item: dict[str, str] = {"url": u, "kind": k}
+        if mid and _local_video_exists(mid):
+            item["media_id"] = mid
+            item["local"] = "1"
+        elif mid and u.startswith(("http://", "https://")):
             item["media_id"] = mid
         items.append(item)
 
@@ -315,6 +341,59 @@ def persist_input_previews(
     return urls
 
 
+def load_input_base64s_from_storage(request_id: str, *, max_items: int = 3) -> list[str]:
+    """Restore input images from local preview files for manual retry."""
+    from flow2api.config import INPUTS_DIR
+
+    folder = INPUTS_DIR / request_id
+    if not folder.is_dir():
+        return []
+    allowed = {".jpg", ".jpeg", ".png", ".webp"}
+    files = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in allowed),
+        key=lambda p: p.name,
+    )
+    out: list[str] = []
+    for path in files[:max_items]:
+        raw = path.read_bytes()
+        ext = path.suffix.lower()
+        mime = {
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(ext, "image/jpeg")
+        b64 = base64.b64encode(raw).decode("ascii")
+        out.append(f"data:{mime};base64,{b64}")
+    return out
+
+
+def prepare_params_for_manual_retry(params: dict[str, Any], request_id: str) -> dict[str, Any]:
+    """Reset stale Google media refs and restore upload bytes for retry."""
+    out = dict(params or {})
+    for key in (
+        "start_media_id",
+        "end_media_id",
+        "reference_media_ids",
+        "recaptcha_retry_count",
+        "get_media_404_retry_count",
+        "upload_internal_retry_count",
+        "extension_timeout_retry_count",
+        "prominent_people_retry_count",
+        "invalid_argument_retry_count",
+        "retry_not_before",
+        "running_started_at",
+        "running_timeout_retry_count",
+    ):
+        out.pop(key, None)
+    # profile_id/label/email dropped so scheduler can reassign profile
+    for key in ("profile_id", "profile_label", "profile_email"):
+        out.pop(key, None)
+    if not (out.get("image_base64s") or out.get("imageBase64s")):
+        restored = load_input_base64s_from_storage(request_id)
+        if restored:
+            out["image_base64s"] = restored
+    return out
+
+
 def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:
     """Lightweight input previews for task list (URLs only)."""
     if not isinstance(params, dict):
@@ -335,25 +414,13 @@ def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:
             item["media_id"] = mid
         items.append(item)
 
-    start = str(params.get("start_media_id") or "").strip()
-    end = str(params.get("end_media_id") or "").strip()
-    ref_ids = [
-        str(mid or "").strip()
-        for mid in (params.get("reference_media_ids") or [])
-        if str(mid or "").strip()
+    preview_urls = [
+        str(u).strip()
+        for u in (params.get("input_preview_urls") or [])
+        if str(u or "").strip()
     ]
-    has_media_ids = bool(start or end or ref_ids)
-
-    if has_media_ids:
-        if start:
-            add(f"/media/{start}", start)
-        if end:
-            add(f"/media/{end}", end)
-        for mid_s in ref_ids:
-            add(f"/media/{mid_s}", mid_s)
-    else:
-        for u in params.get("input_preview_urls") or []:
-            add(str(u))
+    for u in preview_urls:
+        add(u)
 
     return items[:3]
 

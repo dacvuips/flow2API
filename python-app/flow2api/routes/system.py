@@ -70,41 +70,75 @@ async def serve_input_image(request_id: str, filename: str):
 
 @router.get("/media/{media_id:path}")
 async def serve_media(media_id: str):
-    path = VIDEOS_DIR / f"{media_id}.mp4"
-    if path.is_file():
-        return FileResponse(path, media_type="video/mp4")
+    media_id = str(media_id or "").strip().split("/")[0]
+    if not media_id:
+        raise HTTPException(400, "invalid media id")
 
-    client = get_flow_client()
-    if not client.connected:
-        raise HTTPException(503, "extension_not_connected")
     try:
-        resp = await asyncio.wait_for(client.get_media(media_id), timeout=60)
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "get_media_timeout") from None
-    except Exception as exc:
-        logger.warning("serve_media get_media failed %s: %s", media_id[:12], exc)
-        raise HTTPException(502, "get_media_failed") from exc
+        path = VIDEOS_DIR / f"{media_id}.mp4"
+        if path.is_file():
+            return FileResponse(path, media_type="video/mp4")
 
-    status = get_media_http_status(resp if isinstance(resp, dict) else {})
-    if status == 404:
-        raise HTTPException(404, "not_found")
-    if status >= 400:
-        raise HTTPException(status, "get_media_error")
-
-    url, raw, mime = parse_get_media_image(resp if isinstance(resp, dict) else {})
-    if raw:
-        return Response(content=raw, media_type=mime)
-    if url:
+        client = get_flow_client()
+        if not client.connected:
+            raise HTTPException(503, "extension_not_connected")
         try:
-            cap = max(10.0, min(60.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2))
-            async with httpx.AsyncClient(timeout=cap, follow_redirects=True) as http:
-                fetched = await http.get(url)
-            if fetched.status_code == 200 and fetched.content:
-                media_type = fetched.headers.get("content-type") or mime
-                return Response(content=fetched.content, media_type=media_type)
+            resp = await asyncio.wait_for(client.get_media(media_id), timeout=60)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "get_media_timeout") from None
         except Exception as exc:
-            logger.warning("serve_media fetch url failed %s: %s", media_id[:12], exc)
-    raise HTTPException(404, "not_found")
+            logger.warning("serve_media get_media failed %s: %s", media_id[:12], exc)
+            raise HTTPException(404, "not_found") from None
+
+        status = get_media_http_status(resp if isinstance(resp, dict) else {})
+        if status == 404 or status >= 400:
+            if status >= 400 and status != 404:
+                logger.warning("serve_media upstream status=%s id=%s", status, media_id[:12])
+            raise HTTPException(404, "not_found")
+
+        url, raw, mime = parse_get_media_image(resp if isinstance(resp, dict) else {})
+        if raw:
+            return Response(content=raw, media_type=mime)
+        if url:
+            try:
+                cap = max(10.0, min(60.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2))
+                async with httpx.AsyncClient(timeout=cap, follow_redirects=True) as http:
+                    fetched = await http.get(url)
+                if fetched.status_code == 200 and fetched.content:
+                    media_type = fetched.headers.get("content-type") or mime
+                    return Response(content=fetched.content, media_type=media_type)
+            except Exception as exc:
+                logger.warning("serve_media fetch url failed %s: %s", media_id[:12], exc)
+
+        from flow2api.services.flow_sdk import try_fetch_media_video_url
+
+        try:
+            video_ref = await try_fetch_media_video_url(client, media_id)
+        except Exception as exc:
+            logger.warning("serve_media video fetch failed %s: %s", media_id[:12], exc)
+            video_ref = None
+
+        local = VIDEOS_DIR / f"{media_id}.mp4"
+        if local.is_file():
+            return FileResponse(local, media_type="video/mp4")
+
+        if video_ref and str(video_ref).startswith(("http://", "https://")):
+            try:
+                cap = max(10.0, min(60.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2))
+                async with httpx.AsyncClient(timeout=cap, follow_redirects=True) as http:
+                    fetched = await http.get(video_ref)
+                if fetched.status_code == 200 and fetched.content:
+                    media_type = fetched.headers.get("content-type") or "video/mp4"
+                    return Response(content=fetched.content, media_type=media_type)
+            except Exception as exc:
+                logger.warning("serve_media fetch video url failed %s: %s", media_id[:12], exc)
+
+        raise HTTPException(404, "not_found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("serve_media unexpected %s: %s", media_id[:12], exc)
+        raise HTTPException(404, "not_found") from None
 
 
 @router.get("/api/events")

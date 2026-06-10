@@ -10,7 +10,7 @@ from flow2api.services import activity
 from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.dashboard_events import events
-from flow2api.services.result_media import with_base64_media
+from flow2api.services.result_media import prepare_params_for_manual_retry, with_base64_media
 from flow2api.short_id import new_request_id
 from flow2api.worker.processor import get_worker
 
@@ -50,6 +50,9 @@ _RETRY_DROP_KEYS = frozenset(
         "retry_not_before",
         "running_started_at",
         "running_timeout_retry_count",
+        "start_media_id",
+        "end_media_id",
+        "reference_media_ids",
     }
 )
 
@@ -102,7 +105,10 @@ async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)
     row = activity.get_request(request_id)
     if not row:
         raise HTTPException(404, "not_found")
-    params = _params_for_retry(json.loads(row.params_json or "{}"))
+    params = prepare_params_for_manual_retry(
+        json.loads(row.params_json or "{}"),
+        request_id,
+    )
     activity.requeue_request(request_id, params)
     get_worker().prepare_retry(request_id)
     append_request_log(
