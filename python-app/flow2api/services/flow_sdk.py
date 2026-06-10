@@ -1269,6 +1269,67 @@ def is_prominent_people_filter_failure(
     return False
 
 
+def _rpc_error_invalid_argument(payload: dict) -> bool:
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            err = data.get("error")
+    if not isinstance(err, dict):
+        return False
+    if str(err.get("status") or "").upper() == "INVALID_ARGUMENT":
+        return True
+    for detail in err.get("details") or []:
+        if isinstance(detail, dict) and str(detail.get("reason") or "").upper() == "PUBLIC_ERROR_MINOR":
+            return True
+    return False
+
+
+def _payload_has_invalid_argument_retry(payload: Any) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        if _rpc_error_invalid_argument(payload):
+            return True
+        data = payload.get("data")
+        if isinstance(data, dict) and data is not payload and _rpc_error_invalid_argument(data):
+            return True
+        text = json.dumps(payload, ensure_ascii=False)
+    else:
+        text = str(payload)
+    return "PUBLIC_ERROR_MINOR" in text.upper()
+
+
+def is_invalid_argument_retry_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    if _payload_has_invalid_argument_retry(msg):
+        return True
+    if exc is not None:
+        if _payload_has_invalid_argument_retry(str(exc)):
+            return True
+        if isinstance(exc, FlowApiError):
+            if _payload_has_invalid_argument_retry(exc.raw):
+                return True
+            for attempt in exc.attempts or []:
+                if _payload_has_invalid_argument_retry(attempt):
+                    return True
+                response = attempt.get("response") if isinstance(attempt, dict) else None
+                if isinstance(response, dict):
+                    if _payload_has_invalid_argument_retry(response):
+                        return True
+                    if _payload_has_invalid_argument_retry(response.get("data")):
+                        return True
+    for entry in api_trace or []:
+        if _payload_has_invalid_argument_retry(entry.get("data")):
+            return True
+        if _payload_has_invalid_argument_retry(entry):
+            return True
+    return False
+
+
 def _get_media_http_error(resp: dict, status: int) -> str:
     data = resp.get("data")
     if isinstance(data, dict) and isinstance(data.get("error"), dict):

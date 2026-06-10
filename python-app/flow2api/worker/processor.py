@@ -25,6 +25,7 @@ from flow2api.services.flow_sdk import (
     format_api_error,
     is_extension_timeout_error,
     is_get_media_404_failure,
+    is_invalid_argument_retry_failure,
     is_prominent_people_filter_failure,
     is_upload_image_internal_failure,
 )
@@ -619,6 +620,30 @@ class WorkerController:
                 )
                 events.publish("request_finished", {"id": rid, "status": "queued"})
                 return
+            invalid_argument_retry = int(retry_params.get("invalid_argument_retry_count") or 0)
+            if (
+                is_invalid_argument_retry_failure(exc, msg, api_trace)
+                and invalid_argument_retry < RECAPTCHA_RETRY_MAX
+            ):
+                delay_s = flow_sdk.recaptcha_retry_delay(invalid_argument_retry)
+                retry_params["invalid_argument_retry_count"] = invalid_argument_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params.pop("running_started_at", None)
+                activity.update_request(
+                    rid,
+                    status="queued",
+                    params=retry_params,
+                    error=msg,
+                )
+                logger.warning(
+                    "INVALID_ARGUMENT / PUBLIC_ERROR_MINOR retry %s/%s rid=%s — chờ %.1fs rồi thử lại",
+                    invalid_argument_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                )
+                events.publish("request_finished", {"id": rid, "status": "queued"})
+                return
             if isinstance(exc, FlowApiError):
                 logger.error(
                     "worker failed rid=%s step=%s err=%s api_trace=%s",
@@ -723,6 +748,7 @@ class WorkerController:
                 or params.get("upload_internal_retry_count")
                 or params.get("extension_timeout_retry_count")
                 or params.get("prominent_people_retry_count")
+                or params.get("invalid_argument_retry_count")
                 or params.get("retry_not_before")
             ):
                 params.pop("recaptcha_retry_count", None)
@@ -730,6 +756,7 @@ class WorkerController:
                 params.pop("upload_internal_retry_count", None)
                 params.pop("extension_timeout_retry_count", None)
                 params.pop("prominent_people_retry_count", None)
+                params.pop("invalid_argument_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
             activity.update_request(rid, status="done", result=result, error=None)
@@ -867,6 +894,7 @@ class WorkerController:
                     or done_params.pop("upload_internal_retry_count", None) is not None
                     or done_params.pop("extension_timeout_retry_count", None) is not None
                     or done_params.pop("prominent_people_retry_count", None) is not None
+                    or done_params.pop("invalid_argument_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
                     activity.update_request(rid, params=done_params)
