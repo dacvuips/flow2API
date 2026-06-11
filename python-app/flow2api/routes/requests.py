@@ -130,7 +130,7 @@ async def get_request_status(request_id: str, _=Depends(_auth_key_id)):
     if not row:
         raise HTTPException(404, "not_found")
     data = activity.record_to_public(row)
-    return await with_base64_media(data, embed=True)
+    return await with_base64_media(data, embed=False)
 
 
 @router.delete("/{request_id}")

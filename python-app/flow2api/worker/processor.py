@@ -33,6 +33,7 @@ from flow2api.services.flow_sdk import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
+from flow2api.services.stored_media import persist_task_result
 from flow2api.services.flow_client import (
     apply_retry_profile_rotation,
     bind_task_profile,
@@ -748,6 +749,7 @@ class WorkerController:
                 "media_ids": media_ids,
                 "media_entries": media_entries,
             }
+            result = await persist_task_result(rid, result, req_type)
             if (
                 params.get("recaptcha_retry_count")
                 or params.get("get_media_404_retry_count")
@@ -894,6 +896,8 @@ class WorkerController:
         async def _finish(urls: list[str], media: list[str], **extra: Any) -> None:
             result = {"video_urls": urls, "media_ids": media, **extra}
             row_done = activity.get_request(rid)
+            if row_done:
+                result = await persist_task_result(rid, result, row_done.type)
             if row_done:
                 done_params = json.loads(row_done.params_json or "{}")
                 if (

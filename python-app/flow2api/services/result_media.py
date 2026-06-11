@@ -210,7 +210,7 @@ def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
     u = str(url or "").strip()
     if not u:
         return False
-    if u.startswith(("http://", "https://", "/inputs/")):
+    if u.startswith(("http://", "https://", "/inputs/", "/outputs/", "/video/", "/image/")):
         return True
     mid = _extract_media_id(u)
     if mid and u.startswith("/media/"):
@@ -256,7 +256,7 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     for u in result.get("local_files") or []:
         add(str(u), default_kind)
     if result.get("Link"):
-        add(str(result["Link"]), "video")
+        add(str(result["Link"]), default_kind)
 
     for entry in result.get("media_entries") or []:
         if not isinstance(entry, dict):

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from flow2api.config import ACTIVITY_LIST_LIMIT, INPUTS_DIR, VIDEOS_DIR
+from flow2api.services.stored_media import delete_output_dir, purge_expired_outputs
 from flow2api.db.models import RequestRecord, SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ def purge_old_requests(keep: int | None = None) -> int:
             for mid in purge_media:
                 _delete_local_video(mid)
             _delete_input_previews(row.id)
+            delete_output_dir(row.id)
 
             db.delete(row)
             deleted += 1
@@ -148,3 +150,14 @@ def purge_old_requests(keep: int | None = None) -> int:
         raise
     finally:
         db.close()
+
+
+def purge_storage(keep: int | None = None) -> tuple[int, int]:
+    """Purge old DB rows and expired on-disk outputs."""
+    deleted = purge_old_requests(keep)
+    expired = 0
+    try:
+        expired = purge_expired_outputs()
+    except Exception as exc:
+        logger.warning("purge_expired_outputs failed: %s", exc)
+    return deleted, expired

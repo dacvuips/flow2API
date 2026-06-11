@@ -29,7 +29,7 @@ from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
 from flow2api.services.ws_server import run_ws_server
 from flow2api.services.task_counters import bootstrap_from_requests_if_empty
-from flow2api.services.task_retention import purge_old_requests
+from flow2api.services.task_retention import purge_storage
 from flow2api.worker.processor import get_worker
 
 logging.basicConfig(
@@ -44,9 +44,11 @@ async def _retention_loop() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            deleted = await asyncio.to_thread(purge_old_requests, ACTIVITY_LIST_LIMIT)
+            deleted, expired = await asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT)
             if deleted:
                 logger.info("background retention purge removed %s task(s)", deleted)
+            if expired:
+                logger.info("background media purge removed %s output folder(s)", expired)
         except Exception as exc:
             logger.warning("background retention purge failed: %s", exc)
 
@@ -78,9 +80,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("task counter bootstrap failed: %s", exc)
     try:
-        purged = await asyncio.to_thread(purge_old_requests, ACTIVITY_LIST_LIMIT)
+        purged, expired = await asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT)
         if purged:
             logger.info("startup retention purge removed %s old task(s)", purged)
+        if expired:
+            logger.info("startup media purge removed %s expired output folder(s)", expired)
     except Exception as exc:
         logger.warning("startup retention purge failed: %s", exc)
     ws_task = asyncio.create_task(run_ws_server())

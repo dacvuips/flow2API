@@ -9,6 +9,10 @@ import logging
 import httpx
 
 from flow2api.config import HTTP_HANDLER_TIMEOUT_S, INPUTS_DIR, VIDEOS_DIR
+from flow2api.services.stored_media import (
+    resolve_stored_image_path,
+    resolve_stored_video_path,
+)
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.flow_client import get_flow_client
@@ -49,6 +53,52 @@ async def ext_callback(
     payload = await request.json()
     pool.resolve_callback(payload)
     return {"ok": True}
+
+
+@router.get("/video/{request_id}")
+@router.get("/video/{request_id}/{index}")
+async def serve_stored_video(request_id: str, index: int = 0):
+    path = resolve_stored_video_path(request_id, index)
+    if not path:
+        raise HTTPException(404, "not_found")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@router.get("/image/{request_id}")
+@router.get("/image/{request_id}/{index}")
+async def serve_stored_image(request_id: str, index: int = 0):
+    path = resolve_stored_image_path(request_id, index)
+    if not path:
+        raise HTTPException(404, "not_found")
+    ext = path.suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "image/jpeg")
+    return FileResponse(path, media_type=mime)
+
+
+@router.get("/outputs/{request_id}/{filename}")
+async def serve_stored_output(request_id: str, filename: str):
+    if ".." in request_id or ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "invalid path")
+    from flow2api.config import OUTPUTS_DIR
+
+    path = OUTPUTS_DIR / request_id / filename
+    if not path.is_file():
+        raise HTTPException(404, "not_found")
+    ext = path.suffix.lower()
+    if ext == ".mp4":
+        return FileResponse(path, media_type="video/mp4")
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=mime)
 
 
 @router.get("/inputs/{request_id}/{filename}")

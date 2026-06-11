@@ -14,7 +14,7 @@ from flow2api.config import (
 from flow2api.services import activity
 from flow2api.services.result_media import with_base64_media
 from flow2api.services.task_counters import reset_counters
-from flow2api.services.task_retention import purge_old_requests
+from flow2api.services.task_retention import purge_storage
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 
@@ -28,7 +28,7 @@ def _maybe_schedule_purge() -> None:
     if now - _last_purge_monotonic < interval:
         return
     _last_purge_monotonic = now
-    asyncio.create_task(asyncio.to_thread(purge_old_requests, ACTIVITY_LIST_LIMIT))
+    asyncio.create_task(asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT))
 
 
 async def _list_activity_payload(
@@ -106,7 +106,7 @@ async def get_activity(
         row = await asyncio.to_thread(activity.get_request, request_id)
         if not row:
             raise HTTPException(404, "not_found")
-        return await with_base64_media(activity.record_to_public(row), embed=True)
+        return await with_base64_media(activity.record_to_public(row), embed=False)
 
     try:
         data = await asyncio.wait_for(_load(), timeout=timeout)
