@@ -421,7 +421,7 @@ class WorkerController:
     ) -> dict[str, Any]:
         params = apply_retry_profile_rotation(params)
         params.pop("running_started_at", None)
-        activity.update_request(rid, status="queued", params=params, error=error)
+        activity.update_request(rid, status="queued", params=params, error=None)
         events.publish("request_finished", {"id": rid, "status": "queued"})
         return params
 
@@ -672,10 +672,11 @@ class WorkerController:
                 )
             else:
                 logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
+            display_msg = flow_sdk.sanitize_public_error(msg)
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
                 "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
-                "error": msg,
+                "error": display_msg,
                 "debug_version": 2,
             }
             if isinstance(exc, FlowApiError) and exc.step:
@@ -697,8 +698,8 @@ class WorkerController:
                     )
             activity.update_request(
                 rid,
-                status=f"failed: {msg}",
-                error=msg,
+                status=f"failed: {display_msg}",
+                error=display_msg,
                 result=fail_result,
             )
             events.publish("request_finished", {"id": rid, "status": "failed"})

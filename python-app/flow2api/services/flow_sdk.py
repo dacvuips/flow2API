@@ -1310,6 +1310,13 @@ def is_prominent_people_filter_failure(
     return False
 
 
+def sanitize_public_error(msg: str) -> str:
+    """Map raw Google Flow codes to short user-facing labels."""
+    if _payload_has_prominent_people_filter(msg):
+        return "content_filter"
+    return str(msg or "").strip()
+
+
 def _rpc_error_invalid_argument(payload: dict) -> bool:
     err = payload.get("error")
     if not isinstance(err, dict):

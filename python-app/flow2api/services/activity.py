@@ -325,10 +325,19 @@ def record_to_public(
     if for_list:
         params = slim_params_for_list(params)
         result = slim_result_for_list(result)
+    from flow2api.services.flow_sdk import sanitize_public_error
+
+    status = row.status
+    if status.startswith("failed:"):
+        status = f"failed: {sanitize_public_error(status[7:].strip())}"
+    error = sanitize_public_error(row.error) if row.error else None
+    if isinstance(result, dict) and result.get("error"):
+        result = dict(result)
+        result["error"] = sanitize_public_error(str(result["error"]))
     payload = {
         "id": row.id,
         "type": row.type,
-        "status": row.status,
+        "status": status,
         "prompt": row.prompt,
         "model": row.model,
         "profile_id": params.get("profile_id"),
@@ -336,7 +345,7 @@ def record_to_public(
         "profile_email": params.get("profile_email"),
         "params": params,
         "result": result,
-        "error": row.error,
+        "error": error,
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
     }
