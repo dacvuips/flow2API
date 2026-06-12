@@ -180,6 +180,19 @@ def count_queued() -> int:
         db.close()
 
 
+def list_active_requests() -> list[RequestRecord]:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(RequestRecord)
+            .filter(RequestRecord.status.in_(("queued", "running")))
+            .order_by(RequestRecord.created_at.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
 _LIST_HEAVY_PARAM_KEYS = frozenset(
     {
         "image_base64",

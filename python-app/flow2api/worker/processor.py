@@ -96,6 +96,17 @@ class WorkerController:
     def request_cancel(self, rid: str) -> None:
         self._cancelled.add(rid)
 
+    def cancel_running_tasks(self, ids: set[str] | None = None) -> None:
+        """Cancel in-flight asyncio tasks (optional subset by request id)."""
+        self._prune_running()
+        targets = set(ids) if ids is not None else set(self._running.keys())
+        for rid in list(self._running.keys()):
+            if rid not in targets:
+                continue
+            task = self._running.get(rid)
+            if task and not task.done():
+                task.cancel()
+
     def prepare_retry(self, rid: str) -> None:
         """Stop in-flight work so the same request id can run again."""
         self._prune_running()

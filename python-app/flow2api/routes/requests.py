@@ -102,6 +102,35 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
     return {"id": rid, "status": "queued"}
 
 
+@router.post("/cancel-all")
+async def cancel_all_requests(_=Depends(_auth_key_id)):
+    worker = get_worker()
+    rows = activity.list_active_requests()
+    if not rows:
+        return {"canceled": 0, "ids": []}
+
+    ids: list[str] = []
+    for row in rows:
+        ids.append(row.id)
+        worker.request_cancel(row.id)
+        activity.update_request(
+            row.id,
+            status="failed: canceled",
+            error="canceled",
+            result={"error": "canceled"},
+        )
+        append_request_log(
+            row.id,
+            "http",
+            "POST /api/requests/cancel-all",
+            level="warn",
+        )
+        events.publish("request_finished", {"id": row.id, "status": "canceled"})
+
+    worker.cancel_running_tasks(set(ids))
+    return {"canceled": len(ids), "ids": ids}
+
+
 @router.post("/{request_id}/retry")
 async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)):
     row = activity.get_request(request_id)
