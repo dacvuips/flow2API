@@ -106,7 +106,10 @@ async def get_activity(
         row = await asyncio.to_thread(activity.get_request, request_id)
         if not row:
             raise HTTPException(404, "not_found")
-        return await with_base64_media(activity.record_to_public(row), embed=False)
+        return await with_base64_media(
+            activity.record_to_public(row, include_preview=True),
+            embed=False,
+        )
 
     try:
         data = await asyncio.wait_for(_load(), timeout=timeout)

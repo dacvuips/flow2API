@@ -295,7 +295,12 @@ def summary_stats(*, list_rows: list[RequestRecord] | None = None) -> dict[str, 
     return {"total": c.total, "done": c.done, "failed": c.failed, "running": running}
 
 
-def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
+def record_to_public(
+    row: RequestRecord,
+    *,
+    for_list: bool = False,
+    include_preview: bool | None = None,
+) -> dict:
     result = json.loads(row.result_json or "{}")
     params = json.loads(row.params_json or "{}")
     profile_label = (
@@ -304,20 +309,22 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
         or params.get("profile_id")
         or ""
     )
-    if for_list:
-        from flow2api.services.result_media import (
-            input_preview_items_from_params,
-            preview_items_from_result,
-            slim_result_for_list,
-        )
+    from flow2api.services.result_media import (
+        input_preview_items_from_params,
+        preview_items_from_result,
+        slim_result_for_list,
+    )
 
-        preview_items = preview_items_from_result(result, row.type)
-        input_preview_items = input_preview_items_from_params(params)
+    show_preview = include_preview if include_preview is not None else for_list
+    preview_items = (
+        preview_items_from_result(result, row.type) if show_preview else []
+    )
+    input_preview_items = (
+        input_preview_items_from_params(params) if show_preview else []
+    )
+    if for_list:
         params = slim_params_for_list(params)
         result = slim_result_for_list(result)
-    else:
-        preview_items = []
-        input_preview_items = []
     payload = {
         "id": row.id,
         "type": row.type,
@@ -333,7 +340,7 @@ def record_to_public(row: RequestRecord, *, for_list: bool = False) -> dict:
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
     }
-    if for_list:
+    if show_preview:
         payload["preview_items"] = preview_items
         payload["output_count"] = len(preview_items)
         payload["input_preview_items"] = input_preview_items

@@ -284,39 +284,93 @@ async def _persist_images(request_id: str, result: dict[str, Any]) -> list[str]:
     return saved
 
 
+def normalize_publisher_urls(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep Google Flow CDN URLs in API fields; drop base64/data-uri placeholders."""
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    entries = out.get("media_entries") or []
+    if not isinstance(entries, list):
+        entries = []
+
+    def _entry_https_url(index: int) -> str:
+        if index >= len(entries) or not isinstance(entries[index], dict):
+            return ""
+        url = entries[index].get("url")
+        if url and str(url).startswith(("http://", "https://")):
+            return str(url)
+        return ""
+
+    image_urls = list(out.get("image_urls") or [])
+    if image_urls:
+        normalized: list[str] = []
+        for idx, raw in enumerate(image_urls):
+            url = str(raw or "").strip()
+            if url.startswith(("http://", "https://")):
+                normalized.append(url)
+                continue
+            entry_url = _entry_https_url(idx)
+            if entry_url:
+                normalized.append(entry_url)
+        if normalized:
+            out["image_urls"] = normalized
+
+    video_urls = list(out.get("video_urls") or [])
+    if video_urls:
+        normalized = [
+            str(url)
+            for url in video_urls
+            if str(url or "").startswith(("http://", "https://"))
+        ]
+        if normalized:
+            out["video_urls"] = normalized
+
+    link = str(out.get("Link") or "").strip()
+    primary = (out.get("video_urls") or out.get("image_urls") or [None])[0]
+    if link.startswith(("http://", "https://")):
+        out["Link"] = link
+    elif primary and str(primary).startswith(("http://", "https://")):
+        out["Link"] = str(primary)
+    else:
+        out.pop("Link", None)
+
+    out.pop("Local", None)
+    return out
+
+
 async def persist_task_result(
     request_id: str,
     result: dict[str, Any],
     task_type: str,
 ) -> dict[str, Any]:
-    """Save media to disk and rewrite result fields as public links."""
+    """Cache media on disk but keep publisher URLs in API result fields."""
     if not isinstance(result, dict) or not _safe_request_id(request_id):
         return result
 
     out = dict(result)
     is_video = "video" in str(task_type or "").lower()
+    publisher_image_urls = list(out.get("image_urls") or [])
+    publisher_video_urls = list(out.get("video_urls") or [])
+    publisher_link = out.get("Link")
 
     try:
         if is_video:
             local_paths = await _persist_videos(request_id, out)
-            if local_paths:
-                links = [public_video_url(request_id, i) for i in range(len(local_paths))]
-                out["Link"] = links[0]
-                out["Local"] = links[0]
-                out["video_urls"] = links
-                out["local_files"] = local_paths
         else:
             local_paths = await _persist_images(request_id, out)
-            if local_paths:
-                links = [public_image_url(request_id, i) for i in range(len(local_paths))]
-                out["image_urls"] = links
-                out["Link"] = links[0]
-                out["Local"] = links[0]
-                out["local_files"] = local_paths
+        if local_paths:
+            out["local_files"] = local_paths
     except Exception as exc:
         logger.warning("persist_task_result failed %s: %s", request_id[:12], exc)
 
-    return out
+    if publisher_video_urls:
+        out["video_urls"] = publisher_video_urls
+    if publisher_image_urls:
+        out["image_urls"] = publisher_image_urls
+    if publisher_link:
+        out["Link"] = publisher_link
+
+    return normalize_publisher_urls(out)
 
 
 def resolve_stored_video_path(request_id: str, index: int = 0) -> Optional[Path]:

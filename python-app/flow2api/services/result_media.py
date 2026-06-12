@@ -201,6 +201,68 @@ def slim_result_for_list(result: Any) -> Any:
     return out
 
 
+def _is_local_served_url(url: str) -> bool:
+    from flow2api.config import PUBLIC_BASE_URL
+
+    u = str(url or "").strip()
+    if not u:
+        return True
+    if u.startswith(("/outputs/", "/video/", "/image/", "/media/", "/inputs/")):
+        return True
+    if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL):
+        return True
+    return False
+
+
+def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
+    """API payload for external callers — publisher HTTPS URLs only."""
+    from flow2api.services.stored_media import normalize_publisher_urls
+
+    out = normalize_publisher_urls(dict(result))
+    for key in ("local_files", "Local", "raw"):
+        out.pop(key, None)
+
+    for key in ("image_urls", "video_urls"):
+        urls = out.get(key)
+        if not isinstance(urls, list):
+            continue
+        filtered = [str(u) for u in urls if not _is_local_served_url(str(u))]
+        if filtered:
+            out[key] = filtered
+        else:
+            out.pop(key, None)
+
+    link = out.get("Link")
+    if _is_local_served_url(str(link or "")):
+        out.pop("Link", None)
+
+    entries = out.get("media_entries")
+    if isinstance(entries, list):
+        slim: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("url")
+            if not url or _is_local_served_url(str(url)):
+                continue
+            if not str(url).startswith(("http://", "https://")):
+                continue
+            item: dict[str, Any] = {
+                "url": str(url),
+                "kind": entry.get("kind") or entry.get("mediaType") or "image",
+            }
+            mid = entry.get("media_id") or entry.get("mediaId")
+            if mid:
+                item["media_id"] = mid
+            slim.append(item)
+        if slim:
+            out["media_entries"] = slim
+        else:
+            out.pop("media_entries", None)
+
+    return out
+
+
 def _local_video_exists(media_id: str) -> bool:
     return (VIDEOS_DIR / f"{media_id}.mp4").is_file()
 
@@ -230,7 +292,7 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     items: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    def add(url: str, kind: str = "", media_id: str = "") -> None:
+    def add(url: str, kind: str = "", media_id: str = "", *, local: bool = False) -> None:
         u = str(url or "").strip()
         if not u or u in seen:
             return
@@ -242,6 +304,8 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
         seen.add(u)
         mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
         item: dict[str, str] = {"url": u, "kind": k}
+        if local or u.startswith(("/outputs/", "/video/", "/image/")):
+            item["local"] = "1"
         if mid and _local_video_exists(mid):
             item["media_id"] = mid
             item["local"] = "1"
@@ -249,14 +313,17 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             item["media_id"] = mid
         items.append(item)
 
-    for u in result.get("image_urls") or []:
-        add(str(u), "image")
-    for u in result.get("video_urls") or []:
-        add(str(u), "video")
-    for u in result.get("local_files") or []:
-        add(str(u), default_kind)
-    if result.get("Link"):
-        add(str(result["Link"]), default_kind)
+    local_files = [str(u) for u in (result.get("local_files") or []) if str(u or "").strip()]
+    for u in local_files:
+        add(u, default_kind, local=True)
+
+    if not local_files:
+        for u in result.get("image_urls") or []:
+            add(str(u), "image")
+        for u in result.get("video_urls") or []:
+            add(str(u), "video")
+        if result.get("Link"):
+            add(str(result["Link"]), default_kind)
 
     for entry in result.get("media_entries") or []:
         if not isinstance(entry, dict):
@@ -439,5 +506,5 @@ async def with_base64_media(
     if embed:
         out["result"] = await embed_result_base64(result)
     else:
-        out["result"] = slim_result_for_list(result)
+        out["result"] = result_for_external_api(result)
     return out
