@@ -212,6 +212,24 @@ def _collect_video_sources(result: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def _collect_image_sources(result: dict[str, Any]) -> list[tuple[str, str]]:
+    image_urls = [str(u) for u in (result.get("image_urls") or []) if str(u or "").strip()]
+    media_ids = [str(m) for m in (result.get("media_ids") or []) if str(m or "").strip()]
+    if image_urls:
+        sources: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for idx, url in enumerate(image_urls):
+            mid = media_ids[idx] if idx < len(media_ids) else (_extract_media_id(url) or "")
+            key = mid or url
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if mid:
+                seen.add(mid)
+            if url:
+                seen.add(url)
+            sources.append((url, mid))
+        return sources
+
     sources: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -222,10 +240,12 @@ def _collect_image_sources(result: dict[str, Any]) -> list[tuple[str, str]]:
         if not key or key in seen:
             return
         seen.add(key)
+        if mid:
+            seen.add(mid)
+        if u:
+            seen.add(u)
         sources.append((u, mid))
 
-    for u in result.get("image_urls") or []:
-        add(str(u))
     for entry in result.get("media_entries") or []:
         if not isinstance(entry, dict):
             continue
@@ -233,11 +253,8 @@ def _collect_image_sources(result: dict[str, Any]) -> list[tuple[str, str]]:
             str(entry.get("url") or entry.get("local_url") or entry.get("local_path") or ""),
             str(entry.get("media_id") or entry.get("mediaId") or ""),
         )
-    media_ids = result.get("media_ids") or []
-    image_urls = result.get("image_urls") or []
-    for idx, mid in enumerate(media_ids):
-        url = image_urls[idx] if idx < len(image_urls) else ""
-        add(str(url), str(mid))
+    for mid in media_ids:
+        add("", mid)
 
     return sources
 

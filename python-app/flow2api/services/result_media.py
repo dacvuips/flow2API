@@ -290,19 +290,26 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     is_video = "video" in str(task_type or "").lower()
     default_kind = "video" if is_video else "image"
     items: list[dict[str, str]] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
+    seen_mids: set[str] = set()
 
     def add(url: str, kind: str = "", media_id: str = "", *, local: bool = False) -> None:
         u = str(url or "").strip()
-        if not u or u in seen:
+        if not u:
             return
         if u.startswith("data:") or _is_probably_pure_base64(u):
+            return
+        mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
+        if mid and mid in seen_mids:
+            return
+        if u in seen_urls:
             return
         k = kind or default_kind
         if not _list_preview_url_allowed(u, k):
             return
-        seen.add(u)
-        mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
+        seen_urls.add(u)
+        if mid:
+            seen_mids.add(mid)
         item: dict[str, str] = {"url": u, "kind": k}
         if local or u.startswith(("/outputs/", "/video/", "/image/")):
             item["local"] = "1"
@@ -316,36 +323,38 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     local_files = [str(u) for u in (result.get("local_files") or []) if str(u or "").strip()]
     for u in local_files:
         add(u, default_kind, local=True)
+    if local_files:
+        return items[:1]
 
-    if not local_files:
-        for u in result.get("image_urls") or []:
-            add(str(u), "image")
-        for u in result.get("video_urls") or []:
-            add(str(u), "video")
-        if result.get("Link"):
-            add(str(result["Link"]), default_kind)
+    for u in result.get("image_urls") or []:
+        add(str(u), "image")
+    for u in result.get("video_urls") or []:
+        add(str(u), "video")
+    if result.get("Link"):
+        add(str(result["Link"]), default_kind)
 
-    for entry in result.get("media_entries") or []:
-        if not isinstance(entry, dict):
-            continue
-        mid = str(entry.get("media_id") or entry.get("mediaId") or "").strip()
-        kind_raw = str(entry.get("kind") or entry.get("mediaType") or default_kind).lower()
-        kind = "video" if "video" in kind_raw else "image"
-        if entry.get("url"):
-            add(str(entry["url"]), kind, mid)
-        elif entry.get("local_url"):
-            add(str(entry["local_url"]), kind, mid)
-        elif entry.get("local_path"):
-            add(str(entry["local_path"]), kind, mid)
-        elif mid:
-            add(f"/media/{mid}", kind, mid)
+    if not items:
+        for entry in result.get("media_entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            mid = str(entry.get("media_id") or entry.get("mediaId") or "").strip()
+            kind_raw = str(entry.get("kind") or entry.get("mediaType") or default_kind).lower()
+            kind = "video" if "video" in kind_raw else "image"
+            if entry.get("url"):
+                add(str(entry["url"]), kind, mid)
+            elif entry.get("local_url"):
+                add(str(entry["local_url"]), kind, mid)
+            elif entry.get("local_path"):
+                add(str(entry["local_path"]), kind, mid)
+            elif mid:
+                add(f"/media/{mid}", kind, mid)
 
-    for mid in result.get("media_ids") or []:
-        mid_s = str(mid or "").strip()
-        if mid_s:
-            add(f"/media/{mid_s}", default_kind, mid_s)
+        for mid in result.get("media_ids") or []:
+            mid_s = str(mid or "").strip()
+            if mid_s:
+                add(f"/media/{mid_s}", default_kind, mid_s)
 
-    return items[:4]
+    return items[:1]
 
 
 def _decode_image_bytes(b64: str) -> tuple[bytes, str] | None:
