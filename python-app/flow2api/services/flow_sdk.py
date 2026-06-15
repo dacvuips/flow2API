@@ -1420,8 +1420,6 @@ async def _resolve_all_media_urls(
     client: FlowClient,
     completed: dict[str, str],
     pending: list[str],
-    *,
-    fetch_attempts: int = 6,
 ) -> bool:
     """Upgrade /media/{id} placeholders to real URLs or saved local MP4."""
     ok = True
@@ -1435,14 +1433,13 @@ async def _resolve_all_media_urls(
             fetched = await try_fetch_media_video_url_with_retry(
                 client,
                 mid,
-                max_attempts=fetch_attempts,
-                retry_404=True,
+                max_attempts=1,
+                retry_404=False,
             )
         except FlowApiError:
             raise
         except GetMedia404Error:
-            ok = False
-            continue
+            raise
         if fetched:
             completed[mid] = fetched
         else:
@@ -1550,12 +1547,9 @@ async def poll_video_by_media(
                         break
                 if not _poll_entry_done(poll_status, False) and mid not in completed:
                     continue
-                try:
-                    url = await try_fetch_media_video_url_with_retry(
-                        client, mid, max_attempts=4, retry_404=True
-                    )
-                except GetMedia404Error:
-                    continue
+                url = await try_fetch_media_video_url_with_retry(
+                    client, mid, max_attempts=1, retry_404=False
+                )
                 if url:
                     completed[mid] = url
 

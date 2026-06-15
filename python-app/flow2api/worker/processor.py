@@ -567,6 +567,15 @@ class WorkerController:
             if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
                 retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                append_request_log(
+                    rid,
+                    "worker",
+                    (
+                        f"get_media 404 during poll — requeue "
+                        f"{get_media_404_retry + 1}/{RECAPTCHA_RETRY_MAX}"
+                    ),
+                    level="warn",
+                )
                 logger.warning(
                     "get_media 404 retry %s/%s rid=%s — profile=%s",
                     get_media_404_retry + 1,
