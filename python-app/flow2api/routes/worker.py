@@ -7,11 +7,13 @@ from pydantic import BaseModel, Field
 
 from flow2api.services import activity
 from flow2api.services.auth_keys import get_api_key_by_token
+from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.worker_settings import (
     get_worker_settings,
     save_profile_limit,
     save_worker_settings,
+    set_profile_dispatch_enabled,
 )
 from flow2api.worker.processor import get_worker
 
@@ -32,6 +34,10 @@ class ProfileLimitBody(BaseModel):
 class ProfileLimitsBulkBody(BaseModel):
     profile_limits: dict[str, int] = Field(default_factory=dict)
     profile_default_max_concurrent: int | None = Field(None, ge=1, le=8)
+
+
+class ProfileDispatchBody(BaseModel):
+    enabled: bool = True
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -102,4 +108,28 @@ async def update_one_profile_limit(
         profile_id = body.profile_id
     saved = save_profile_limit(profile_id, body.max_concurrent)
     return {**saved.to_dict(), "ok": True}
+
+
+@router.put("/profiles/{profile_id}/dispatch")
+async def update_profile_dispatch(
+    profile_id: str,
+    body: ProfileDispatchBody,
+    _=Depends(_auth_key_id),
+):
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    try:
+        saved = set_profile_dispatch_enabled(profile_id, body.enabled)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    events.publish(
+        "profile_dispatch_changed",
+        {"profile_id": profile_id, "enabled": body.enabled},
+    )
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
+        "ok": True,
+    }
 

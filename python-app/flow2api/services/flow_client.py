@@ -39,10 +39,13 @@ def unbind_task_profile() -> None:
 
 
 def pick_profile_for_task(existing_profile_id: Optional[str] = None) -> Optional[str]:
-    from flow2api.services.worker_settings import get_profile_max_concurrent
+    from flow2api.services.worker_settings import (
+        get_profile_max_concurrent,
+        is_profile_dispatch_enabled,
+    )
 
     pool = get_extension_pool()
-    if existing_profile_id:
+    if existing_profile_id and is_profile_dispatch_enabled(existing_profile_id):
         session = pool.get(existing_profile_id)
         if session and session.is_ready():
             limit = get_profile_max_concurrent(existing_profile_id)
@@ -57,7 +60,11 @@ def pick_profile_for_retry(current_profile_id: str) -> Optional[str]:
 
 
 def profile_available_for_queue(params: dict[str, Any]) -> bool:
+    from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
     pid = params.get("profile_id")
+    if pid and not is_profile_dispatch_enabled(str(pid)):
+        return bool(pick_profile_for_task(None))
     if pid:
         return bool(pick_profile_for_task(str(pid)))
     exclude = params.get("retry_exclude_profile_id")

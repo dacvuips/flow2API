@@ -22,6 +22,7 @@ class WorkerSettings:
     task_stagger_s: float = 0.0
     profile_default_max_concurrent: int = 1
     profile_limits: dict[str, int] = field(default_factory=dict)
+    profile_dispatch_disabled: list[str] = field(default_factory=list)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -33,11 +34,17 @@ class WorkerSettings:
                 if not pid or str(pid).startswith("_"):
                     continue
                 limits[str(pid)] = max(1, min(_PROFILE_MAX_CAP, int(val or default_p)))
+        disabled: list[str] = []
+        if isinstance(self.profile_dispatch_disabled, list):
+            for pid in self.profile_dispatch_disabled:
+                if pid and not str(pid).startswith("_"):
+                    disabled.append(str(pid))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
             profile_default_max_concurrent=default_p,
             profile_limits=limits,
+            profile_dispatch_disabled=sorted(set(disabled)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +54,7 @@ class WorkerSettings:
             "task_stagger_s": n.task_stagger_s,
             "profile_default_max_concurrent": n.profile_default_max_concurrent,
             "profile_limits": dict(n.profile_limits),
+            "profile_dispatch_disabled": list(n.profile_dispatch_disabled),
         }
 
 
@@ -80,11 +88,15 @@ def _load_file() -> WorkerSettings | None:
     limits = raw.get("profile_limits") or {}
     if not isinstance(limits, dict):
         limits = {}
+    disabled = raw.get("profile_dispatch_disabled") or []
+    if not isinstance(disabled, list):
+        disabled = []
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
         profile_default_max_concurrent=int(raw.get("profile_default_max_concurrent", 1)),
         profile_limits={str(k): int(v) for k, v in limits.items()},
+        profile_dispatch_disabled=[str(x) for x in disabled],
     ).normalized()
 
 
@@ -113,6 +125,24 @@ def get_profile_max_concurrent(profile_id: str) -> int:
     return settings.profile_default_max_concurrent
 
 
+def is_profile_dispatch_enabled(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid not in get_worker_settings().profile_dispatch_disabled
+
+
+def set_profile_dispatch_enabled(profile_id: str, enabled: bool) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    disabled = [x for x in current.profile_dispatch_disabled if x != pid]
+    if not enabled:
+        disabled.append(pid)
+    return save_worker_settings(profile_dispatch_disabled=disabled)
+
+
 def save_worker_settings(**fields: Any) -> WorkerSettings:
     with _LOCK:
         current = _load_file() or _defaults_from_env()
@@ -134,6 +164,14 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                 else:
                     merged[str(pid)] = int(val)
             data["profile_limits"] = merged
+        if "profile_dispatch_disabled" in fields:
+            raw_disabled = fields["profile_dispatch_disabled"]
+            if isinstance(raw_disabled, list):
+                data["profile_dispatch_disabled"] = [
+                    str(x)
+                    for x in raw_disabled
+                    if x and not str(x).startswith("_")
+                ]
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)
 

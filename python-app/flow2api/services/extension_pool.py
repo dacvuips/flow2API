@@ -238,12 +238,17 @@ class ExtensionSession:
             self._pending.pop(req_id, None)
 
     def to_public_dict(self) -> dict[str, Any]:
-        from flow2api.services.worker_settings import get_profile_max_concurrent
+        from flow2api.services.worker_settings import (
+            get_profile_max_concurrent,
+            is_profile_dispatch_enabled,
+        )
 
         token_age = None
         if self.token_captured_at:
             token_age = int(time.time() - self.token_captured_at)
         max_c = get_profile_max_concurrent(self.profile_id)
+        dispatch_enabled = is_profile_dispatch_enabled(self.profile_id)
+        slots = max(0, max_c - self.active_jobs) if dispatch_enabled else 0
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -251,12 +256,13 @@ class ExtensionSession:
             "email": self.email,
             "online": self.connected,
             "ready": self.is_ready(),
+            "dispatch_enabled": dispatch_enabled,
             "flow_key_present": bool(self.flow_key),
             "token_age_s": token_age,
             "paygate_tier": self.paygate_tier,
             "active_jobs": self.active_jobs,
             "max_concurrent": max_c,
-            "slots_available": max(0, max_c - self.active_jobs),
+            "slots_available": slots,
             "assigned_total": self.assigned_total,
             "user": self.user_info or {},
         }
@@ -383,11 +389,16 @@ class ExtensionPool:
         return False
 
     def _sessions_with_capacity(self, *, exclude: Optional[set[str]] = None) -> list[ExtensionSession]:
-        from flow2api.services.worker_settings import get_profile_max_concurrent
+        from flow2api.services.worker_settings import (
+            get_profile_max_concurrent,
+            is_profile_dispatch_enabled,
+        )
 
         out: list[ExtensionSession] = []
         for session in self.ready_sessions():
             if exclude and session.profile_id in exclude:
+                continue
+            if not is_profile_dispatch_enabled(session.profile_id):
                 continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:
@@ -409,12 +420,17 @@ class ExtensionPool:
 
     def pick_profile_for_retry(self, current_profile_id: str) -> Optional[str]:
         """Next profile in stable ring order; idle first; *current* only after full cycle."""
-        from flow2api.services.worker_settings import get_profile_max_concurrent
+        from flow2api.services.worker_settings import (
+            get_profile_max_concurrent,
+            is_profile_dispatch_enabled,
+        )
 
         current = (current_profile_id or "").strip()
         eligible: list[ExtensionSession] = []
         for session in self.ready_sessions():
             if session.profile_id.startswith("_"):
+                continue
+            if not is_profile_dispatch_enabled(session.profile_id):
                 continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:
