@@ -1487,6 +1487,7 @@ async def poll_video_by_media(
     should_abort=None,
     on_round=None,
     interleave_get_media: bool = True,
+    requeue_on_get_media_404: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Poll batchCheckAsyncVideoGenerationStatus with media[{name, projectId}]."""
     pending = [mid for mid in dict.fromkeys(media_ids) if mid]
@@ -1545,11 +1546,24 @@ async def poll_video_by_media(
                     ) == mid:
                         poll_status = _extract_poll_status(entry)
                         break
-                if not _poll_entry_done(poll_status, False) and mid not in completed:
+                if (
+                    not requeue_on_get_media_404
+                    and not _poll_entry_done(poll_status, False)
+                    and mid not in completed
+                ):
                     continue
-                url = await try_fetch_media_video_url_with_retry(
-                    client, mid, max_attempts=1, retry_404=False
-                )
+                try:
+                    url = await try_fetch_media_video_url_with_retry(
+                        client, mid, max_attempts=1, retry_404=False
+                    )
+                except GetMedia404Error:
+                    if requeue_on_get_media_404 and not (
+                        _poll_entry_done(poll_status, False)
+                        or mid in completed
+                        or round_idx >= 5
+                    ):
+                        continue
+                    raise
                 if url:
                     completed[mid] = url
 
@@ -1676,11 +1690,37 @@ async def poll_workflow_videos(
     operations: list[dict],
     max_rounds: int,
     *,
+    project_id: str | None = None,
     should_abort=None,
     on_round=None,
 ) -> tuple[list[str], list[str]]:
-    """Poll Lower Priority / workflow models via GET /v1/media/{id}."""
-    pending = {op["_primary_media_id"] for op in operations if op.get("_primary_media_id")}
+    """Poll Lower Priority / workflow models (batch status + get_media, requeue on 404)."""
+    media_ids = list(
+        dict.fromkeys(
+            str(op["_primary_media_id"])
+            for op in operations
+            if op.get("_primary_media_id")
+        )
+    )
+    if not project_id:
+        for op in operations:
+            pid = op.get("_project_id")
+            if pid:
+                project_id = str(pid)
+                break
+
+    if project_id and media_ids:
+        return await poll_video_by_media(
+            client,
+            project_id,
+            media_ids,
+            max_rounds,
+            should_abort=should_abort,
+            on_round=on_round,
+            requeue_on_get_media_404=True,
+        )
+
+    pending = {mid for mid in media_ids if mid}
     completed: dict[str, str] = {}
 
     for round_idx in range(max_rounds):
@@ -1689,12 +1729,9 @@ async def poll_workflow_videos(
         for mid in list(pending):
             if _media_url_is_resolved(completed.get(mid, ""), mid):
                 continue
-            try:
-                url = await try_fetch_media_video_url_with_retry(
-                    client, mid, max_attempts=4, retry_404=True
-                )
-            except GetMedia404Error:
-                continue
+            url = await try_fetch_media_video_url_with_retry(
+                client, mid, max_attempts=1, retry_404=False
+            )
             if url:
                 completed[mid] = url
 

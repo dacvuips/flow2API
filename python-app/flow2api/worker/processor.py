@@ -945,6 +945,7 @@ class WorkerController:
                     media_ids,
                     VIDEO_POLL_MAX,
                     should_abort=self._abort_hook(rid),
+                    requeue_on_get_media_404=workflow_mode,
                 )
                 await _finish(urls, media, poll_mode="media")
                 return
@@ -961,6 +962,7 @@ class WorkerController:
                         client,
                         workflow_ops,
                         max_rounds=min(60, VIDEO_POLL_MAX),
+                        project_id=poll_project_id,
                         should_abort=self._abort_hook(rid),
                     )
                     await _finish(urls, media, poll_mode="get_media_fallback", workflow_mode=True)
@@ -971,6 +973,7 @@ class WorkerController:
                 client,
                 workflow_ops,
                 VIDEO_POLL_MAX,
+                project_id=poll_project_id,
                 should_abort=self._abort_hook(rid),
             )
             await _finish(urls, media, poll_mode="get_media", workflow_mode=True)
@@ -1000,7 +1003,11 @@ class WorkerController:
                             return
                     elif workflow_ops and transient_streak % 3 == 0:
                         urls, media = await flow_sdk.poll_workflow_videos(
-                            client, workflow_ops, max_rounds=5, should_abort=self._abort_hook(rid)
+                            client,
+                            workflow_ops,
+                            max_rounds=5,
+                            project_id=poll_project_id,
+                            should_abort=self._abort_hook(rid),
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="get_media")
@@ -1031,12 +1038,19 @@ class WorkerController:
                     except RuntimeError:
                         pass
                 if workflow_ops:
-                    urls, media = await flow_sdk.poll_workflow_videos(
-                        client, workflow_ops, max_rounds=10, should_abort=self._abort_hook(rid)
-                    )
-                    if urls:
-                        await _finish(urls, media, recovered_from="get_media")
-                        return
+                    try:
+                        urls, media = await flow_sdk.poll_workflow_videos(
+                            client,
+                            workflow_ops,
+                            max_rounds=10,
+                            project_id=poll_project_id,
+                            should_abort=self._abort_hook(rid),
+                        )
+                        if urls:
+                            await _finish(urls, media, recovered_from="get_media")
+                            return
+                    except GetMedia404Error:
+                        raise
                 raise RuntimeError("video_generation_failed")
             if summary and all(s.get("done") for s in summary):
                 urls, media = flow_sdk._urls_from_operations(current_ops)
@@ -1061,12 +1075,19 @@ class WorkerController:
                 except RuntimeError:
                     pass
             elif workflow_ops and round_idx % 5 == 4:
-                urls, media = await flow_sdk.poll_workflow_videos(
-                    client, workflow_ops, max_rounds=3, should_abort=self._abort_hook(rid)
-                )
-                if urls:
-                    await _finish(urls, media, recovered_from="get_media")
-                    return
+                try:
+                    urls, media = await flow_sdk.poll_workflow_videos(
+                        client,
+                        workflow_ops,
+                        max_rounds=3,
+                        project_id=poll_project_id,
+                        should_abort=self._abort_hook(rid),
+                    )
+                    if urls:
+                        await _finish(urls, media, recovered_from="get_media")
+                        return
+                except GetMedia404Error:
+                    raise
             await asyncio.sleep(POLL_INTERVAL_S)
 
         if media_ids and poll_project_id:
@@ -1088,12 +1109,19 @@ class WorkerController:
             except RuntimeError:
                 pass
         if workflow_ops:
-            urls, media = await flow_sdk.poll_workflow_videos(
-                client, workflow_ops, max_rounds=30, should_abort=self._abort_hook(rid)
-            )
-            if urls:
-                await _finish(urls, media, recovered_from="get_media")
-                return
+            try:
+                urls, media = await flow_sdk.poll_workflow_videos(
+                    client,
+                    workflow_ops,
+                    max_rounds=30,
+                    project_id=poll_project_id,
+                    should_abort=self._abort_hook(rid),
+                )
+                if urls:
+                    await _finish(urls, media, recovered_from="get_media")
+                    return
+            except GetMedia404Error:
+                raise
         raise RuntimeError("timeout_waiting_video")
 
 
