@@ -442,13 +442,43 @@ def load_input_base64s_from_storage(request_id: str, *, max_items: int = 3) -> l
     return out
 
 
+_MEDIA_REF_KEYS = ("start_media_id", "end_media_id", "reference_media_ids")
+_PROFILE_ASSIGN_KEYS = ("profile_id", "profile_label", "profile_email")
+
+
+def _restore_input_images(params: dict[str, Any], request_id: str) -> dict[str, Any]:
+    out = dict(params or {})
+    if not (out.get("image_base64s") or out.get("imageBase64s")):
+        restored = load_input_base64s_from_storage(request_id)
+        if restored:
+            out["image_base64s"] = restored
+    return out
+
+
+def prepare_params_for_poll_404_retry(
+    params: dict[str, Any],
+    request_id: str,
+    *,
+    prompt: str = "",
+) -> dict[str, Any]:
+    """Requeue after get_media 404 — same task id, fresh media refs, inputs restored."""
+    out = dict(params or {})
+    for key in _MEDIA_REF_KEYS:
+        out.pop(key, None)
+    for key in _PROFILE_ASSIGN_KEYS:
+        out.pop(key, None)
+    out.pop("running_started_at", None)
+    out.pop("retry_exclude_profile_id", None)
+    if prompt and not str(out.get("prompt") or "").strip():
+        out["prompt"] = prompt
+    return _restore_input_images(out, request_id)
+
+
 def prepare_params_for_manual_retry(params: dict[str, Any], request_id: str) -> dict[str, Any]:
     """Reset stale Google media refs and restore upload bytes for retry."""
     out = dict(params or {})
     for key in (
-        "start_media_id",
-        "end_media_id",
-        "reference_media_ids",
+        *_MEDIA_REF_KEYS,
         "recaptcha_retry_count",
         "get_media_404_retry_count",
         "upload_internal_retry_count",
@@ -462,14 +492,9 @@ def prepare_params_for_manual_retry(params: dict[str, Any], request_id: str) -> 
         "retry_exclude_profile_id",
     ):
         out.pop(key, None)
-    # profile_id/label/email dropped so scheduler can reassign profile
-    for key in ("profile_id", "profile_label", "profile_email"):
+    for key in _PROFILE_ASSIGN_KEYS:
         out.pop(key, None)
-    if not (out.get("image_base64s") or out.get("imageBase64s")):
-        restored = load_input_base64s_from_storage(request_id)
-        if restored:
-            out["image_base64s"] = restored
-    return out
+    return _restore_input_images(out, request_id)
 
 
 def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:

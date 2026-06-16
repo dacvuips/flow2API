@@ -33,6 +33,7 @@ from flow2api.services.flow_sdk import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
+from flow2api.services.result_media import prepare_params_for_poll_404_retry
 from flow2api.services.stored_media import persist_task_result
 from flow2api.services.flow_client import (
     apply_retry_profile_rotation,
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 _IMAGE_VIDEO_TYPES = frozenset(
     {"gen_image_video", "gen_video", "gen_video_start_end", "gen_multi_image_video"}
 )
+
+
+def _task_prompt(row: Any, params: dict[str, Any]) -> str:
+    return str(params.get("prompt") or getattr(row, "prompt", "") or "")
 
 
 def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
@@ -566,18 +571,25 @@ class WorkerController:
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
             if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
+                row_prompt = str((cur.prompt if cur else "") or "")
+                retry_params = prepare_params_for_poll_404_retry(
+                    retry_params,
+                    rid,
+                    prompt=row_prompt,
+                )
                 retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 append_request_log(
                     rid,
                     "worker",
                     (
                         f"get_media 404 during poll — requeue "
-                        f"{get_media_404_retry + 1}/{RECAPTCHA_RETRY_MAX}"
+                        f"{get_media_404_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                        f"(same task id, inputs restored)"
                     ),
                     level="warn",
                 )
                 logger.warning(
-                    "get_media 404 retry %s/%s rid=%s — profile=%s",
+                    "get_media 404 retry %s/%s rid=%s — inputs restored, profile=%s",
                     get_media_404_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
@@ -728,7 +740,9 @@ class WorkerController:
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:
-                activity.maybe_strip_heavy_params(rid)
+                cur_after = activity.get_request(rid)
+                if cur_after and cur_after.status != "queued":
+                    activity.maybe_strip_heavy_params(rid)
             except Exception as exc:
                 logger.warning("strip heavy params failed rid=%s: %s", rid[:8], exc)
 
@@ -755,7 +769,7 @@ class WorkerController:
             raw = await flow_sdk.gen_image(
                 client,
                 project_id=project_id,
-                prompt=params.get("prompt", ""),
+                prompt=_task_prompt(row, params),
                 aspect_ratio=params.get("aspect_ratio", "16:9"),
                 image_model=params.get("image_model", "NANO_BANANA_PRO"),
                 variant_count=int(params.get("variant_count") or 1),
@@ -798,7 +812,7 @@ class WorkerController:
             raw = await flow_sdk.gen_text_video(
                 client,
                 project_id=project_id,
-                prompt=params.get("prompt", ""),
+                prompt=_task_prompt(row, params),
                 aspect_ratio=params.get("aspect_ratio", "16:9"),
                 video_quality=params.get("video_quality", "fast"),
             )
@@ -823,7 +837,8 @@ class WorkerController:
         video_mode: str,
         req_type: str,
     ) -> None:
-        prompt = params.get("prompt", "")
+        row = activity.get_request(rid)
+        prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
         video_quality = params.get("video_quality", "fast")
 
