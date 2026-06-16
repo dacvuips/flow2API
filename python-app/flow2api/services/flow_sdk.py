@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 IMAGE_MODELS = {
     "NANO_BANANA_PRO": "GEM_PIX_2",
-    "NANO_BANANA_2": "GEM_PIX",
+    "NANO_BANANA_2": "NARWHAL",
 }
 
 IMAGE_ASPECT = {
