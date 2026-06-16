@@ -23,7 +23,7 @@ def append_request_log(
 ) -> None:
     line = f"[{_now_iso()}]"
     if request_id:
-        line += f" [{request_id[:8]}]"
+        line += f" [{request_id}]"
     line += f" {step}: {message}"
     if level == "error":
         _runtime_logger.error(line)
