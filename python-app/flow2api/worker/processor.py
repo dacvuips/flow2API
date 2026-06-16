@@ -33,7 +33,7 @@ from flow2api.services.flow_sdk import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
-from flow2api.services.result_media import prepare_params_for_poll_404_retry
+from flow2api.services.result_media import prepare_params_for_worker_requeue
 from flow2api.services.stored_media import persist_task_result
 from flow2api.services.flow_client import (
     apply_retry_profile_rotation,
@@ -138,26 +138,31 @@ class WorkerController:
 
         if retry_count < max_retries:
             params["running_timeout_retry_count"] = retry_count + 1
+            params = prepare_params_for_worker_requeue(
+                params,
+                rid,
+                prompt=str(row.prompt or ""),
+            )
             params = apply_retry_profile_rotation(params)
-            params.pop("running_started_at", None)
             activity.update_request(
                 rid,
                 status="queued",
                 params=params,
-                error=f"running_stuck_retry_{retry_count + 1}",
+                error=None,
             )
             append_request_log(
                 rid,
                 "worker",
                 (
                     f"Running stuck {TASK_RUNNING_TIMEOUT_S // 60}m — "
-                    f"requeue {retry_count + 1}/{max_retries}"
+                    f"requeue {retry_count + 1}/{max_retries} "
+                    f"(same task id, inputs restored)"
                 ),
                 level="warn",
             )
             events.publish("request_finished", {"id": rid, "status": "queued"})
             logger.warning(
-                "task stuck running rid=%s — requeue %s/%s",
+                "task stuck running rid=%s — requeue %s/%s, inputs restored",
                 rid[:8],
                 retry_count + 1,
                 max_retries,
@@ -572,7 +577,7 @@ class WorkerController:
             if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
                 retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
                 row_prompt = str((cur.prompt if cur else "") or "")
-                retry_params = prepare_params_for_poll_404_retry(
+                retry_params = prepare_params_for_worker_requeue(
                     retry_params,
                     rid,
                     prompt=row_prompt,

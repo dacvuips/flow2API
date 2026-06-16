@@ -455,13 +455,13 @@ def _restore_input_images(params: dict[str, Any], request_id: str) -> dict[str, 
     return out
 
 
-def prepare_params_for_poll_404_retry(
+def prepare_params_for_worker_requeue(
     params: dict[str, Any],
     request_id: str,
     *,
     prompt: str = "",
 ) -> dict[str, Any]:
-    """Requeue after get_media 404 — same task id, fresh media refs, inputs restored."""
+    """Requeue same task id — refresh Google media refs, restore input images."""
     out = dict(params or {})
     for key in _MEDIA_REF_KEYS:
         out.pop(key, None)
