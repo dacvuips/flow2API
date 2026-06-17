@@ -87,3 +87,73 @@ class Flow2APIClient:
                 raise RuntimeError(task.get("error") or status)
             time.sleep(poll_interval)
         raise TimeoutError(f"timeout_waiting_result:{request_id}")
+
+    def upsample_image(
+        self,
+        *,
+        media_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        index: int = 0,
+        project_id: Optional[str] = None,
+        resolution: str = "4k",
+        download: bool = False,
+    ) -> dict | bytes:
+        """Upscale ảnh đã generate lên 2K hoặc 4K. resolution: 2k | 4k."""
+        body: dict[str, Any] = {
+            "target_resolution": resolution,
+            "index": index,
+        }
+        if media_id:
+            body["media_id"] = media_id
+        if request_id:
+            body["request_id"] = request_id
+        if project_id:
+            body["project_id"] = project_id
+        params = {"download": "true"} if download else {}
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/requests/upsample-image",
+                headers=self._headers(),
+                params=params,
+                json=body,
+            )
+            r.raise_for_status()
+            if download:
+                return r.content
+            return r.json()
+
+    def upsample_image_4k(
+        self,
+        *,
+        media_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        index: int = 0,
+        project_id: Optional[str] = None,
+        download: bool = False,
+    ) -> dict | bytes:
+        return self.upsample_image(
+            media_id=media_id,
+            request_id=request_id,
+            index=index,
+            project_id=project_id,
+            resolution="4k",
+            download=download,
+        )
+
+    def upsample_image_2k(
+        self,
+        *,
+        media_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        index: int = 0,
+        project_id: Optional[str] = None,
+        download: bool = False,
+    ) -> dict | bytes:
+        return self.upsample_image(
+            media_id=media_id,
+            request_id=request_id,
+            index=index,
+            project_id=project_id,
+            resolution="2k",
+            download=download,
+        )

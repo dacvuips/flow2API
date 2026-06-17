@@ -526,7 +526,7 @@ async def upsample_image(
     project_id: str,
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
 ) -> dict[str, Any]:
-    """Upscale a generated image to 4K via /v1/flow/upsampleImage."""
+    """Upscale a generated image via /v1/flow/upsampleImage (2K or 4K)."""
     tier = _require_tier(client)
     media_id = str(media_id or "").strip()
     if not media_id:

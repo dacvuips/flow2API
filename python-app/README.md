@@ -85,6 +85,55 @@ curl -X POST "http://127.0.0.1:1994/api/requests" ^
 curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/REQUEST_ID"
 ```
 
+Khi `status=done`, response có `result.media_ids` (dùng cho upscale 4K) và `result.project_id`.
+
+### Tải ảnh 2K / 4K (upscale)
+
+Sau khi tạo ảnh xong, gọi upscale với `target_resolution`:
+
+| Giá trị | Mô tả |
+|---------|--------|
+| `2k` hoặc `UPSAMPLE_IMAGE_RESOLUTION_2K` | Upscale 2K |
+| `4k` hoặc `UPSAMPLE_IMAGE_RESOLUTION_4K` | Upscale 4K (mặc định) |
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"request_id\":\"REQUEST_ID\",\"target_resolution\":\"UPSAMPLE_IMAGE_RESOLUTION_2K\"}"
+```
+
+Hoặc truyền trực tiếp `media_id` từ `result.media_ids[0]`:
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"media_id\":\"MEDIA_UUID\",\"project_id\":\"PROJECT_UUID\",\"target_resolution\":\"2k\"}"
+```
+
+Tải thẳng file ảnh (không JSON): thêm query `?download=true`
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image?download=true" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"request_id\":\"REQUEST_ID\"}" ^
+  -o output_4k.jpg
+```
+
+Response JSON mẫu:
+
+```json
+{
+  "source_media_id": "67df4b95-458d-44c8-927c-ab9a34ebac28",
+  "project_id": "53fb4e75-b57e-447d-93a9-d7fa48f9cc36",
+  "target_resolution": "UPSAMPLE_IMAGE_RESOLUTION_4K",
+  "media_id": "...",
+  "image_url": "https://..."
+}
+```
+
 ### Python client
 
 ```python
@@ -92,10 +141,13 @@ from client.flow2api_client import Flow2APIClient
 
 client = Flow2APIClient("http://127.0.0.1:1994", "f2api_...")
 job = client.create_image(prompt="A cinematic fashion photo", aspect_ratio="16:9")
-print(client.wait(job["id"]))
+task = client.wait(job["id"])
+upscaled_2k = client.upsample_image_2k(request_id=job["id"])
+upscaled_4k = client.upsample_image_4k(request_id=job["id"])
+print(upscaled_2k, upscaled_4k)
 ```
 
-Hoặc chạy: `python client/example_gen_image.py` (đặt `FLOW2API_TOKEN`).
+Hoặc chạy: `python client/example_gen_image.py` / `python client/example_upsample_4k.py` (đặt `FLOW2API_TOKEN`).
 
 ## Cloudflare Zero Trust
 

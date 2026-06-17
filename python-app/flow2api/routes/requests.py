@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from flow2api.services import activity
@@ -11,6 +12,11 @@ from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.dashboard_events import events
 from flow2api.services.result_media import prepare_params_for_manual_retry, with_base64_media
+from flow2api.services.image_upsample import (
+    fetch_upsample_image_bytes,
+    run_upsample_image,
+    upsample_resolution_label,
+)
 from flow2api.short_id import new_request_id
 from flow2api.worker.processor import get_worker
 
@@ -34,6 +40,14 @@ class RequestParams(BaseModel):
 class CreateRequestBody(BaseModel):
     type: str
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpsampleImageRequest(BaseModel):
+    media_id: Optional[str] = None
+    request_id: Optional[str] = None
+    index: int = 0
+    project_id: Optional[str] = None
+    target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
 
 
 _RETRY_DROP_KEYS = frozenset(
@@ -100,6 +114,46 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
         data={"type": body.type, "params": params},
     )
     return {"id": rid, "status": "queued"}
+
+
+@router.post("/upsample-image")
+async def upsample_image_external(
+    body: UpsampleImageRequest,
+    download: bool = Query(False, description="Trả file ảnh JPEG/PNG thay vì JSON"),
+    api_key_id: int = Depends(_auth_key_id),
+):
+    """Upscale ảnh đã generate lên 2K/4K. Dùng media_id hoặc request_id (task gen_image done)."""
+    result = await run_upsample_image(
+        media_id=body.media_id,
+        request_id=body.request_id,
+        index=body.index,
+        project_id=body.project_id,
+        target_resolution=body.target_resolution,
+    )
+    append_request_log(
+        body.request_id or result.get("source_media_id") or "-",
+        "http",
+        "POST /api/requests/upsample-image",
+        level="info",
+        data={
+            "source_media_id": result.get("source_media_id"),
+            "upsampled_media_id": result.get("media_id"),
+            "download": download,
+        },
+    )
+    if download:
+        raw, mime = await fetch_upsample_image_bytes(result)
+        mid = str(result.get("source_media_id") or "image")[:8]
+        label = upsample_resolution_label(str(result.get("target_resolution") or ""))
+        ext = "png" if "png" in mime else "jpg"
+        return Response(
+            content=raw,
+            media_type=mime,
+            headers={
+                "Content-Disposition": f'attachment; filename="flow-{label}-{mid}.{ext}"'
+            },
+        )
+    return result
 
 
 @router.post("/cancel-all")

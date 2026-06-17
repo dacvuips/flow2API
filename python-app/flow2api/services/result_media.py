@@ -260,6 +260,17 @@ def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
         else:
             out.pop("media_entries", None)
 
+    if isinstance(out.get("media_ids"), list):
+        out["media_ids"] = [str(m) for m in out["media_ids"] if str(m).strip()]
+        if not out["media_ids"]:
+            out.pop("media_ids", None)
+
+    pid = str(out.get("project_id") or "").strip()
+    if pid:
+        out["project_id"] = pid
+    else:
+        out.pop("project_id", None)
+
     return out
 
 

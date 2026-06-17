@@ -18,14 +18,9 @@ from flow2api.services.stored_media import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.flow_client import get_flow_client
-from flow2api.services.flow_sdk import (
-    FlowApiError,
-    ensure_project,
-    get_media_http_status,
-    parse_get_media_image,
-    upsample_image,
-)
+from flow2api.services.flow_sdk import get_media_http_status, parse_get_media_image
 from flow2api.services.health_cache import get_health_payload
+from flow2api.services.image_upsample import run_upsample_image
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +28,9 @@ router = APIRouter(tags=["system"])
 
 
 class UpsampleImageBody(BaseModel):
-    media_id: str
+    media_id: str | None = None
+    request_id: str | None = None
+    index: int = 0
     project_id: str | None = None
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
 
@@ -219,53 +216,13 @@ async def flow_upsample_image(
     body: UpsampleImageBody,
     _: str = Depends(_bearer_token),
 ):
-    media_id = str(body.media_id or "").strip()
-    if not media_id:
-        raise HTTPException(400, "missing_media_id")
-
-    client = get_flow_client()
-    if not client.connected:
-        raise HTTPException(503, "extension_not_connected")
-    if not client.flow_key:
-        raise HTTPException(503, "no_flow_token")
-    if not client.paygate_tier:
-        await client.fetch_paygate_tier()
-
-    project_id = str(body.project_id or "").strip()
-    if not project_id:
-        try:
-            project_id = await ensure_project(client)
-        except Exception as exc:
-            logger.warning("upsample ensure_project failed: %s", exc)
-            raise HTTPException(503, "project_unavailable") from exc
-
-    try:
-        result = await asyncio.wait_for(
-            upsample_image(
-                client,
-                media_id=media_id,
-                project_id=project_id,
-                target_resolution=body.target_resolution,
-            ),
-            timeout=300,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "upsample_timeout") from None
-    except FlowApiError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    except Exception as exc:
-        logger.warning("upsample_image failed %s: %s", media_id[:12], exc)
-        raise HTTPException(502, "upsample_failed") from exc
-
-    if result.get("encoded_image"):
-        enc = str(result["encoded_image"])
-        if not enc.startswith("data:"):
-            result["data_url"] = f"data:image/jpeg;base64,{enc}"
-        else:
-            result["data_url"] = enc
-    if result.get("media_id") and not result.get("url"):
-        result["url"] = f"/media/{result['media_id']}"
-    return result
+    return await run_upsample_image(
+        media_id=body.media_id,
+        request_id=body.request_id,
+        index=body.index,
+        project_id=body.project_id,
+        target_resolution=body.target_resolution,
+    )
 
 
 @router.get("/api/events")
