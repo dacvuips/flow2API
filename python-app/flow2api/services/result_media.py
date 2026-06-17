@@ -326,8 +326,11 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     if local_files:
         return items[:1]
 
-    for u in result.get("image_urls") or []:
-        add(str(u), "image")
+    image_urls = result.get("image_urls") or []
+    media_ids = result.get("media_ids") or []
+    for i, u in enumerate(image_urls):
+        mid = str(media_ids[i] if i < len(media_ids) else "").strip()
+        add(str(u), "image", mid)
     for u in result.get("video_urls") or []:
         add(str(u), "video")
     if result.get("Link"):

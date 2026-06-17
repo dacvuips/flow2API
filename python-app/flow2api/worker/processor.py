@@ -788,6 +788,7 @@ class WorkerController:
                 "image_urls": urls,
                 "media_ids": media_ids,
                 "media_entries": media_entries,
+                "project_id": project_id,
             }
             result = await persist_task_result(rid, result, req_type)
             if (

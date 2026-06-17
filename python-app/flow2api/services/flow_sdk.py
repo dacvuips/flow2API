@@ -155,6 +155,7 @@ VIDEO_START_END_PATH = "/v1/video:batchAsyncGenerateVideoStartAndEndImage"
 VIDEO_REF_PATH = "/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_PATH = "/v1/video:batchCheckAsyncVideoGenerationStatus"
 UPLOAD_IMAGE_PATH = "/v1/flow/uploadImage"
+UPSAMPLE_IMAGE_PATH = "/v1/flow/upsampleImage"
 
 
 def _api_url(path: str) -> str:
@@ -479,6 +480,95 @@ def extract_image_media_ids(data: dict) -> list[str]:
         if mid:
             ids.append(mid)
     return ids
+
+
+def parse_upsample_image_response(data: Any) -> dict[str, Any]:
+    """Extract url / media_id / encoded_image from upsampleImage response."""
+    if not isinstance(data, dict):
+        return {}
+
+    payload: dict = data
+    if isinstance(payload.get("data"), dict):
+        inner = payload["data"]
+        if inner.get("encodedImage") or inner.get("mediaId") or inner.get("fifeUrl"):
+            payload = inner
+
+    encoded = str(payload.get("encodedImage") or "")
+    mid = str(payload.get("mediaId") or payload.get("name") or "")
+    url = payload.get("fifeUrl") or payload.get("imageUri") or payload.get("url")
+
+    for entry in payload.get("media") or []:
+        if not isinstance(entry, dict):
+            continue
+        gen = (entry.get("image") or {}).get("generatedImage")
+        if not isinstance(gen, dict):
+            gen = entry.get("image") if isinstance(entry.get("image"), dict) else entry
+        if not isinstance(gen, dict):
+            continue
+        encoded = encoded or str(gen.get("encodedImage") or "")
+        mid = mid or str(gen.get("mediaId") or gen.get("name") or "")
+        url = url or gen.get("fifeUrl") or gen.get("imageUri") or gen.get("url")
+
+    out: dict[str, Any] = {}
+    if url:
+        out["url"] = str(url)
+    if mid:
+        out["media_id"] = mid
+    if encoded:
+        out["encoded_image"] = encoded
+    return out
+
+
+async def upsample_image(
+    client: FlowClient,
+    *,
+    media_id: str,
+    project_id: str,
+    target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
+) -> dict[str, Any]:
+    """Upscale a generated image to 4K via /v1/flow/upsampleImage."""
+    tier = _require_tier(client)
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        raise ValueError("missing_media_id")
+
+    last_err = "upsample_image_failed"
+    last_resp: dict = {}
+    for attempt in range(RECAPTCHA_RETRY_MAX):
+        body = {
+            "mediaId": media_id,
+            "targetResolution": target_resolution,
+            "clientContext": _client_context(project_id, tier),
+        }
+        resp = await client.api_request(
+            _api_url(UPSAMPLE_IMAGE_PATH),
+            body=body,
+            captcha_action="IMAGE_GENERATION",
+            timeout=300,
+            raise_on_error=False,
+        )
+        last_resp = resp if isinstance(resp, dict) else {}
+        status = int(resp.get("status") or 0)
+        if status < 400:
+            data = resp.get("data") or {}
+            parsed = parse_upsample_image_response(data)
+            if parsed:
+                return parsed
+            return {"raw": data} if data else {}
+        last_err = error_from_response(resp)
+        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = _recaptcha_retry_delay(attempt)
+            logger.warning(
+                "upsample reCAPTCHA retry %s/%s: %s — wait %ss",
+                attempt + 1,
+                RECAPTCHA_RETRY_MAX,
+                last_err,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        break
+    raise FlowApiError(last_err, step="upsample_image", raw=last_resp)
 
 
 def _video_model_key(mode: str, tier: str, aspect: str, quality: str) -> str:
