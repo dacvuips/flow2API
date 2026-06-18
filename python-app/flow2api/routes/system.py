@@ -32,6 +32,7 @@ class UpsampleImageBody(BaseModel):
     request_id: str | None = None
     index: int = 0
     project_id: str | None = None
+    profile_id: str | None = None
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
 
 
@@ -221,6 +222,7 @@ async def flow_upsample_image(
         request_id=body.request_id,
         index=body.index,
         project_id=body.project_id,
+        profile_id=body.profile_id,
         target_resolution=body.target_resolution,
     )
 

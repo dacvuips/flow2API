@@ -789,6 +789,7 @@ class WorkerController:
                 "media_ids": media_ids,
                 "media_entries": media_entries,
                 "project_id": project_id,
+                "profile_id": profile_id,
             }
             result = await persist_task_result(rid, result, req_type)
             if (
@@ -936,8 +937,17 @@ class WorkerController:
         poll_project_id = flow_sdk.resolve_poll_project_id(submit_raw, operations, project_id)
 
         async def _finish(urls: list[str], media: list[str], **extra: Any) -> None:
-            result = {"video_urls": urls, "media_ids": media, **extra}
             row_done = activity.get_request(rid)
+            done_params = (
+                json.loads(row_done.params_json or "{}") if row_done else {}
+            )
+            result = {
+                "video_urls": urls,
+                "media_ids": media,
+                "project_id": poll_project_id,
+                "profile_id": done_params.get("profile_id"),
+                **extra,
+            }
             if row_done:
                 result = await persist_task_result(rid, result, row_done.type)
             if row_done:

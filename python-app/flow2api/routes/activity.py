@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from flow2api.config import (
     ACTIVITY_LIST_LIMIT,
+    ACTIVITY_META_LIMIT,
     ACTIVITY_PAGE_SIZE,
     HTTP_HANDLER_TIMEOUT_S,
     PURGE_INTERVAL_S,
@@ -28,7 +29,7 @@ def _maybe_schedule_purge() -> None:
     if now - _last_purge_monotonic < interval:
         return
     _last_purge_monotonic = now
-    asyncio.create_task(asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT))
+    asyncio.create_task(asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT, ACTIVITY_META_LIMIT))
 
 
 async def _list_activity_payload(

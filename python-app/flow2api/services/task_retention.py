@@ -1,4 +1,4 @@
-"""Drop finished tasks (and their media) beyond the dashboard retention window."""
+"""Tiered task retention: media for newest N rows, metadata-only for M rows."""
 from __future__ import annotations
 
 import json
@@ -6,9 +6,14 @@ import logging
 import re
 from typing import Any
 
-from flow2api.config import ACTIVITY_LIST_LIMIT, INPUTS_DIR, VIDEOS_DIR
-from flow2api.services.stored_media import delete_output_dir, purge_expired_outputs
+from flow2api.config import (
+    ACTIVITY_LIST_LIMIT,
+    ACTIVITY_META_LIMIT,
+    INPUTS_DIR,
+    VIDEOS_DIR,
+)
 from flow2api.db.models import RequestRecord, SessionLocal
+from flow2api.services.stored_media import delete_output_dir, purge_expired_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,39 @@ def collect_request_media_ids(row: RequestRecord) -> set[str]:
     return ids
 
 
+def slim_params_for_retention(params: dict[str, Any]) -> dict[str, Any]:
+    """Keep only profile_id for upscale fallback after media purge."""
+    pid = str((params or {}).get("profile_id") or "").strip()
+    return {"profile_id": pid} if pid else {}
+
+
+def strip_result_to_metadata(
+    result: dict[str, Any],
+    *,
+    profile_id: str = "",
+) -> dict[str, Any]:
+    """Keep only upscale fields; drop URLs, traces, logs, and other result blobs."""
+    out: dict[str, Any] = {"media_purged": True}
+
+    media_ids = [
+        str(m).strip()
+        for m in (result.get("media_ids") or [])
+        if str(m).strip()
+    ]
+    if media_ids:
+        out["media_ids"] = media_ids
+
+    project_id = str(result.get("project_id") or "").strip()
+    if project_id:
+        out["project_id"] = project_id
+
+    prof = str(result.get("profile_id") or profile_id or "").strip()
+    if prof:
+        out["profile_id"] = prof
+
+    return out
+
+
 def _delete_local_video(media_id: str) -> None:
     path = VIDEOS_DIR / f"{media_id}.mp4"
     if not path.is_file():
@@ -99,52 +137,143 @@ def _delete_input_previews(request_id: str) -> None:
         logger.warning("failed to delete input previews %s: %s", request_id[:8], exc)
 
 
-def purge_old_requests(keep: int | None = None) -> int:
-    """Delete finished tasks older than the newest `keep` rows (+ their media)."""
-    limit = max(1, int(keep or ACTIVITY_LIST_LIMIT))
-    db = SessionLocal()
-    deleted = 0
-    try:
-        total = db.query(RequestRecord).count()
-        if total <= limit:
-            return 0
+def _purge_row_files(
+    row: RequestRecord,
+    purge_media_ids: set[str],
+    *,
+    delete_inputs: bool = True,
+) -> None:
+    for mid in purge_media_ids:
+        _delete_local_video(mid)
+    if delete_inputs:
+        _delete_input_previews(row.id)
+    delete_output_dir(row.id)
 
-        keep_rows = (
+
+def purge_tiered_requests(
+    media_keep: int | None = None,
+    meta_keep: int | None = None,
+) -> tuple[int, int, set[str]]:
+    """
+    Tier 1 (newest media_keep): keep DB row + on-disk media.
+    Tier 2 (media_keep..meta_keep): keep DB row, strip media files + heavy result fields.
+    Tier 3 (beyond meta_keep): delete DB row (+ orphan media).
+    Returns (metadata_stripped, rows_deleted, protected_request_ids).
+    """
+    media_limit = max(1, int(media_keep or ACTIVITY_LIST_LIMIT))
+    meta_limit = max(media_limit, int(meta_keep or ACTIVITY_META_LIMIT))
+
+    db = SessionLocal()
+    stripped = 0
+    deleted = 0
+    protected_request_ids: set[str] = set()
+    try:
+        all_rows = (
             db.query(RequestRecord)
             .order_by(RequestRecord.created_at.desc())
-            .limit(limit)
             .all()
         )
-        keep_ids = {row.id for row in keep_rows}
-        remaining_media: set[str] = set()
-        for row in keep_rows:
+        if not all_rows:
+            return 0, 0, protected_request_ids
+
+        media_rows = all_rows[:media_limit]
+        meta_rows = all_rows[media_limit:meta_limit]
+        drop_rows = all_rows[meta_limit:]
+
+        protected_request_ids = {row.id for row in media_rows}
+        protected_media: set[str] = set()
+        for row in media_rows:
+            protected_media |= collect_request_media_ids(row)
+
+        for row in meta_rows:
+            if row.status in _ACTIVE_STATUSES:
+                continue
+            try:
+                result = json.loads(row.result_json or "{}")
+            except json.JSONDecodeError:
+                result = {}
+            try:
+                params = json.loads(row.params_json or "{}")
+            except json.JSONDecodeError:
+                params = {}
+            prof = str(
+                (result.get("profile_id") if isinstance(result, dict) else "")
+                or params.get("profile_id")
+                or ""
+            ).strip()
+            if result.get("media_purged"):
+                changed = False
+                if (row.logs_json or "[]").strip() not in ("", "[]"):
+                    row.logs_json = "[]"
+                    changed = True
+                slim_params = slim_params_for_retention(params)
+                if params != slim_params:
+                    row.params_json = json.dumps(slim_params, ensure_ascii=False)
+                    changed = True
+                slim_result = strip_result_to_metadata(
+                    result if isinstance(result, dict) else {},
+                    profile_id=prof,
+                )
+                if result != slim_result:
+                    row.result_json = json.dumps(slim_result, ensure_ascii=False)
+                    changed = True
+                if changed:
+                    stripped += 1
+                continue
+
+            orphan_media = collect_request_media_ids(row) - protected_media
+            _purge_row_files(row, orphan_media, delete_inputs=True)
+
+            slim = strip_result_to_metadata(
+                result if isinstance(result, dict) else {},
+                profile_id=prof,
+            )
+            if not slim.get("media_ids") and isinstance(result, dict):
+                mids = [
+                    str(m).strip()
+                    for m in (result.get("media_ids") or [])
+                    if str(m).strip()
+                ]
+                if mids:
+                    slim["media_ids"] = mids
+            row.result_json = json.dumps(slim, ensure_ascii=False)
+            row.logs_json = "[]"
+            row.params_json = json.dumps(
+                slim_params_for_retention(params), ensure_ascii=False
+            )
+            stripped += 1
+
+        keep_ids = {row.id for row in all_rows[:meta_limit]}
+        remaining_media = set(protected_media)
+        for row in all_rows[:meta_limit]:
             remaining_media |= collect_request_media_ids(row)
 
-        old_rows = (
-            db.query(RequestRecord)
-            .order_by(RequestRecord.created_at.desc())
-            .offset(limit)
-            .all()
-        )
-        for row in old_rows:
+        for row in drop_rows:
             if row.id in keep_ids:
                 continue
             if row.status in _ACTIVE_STATUSES:
                 continue
 
             purge_media = collect_request_media_ids(row) - remaining_media
-            for mid in purge_media:
-                _delete_local_video(mid)
-            _delete_input_previews(row.id)
-            delete_output_dir(row.id)
-
+            _purge_row_files(row, purge_media, delete_inputs=True)
             db.delete(row)
             deleted += 1
 
-        if deleted:
+        if stripped or deleted:
             db.commit()
-            logger.info("purged %s task(s) beyond retention limit %s", deleted, limit)
-        return deleted
+            if stripped:
+                logger.info(
+                    "stripped media from %s task(s) (tier 2, meta limit %s)",
+                    stripped,
+                    meta_limit,
+                )
+            if deleted:
+                logger.info(
+                    "purged %s task row(s) beyond meta limit %s",
+                    deleted,
+                    meta_limit,
+                )
+        return stripped, deleted, protected_request_ids
     except Exception:
         db.rollback()
         raise
@@ -152,12 +281,21 @@ def purge_old_requests(keep: int | None = None) -> int:
         db.close()
 
 
-def purge_storage(keep: int | None = None) -> tuple[int, int]:
-    """Purge old DB rows and expired on-disk outputs."""
-    deleted = purge_old_requests(keep)
+def purge_old_requests(keep: int | None = None) -> int:
+    """Back-compat: full delete beyond `keep` rows."""
+    _, deleted, _ = purge_tiered_requests(media_keep=keep, meta_keep=keep)
+    return deleted
+
+
+def purge_storage(
+    media_keep: int | None = None,
+    meta_keep: int | None = None,
+) -> tuple[int, int, int]:
+    """Purge tier-2 media, tier-3 rows, then expired outputs (skipping protected ids)."""
+    stripped, deleted, protected = purge_tiered_requests(media_keep, meta_keep)
     expired = 0
     try:
-        expired = purge_expired_outputs()
+        expired = purge_expired_outputs(protected_request_ids=protected)
     except Exception as exc:
         logger.warning("purge_expired_outputs failed: %s", exc)
-    return deleted, expired
+    return stripped, deleted, expired

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from flow2api.config import (
     ACTIVITY_LIST_LIMIT,
+    ACTIVITY_META_LIMIT,
     FRONTEND_DIR,
     HTTP_HOST,
     HTTP_PORT,
@@ -44,7 +45,13 @@ async def _retention_loop() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            deleted, expired = await asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT)
+            stripped, deleted, expired = await asyncio.to_thread(
+                purge_storage, ACTIVITY_LIST_LIMIT, ACTIVITY_META_LIMIT
+            )
+            if stripped:
+                logger.info(
+                    "background retention stripped media from %s task(s)", stripped
+                )
             if deleted:
                 logger.info("background retention purge removed %s task(s)", deleted)
             if expired:
@@ -80,7 +87,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("task counter bootstrap failed: %s", exc)
     try:
-        purged, expired = await asyncio.to_thread(purge_storage, ACTIVITY_LIST_LIMIT)
+        stripped, purged, expired = await asyncio.to_thread(
+            purge_storage, ACTIVITY_LIST_LIMIT, ACTIVITY_META_LIMIT
+        )
+        if stripped:
+            logger.info("startup retention stripped media from %s task(s)", stripped)
         if purged:
             logger.info("startup retention purge removed %s old task(s)", purged)
         if expired:

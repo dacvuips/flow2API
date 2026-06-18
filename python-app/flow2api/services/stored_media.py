@@ -434,8 +434,12 @@ def delete_output_dir(request_id: str) -> None:
         logger.warning("failed to delete output dir %s: %s", request_id[:12], exc)
 
 
-def purge_expired_outputs() -> int:
-    """Remove output folders older than MEDIA_STORE_TTL_S."""
+def purge_expired_outputs(
+    *,
+    protected_request_ids: set[str] | None = None,
+) -> int:
+    """Remove output folders older than MEDIA_STORE_TTL_S (skip protected request ids)."""
+    protected = protected_request_ids or set()
     ttl = max(60, int(MEDIA_STORE_TTL_S or 6 * 3600))
     cutoff = time.time() - ttl
     deleted = 0
@@ -444,6 +448,8 @@ def purge_expired_outputs() -> int:
 
     for entry in OUTPUTS_DIR.iterdir():
         if not entry.is_dir():
+            continue
+        if entry.name in protected:
             continue
         try:
             mtimes = [f.stat().st_mtime for f in entry.rglob("*") if f.is_file()]

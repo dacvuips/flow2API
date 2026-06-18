@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from flow2api.config import HTTP_HANDLER_TIMEOUT_S, PUBLIC_BASE_URL
 from flow2api.services import activity
-from flow2api.services.flow_client import get_flow_client
+from flow2api.services.flow_client import get_flow_client_for_profile
 from flow2api.services.flow_sdk import FlowApiError, ensure_project, upsample_image
 
 logger = logging.getLogger(__name__)
@@ -55,10 +55,12 @@ def resolve_upsample_inputs(
     request_id: Optional[str] = None,
     index: int = 0,
     project_id: Optional[str] = None,
-) -> tuple[str, str]:
-    """Resolve media_id + project_id from explicit ids or a completed gen_image task."""
+    profile_id: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """Resolve media_id + project_id + profile_id from explicit ids or a gen_image task."""
     mid = str(media_id or "").strip()
     pid = str(project_id or "").strip()
+    prof = str(profile_id or "").strip()
 
     rid = str(request_id or "").strip()
     if rid:
@@ -70,8 +72,11 @@ def resolve_upsample_inputs(
         if row.type != "gen_image":
             raise HTTPException(400, "request_not_image")
         result = json.loads(row.result_json or "{}")
+        params = json.loads(row.params_json or "{}")
         if not pid:
             pid = str(result.get("project_id") or "").strip()
+        if not prof:
+            prof = str(result.get("profile_id") or params.get("profile_id") or "").strip()
         if not mid:
             media_ids = [str(m).strip() for m in (result.get("media_ids") or []) if str(m).strip()]
             if not media_ids:
@@ -89,7 +94,7 @@ def resolve_upsample_inputs(
 
     if not mid:
         raise HTTPException(400, "missing_media_id")
-    return mid, pid
+    return mid, pid, prof
 
 
 async def run_upsample_image(
@@ -98,17 +103,24 @@ async def run_upsample_image(
     request_id: Optional[str] = None,
     index: int = 0,
     project_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
     target_resolution: str = UPSAMPLE_RESOLUTION_4K,
 ) -> dict[str, Any]:
     resolution = normalize_target_resolution(target_resolution)
-    mid, pid = resolve_upsample_inputs(
+    mid, pid, prof = resolve_upsample_inputs(
         media_id=media_id,
         request_id=request_id,
         index=index,
         project_id=project_id,
+        profile_id=profile_id,
     )
 
-    client = get_flow_client()
+    try:
+        client = get_flow_client_for_profile(prof or None)
+    except RuntimeError as exc:
+        if str(exc) == "profile_not_ready":
+            raise HTTPException(503, "profile_not_ready") from exc
+        raise
     if not client.connected:
         raise HTTPException(503, "extension_not_connected")
     if not client.flow_key:
@@ -149,6 +161,7 @@ async def run_upsample_image(
         raw,
         source_media_id=mid,
         project_id=pid,
+        profile_id=prof or client.profile_id,
         target_resolution=resolution,
     )
 
@@ -158,6 +171,7 @@ def format_upsample_response(
     *,
     source_media_id: str,
     project_id: str,
+    profile_id: str = "",
     target_resolution: str = UPSAMPLE_RESOLUTION_4K,
 ) -> dict[str, Any]:
     """Normalize upsample result for external JSON API."""
@@ -167,6 +181,8 @@ def format_upsample_response(
         "project_id": project_id,
         "target_resolution": resolution,
     }
+    if profile_id:
+        out["profile_id"] = profile_id
 
     url = str(raw.get("url") or "").strip()
     upsampled_id = str(raw.get("media_id") or "").strip()

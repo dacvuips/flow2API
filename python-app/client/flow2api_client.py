@@ -95,6 +95,7 @@ class Flow2APIClient:
         request_id: Optional[str] = None,
         index: int = 0,
         project_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
         resolution: str = "4k",
         download: bool = False,
     ) -> dict | bytes:
@@ -109,6 +110,8 @@ class Flow2APIClient:
             body["request_id"] = request_id
         if project_id:
             body["project_id"] = project_id
+        if profile_id:
+            body["profile_id"] = profile_id
         params = {"download": "true"} if download else {}
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(
@@ -129,6 +132,7 @@ class Flow2APIClient:
         request_id: Optional[str] = None,
         index: int = 0,
         project_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
         download: bool = False,
     ) -> dict | bytes:
         return self.upsample_image(
@@ -136,6 +140,7 @@ class Flow2APIClient:
             request_id=request_id,
             index=index,
             project_id=project_id,
+            profile_id=profile_id,
             resolution="4k",
             download=download,
         )
@@ -147,6 +152,7 @@ class Flow2APIClient:
         request_id: Optional[str] = None,
         index: int = 0,
         project_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
         download: bool = False,
     ) -> dict | bytes:
         return self.upsample_image(
@@ -154,6 +160,7 @@ class Flow2APIClient:
             request_id=request_id,
             index=index,
             project_id=project_id,
+            profile_id=profile_id,
             resolution="2k",
             download=download,
         )

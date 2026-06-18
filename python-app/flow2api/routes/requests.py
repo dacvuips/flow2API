@@ -47,6 +47,7 @@ class UpsampleImageRequest(BaseModel):
     request_id: Optional[str] = None
     index: int = 0
     project_id: Optional[str] = None
+    profile_id: Optional[str] = None
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
 
 
@@ -128,6 +129,7 @@ async def upsample_image_external(
         request_id=body.request_id,
         index=body.index,
         project_id=body.project_id,
+        profile_id=body.profile_id,
         target_resolution=body.target_resolution,
     )
     append_request_log(

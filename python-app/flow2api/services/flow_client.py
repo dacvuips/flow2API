@@ -20,6 +20,22 @@ def get_flow_client() -> ExtensionSession:
     bound = pool.get_bound()
     if bound and bound.connected:
         return bound
+    return _first_ready_or_offline(pool)
+
+
+def get_flow_client_for_profile(profile_id: Optional[str] = None) -> ExtensionSession:
+    """Session cho HTTP upscale — ưu tiên profile_id đã tạo ảnh (multi-account)."""
+    pool = get_extension_pool()
+    pid = str(profile_id or "").strip()
+    if pid:
+        session = pool.get(pid)
+        if session and session.is_ready():
+            return session
+        raise RuntimeError("profile_not_ready")
+    return _first_ready_or_offline(pool)
+
+
+def _first_ready_or_offline(pool: Any) -> ExtensionSession:
     ready = pool.first_ready()
     if ready:
         return ready
