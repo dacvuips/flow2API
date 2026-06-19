@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 import shutil
@@ -40,6 +41,52 @@ def public_image_url(request_id: str, index: int = 0) -> str:
     if index <= 0:
         return f"{PUBLIC_BASE_URL}/image/{request_id}"
     return f"{PUBLIC_BASE_URL}/image/{request_id}/{index}"
+
+
+def public_media_url(media_id: str) -> str:
+    return f"{PUBLIC_BASE_URL}/media/{media_id}"
+
+
+_STALE_PUBLIC_HOSTS = (
+    "https://viettheo.site",
+    "http://viettheo.site",
+)
+
+
+def rewrite_public_base_url(url: str) -> str:
+    """Fix legacy PUBLIC_BASE_URL host stored in older task results."""
+    u = str(url or "").strip()
+    if not u or not PUBLIC_BASE_URL:
+        return u
+    for stale in _STALE_PUBLIC_HOSTS:
+        if u == stale or u.startswith(stale + "/"):
+            return PUBLIC_BASE_URL + u[len(stale) :]
+    return u
+
+
+def rewrite_result_public_urls(result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    for key in ("video_urls", "image_urls"):
+        urls = out.get(key)
+        if isinstance(urls, list):
+            out[key] = [rewrite_public_base_url(str(u)) for u in urls if str(u or "").strip()]
+    if isinstance(out.get("Link"), str):
+        out["Link"] = rewrite_public_base_url(out["Link"])
+    entries = out.get("media_entries")
+    if isinstance(entries, list):
+        fixed: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                fixed.append(entry)
+                continue
+            item = dict(entry)
+            if item.get("url"):
+                item["url"] = rewrite_public_base_url(str(item["url"]))
+            fixed.append(item)
+        out["media_entries"] = fixed
+    return out
 
 
 def output_dir(request_id: str) -> Path:
@@ -427,6 +474,102 @@ def apply_video_public_urls(request_id: str, result: dict[str, Any]) -> dict[str
     return out
 
 
+def finalize_video_result_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Pick playable HTTPS URLs for video tasks (mirror image CDN behavior)."""
+    out = rewrite_result_public_urls(dict(result))
+    external = _external_https_urls(out.get("video_urls") or [])
+    link = str(out.get("Link") or "").strip()
+    if link.startswith(("http://", "https://")):
+        rewritten_link = rewrite_public_base_url(link)
+        if rewritten_link.startswith(("http://", "https://")) and (
+            not PUBLIC_BASE_URL or not rewritten_link.startswith(PUBLIC_BASE_URL)
+        ):
+            external = external or [rewritten_link]
+
+    if resolve_stored_video_path(request_id, 0):
+        out = apply_video_public_urls(request_id, out)
+    elif external:
+        out["video_urls"] = external
+        out["Link"] = external[0]
+    else:
+        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+        if media_ids:
+            pub = public_media_url(media_ids[0])
+            out["video_urls"] = [pub]
+            out["Link"] = pub
+            out["media_entries"] = [
+                {"url": pub, "media_id": media_ids[0], "kind": "video"},
+            ]
+
+    return normalize_publisher_urls(rewrite_result_public_urls(out))
+
+
+def _load_request_video_result(request_id: str) -> dict[str, Any] | None:
+    from flow2api.services import activity
+
+    row = activity.get_request(request_id)
+    if not row or "video" not in str(row.type or "").lower():
+        return None
+    result = json.loads(row.result_json or "{}")
+    return result if isinstance(result, dict) else None
+
+
+async def materialize_request_video(
+    request_id: str,
+    index: int = 0,
+    result: dict[str, Any] | None = None,
+) -> Optional[Path]:
+    """Ensure OUTPUTS/{request_id}/*.mp4 exists — fetch via media_id if needed."""
+    existing = resolve_stored_video_path(request_id, index)
+    if existing:
+        return existing
+
+    payload = result if isinstance(result, dict) else _load_request_video_result(request_id)
+    if not payload:
+        return None
+
+    apply_video_public_urls(request_id, payload)
+    existing = resolve_stored_video_path(request_id, index)
+    if existing:
+        return existing
+
+    if await _persist_videos(request_id, payload):
+        existing = resolve_stored_video_path(request_id, index)
+        if existing:
+            return existing
+
+    media_ids = [str(m) for m in (payload.get("media_ids") or []) if str(m).strip()]
+    if not media_ids:
+        return None
+
+    targets: list[tuple[int, str]] = []
+    if index < len(media_ids):
+        targets = [(index, media_ids[index])]
+    elif index == 0:
+        targets = [(i, mid) for i, mid in enumerate(media_ids)]
+
+    out_dir = output_dir(request_id)
+    for idx, mid in targets:
+        data = await _video_bytes_from_source(f"/media/{mid}", mid)
+        if not data:
+            for url in payload.get("video_urls") or []:
+                u = str(url or "").strip()
+                if u.startswith(("http://", "https://")):
+                    data = await _video_bytes_from_source(u, mid)
+                    if data:
+                        break
+        if not data:
+            continue
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = "video.mp4" if len(media_ids) <= 1 else f"{idx}.mp4"
+        dest = out_dir / filename
+        dest.write_bytes(data)
+        if idx == index:
+            return dest
+
+    return resolve_stored_video_path(request_id, index)
+
+
 async def persist_task_result(
     request_id: str,
     result: dict[str, Any],
@@ -441,7 +584,6 @@ async def persist_task_result(
     publisher_image_urls = list(out.get("image_urls") or [])
     publisher_video_urls = list(out.get("video_urls") or [])
     publisher_link = out.get("Link")
-    external_video_urls = _external_https_urls(publisher_video_urls)
 
     try:
         if is_video:
@@ -454,10 +596,15 @@ async def persist_task_result(
         logger.warning("persist_task_result failed %s: %s", request_id[:12], exc)
 
     if is_video:
-        out = apply_video_public_urls(request_id, out)
-        if not resolve_stored_video_path(request_id, 0) and external_video_urls:
-            out["video_urls"] = external_video_urls
-            out["Link"] = publisher_link or external_video_urls[0]
+        if not resolve_stored_video_path(request_id, 0):
+            materialized = await materialize_request_video(request_id, 0, out)
+            if not materialized:
+                logger.warning(
+                    "video not materialized for %s (media_ids=%s)",
+                    request_id[:12],
+                    [str(m)[:8] for m in (out.get("media_ids") or [])[:3]],
+                )
+        out = finalize_video_result_urls(request_id, out)
     else:
         if publisher_video_urls:
             out["video_urls"] = publisher_video_urls

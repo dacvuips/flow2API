@@ -215,9 +215,12 @@ def _is_internal_result_url(url: str) -> bool:
 
 def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
     """API payload for external callers — publisher HTTPS URLs only."""
-    from flow2api.services.stored_media import normalize_publisher_urls
+    from flow2api.services.stored_media import (
+        normalize_publisher_urls,
+        rewrite_result_public_urls,
+    )
 
-    out = normalize_publisher_urls(dict(result))
+    out = normalize_publisher_urls(rewrite_result_public_urls(dict(result)))
     for key in ("local_files", "Local", "raw"):
         out.pop(key, None)
 
@@ -369,7 +372,12 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
         for mid in result.get("media_ids") or []:
             mid_s = str(mid or "").strip()
             if mid_s:
-                add(f"/media/{mid_s}", default_kind, mid_s)
+                if is_video:
+                    from flow2api.services.stored_media import public_media_url
+
+                    add(public_media_url(mid_s), default_kind, mid_s)
+                else:
+                    add(f"/media/{mid_s}", default_kind, mid_s)
 
     return items[:1]
 

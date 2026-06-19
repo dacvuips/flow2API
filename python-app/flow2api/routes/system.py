@@ -12,6 +12,7 @@ import httpx
 from flow2api.config import HTTP_HANDLER_TIMEOUT_S, INPUTS_DIR, VIDEOS_DIR
 from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.stored_media import (
+    materialize_request_video,
     resolve_stored_image_path,
     resolve_stored_video_path,
 )
@@ -80,6 +81,16 @@ async def ext_callback(
 @router.get("/video/{request_id}/{index}")
 async def serve_stored_video(request_id: str, index: int = 0):
     path = resolve_stored_video_path(request_id, index)
+    if not path:
+        try:
+            path = await materialize_request_video(request_id, index)
+        except Exception as exc:
+            logger.warning(
+                "serve_stored_video materialize failed %s: %s",
+                str(request_id)[:12],
+                exc,
+            )
+            path = None
     if not path:
         raise HTTPException(404, "not_found")
     return FileResponse(path, media_type="video/mp4")

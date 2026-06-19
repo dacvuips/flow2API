@@ -50,7 +50,7 @@ HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))
 PURGE_INTERVAL_S = int(os.environ.get("FLOW2API_PURGE_INTERVAL_S", "300"))
 # Public links returned in API responses: https://{PUBLIC_BASE_URL}/video/{id}
 PUBLIC_BASE_URL = os.environ.get(
-    "FLOW2API_PUBLIC_BASE_URL", "https://viettheo.site"
+    "FLOW2API_PUBLIC_BASE_URL", "https://flow2.viettheo.site"
 ).rstrip("/")
 # How long generated outputs stay on disk (default 6 hours).
 MEDIA_STORE_TTL_S = int(os.environ.get("FLOW2API_MEDIA_STORE_TTL_S", str(6 * 3600)))

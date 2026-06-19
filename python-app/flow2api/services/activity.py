@@ -302,6 +302,15 @@ def record_to_public(
     include_preview: bool | None = None,
 ) -> dict:
     result = json.loads(row.result_json or "{}")
+    from flow2api.services.stored_media import (
+        finalize_video_result_urls,
+        rewrite_result_public_urls,
+    )
+
+    if "video" in str(row.type or "").lower():
+        result = finalize_video_result_urls(row.id, result)
+    else:
+        result = rewrite_result_public_urls(result)
     params = json.loads(row.params_json or "{}")
     profile_label = (
         params.get("profile_label")
