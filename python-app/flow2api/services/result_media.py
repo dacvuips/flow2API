@@ -201,15 +201,14 @@ def slim_result_for_list(result: Any) -> Any:
     return out
 
 
-def _is_local_served_url(url: str) -> bool:
-    from flow2api.config import PUBLIC_BASE_URL
-
+def _is_internal_result_url(url: str) -> bool:
+    """Paths that must not appear in external API payloads (not public download URLs)."""
     u = str(url or "").strip()
     if not u:
         return True
-    if u.startswith(("/outputs/", "/video/", "/image/", "/media/", "/inputs/")):
+    if u.startswith(("/outputs/", "/media/", "/inputs/")):
         return True
-    if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL):
+    if u.startswith(("/video/", "/image/")):
         return True
     return False
 
@@ -226,14 +225,14 @@ def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
         urls = out.get(key)
         if not isinstance(urls, list):
             continue
-        filtered = [str(u) for u in urls if not _is_local_served_url(str(u))]
+        filtered = [str(u) for u in urls if not _is_internal_result_url(str(u))]
         if filtered:
             out[key] = filtered
         else:
             out.pop(key, None)
 
     link = out.get("Link")
-    if _is_local_served_url(str(link or "")):
+    if _is_internal_result_url(str(link or "")):
         out.pop("Link", None)
 
     entries = out.get("media_entries")
@@ -243,7 +242,7 @@ def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(entry, dict):
                 continue
             url = entry.get("url")
-            if not url or _is_local_served_url(str(url)):
+            if not url or _is_internal_result_url(str(url)):
                 continue
             if not str(url).startswith(("http://", "https://")):
                 continue
@@ -280,9 +279,13 @@ def _local_video_exists(media_id: str) -> bool:
 
 def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
     """Skip bare /media/{uuid} placeholders that are not cached locally."""
+    from flow2api.config import PUBLIC_BASE_URL
+
     u = str(url or "").strip()
     if not u:
         return False
+    if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL):
+        return True
     if u.startswith(("http://", "https://", "/inputs/", "/outputs/", "/video/", "/image/")):
         return True
     mid = _extract_media_id(u)

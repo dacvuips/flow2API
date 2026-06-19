@@ -355,6 +355,78 @@ def normalize_publisher_urls(result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _external_https_urls(urls: Any) -> list[str]:
+    if not isinstance(urls, list):
+        return []
+    out: list[str] = []
+    for raw in urls:
+        u = str(raw or "").strip()
+        if u.startswith(("http://", "https://")) and not u.startswith(f"{PUBLIC_BASE_URL}/"):
+            out.append(u)
+    return out
+
+
+def apply_video_public_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Expose {PUBLIC_BASE_URL}/video/{request_id} when output MP4 exists on disk."""
+    if not _safe_request_id(request_id) or not isinstance(result, dict):
+        return result
+
+    out = dict(result)
+    out_dir = output_dir(request_id)
+    if not resolve_stored_video_path(request_id, 0):
+        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+        for idx, mid in enumerate(media_ids):
+            cached = VIDEOS_DIR / f"{mid}.mp4"
+            if not cached.is_file():
+                continue
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filename = "video.mp4" if len(media_ids) == 1 else f"{idx}.mp4"
+            dest = out_dir / filename
+            if not dest.is_file():
+                try:
+                    shutil.copy2(cached, dest)
+                except OSError as exc:
+                    logger.warning(
+                        "copy cached video failed %s: %s", request_id[:12], exc
+                    )
+                    continue
+
+    stored = sorted(
+        p
+        for p in (out_dir.glob("*.mp4") if out_dir.is_dir() else [])
+        if p.is_file()
+    )
+    if not stored:
+        single = resolve_stored_video_path(request_id, 0)
+        if single:
+            stored = [single]
+
+    if not stored:
+        return out
+
+    public_urls = [
+        public_video_url(request_id, 0 if len(stored) == 1 else idx)
+        for idx in range(len(stored))
+    ]
+    out["video_urls"] = public_urls
+    out["Link"] = public_urls[0]
+    out["local_files"] = [
+        local_output_path(request_id, path.name) for path in stored
+    ]
+
+    media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+    entries: list[dict[str, str]] = []
+    for idx, pub in enumerate(public_urls):
+        entry: dict[str, str] = {"url": pub, "kind": "video"}
+        if idx < len(media_ids):
+            entry["media_id"] = media_ids[idx]
+        entries.append(entry)
+    if entries:
+        out["media_entries"] = entries
+
+    return out
+
+
 async def persist_task_result(
     request_id: str,
     result: dict[str, Any],
@@ -369,6 +441,7 @@ async def persist_task_result(
     publisher_image_urls = list(out.get("image_urls") or [])
     publisher_video_urls = list(out.get("video_urls") or [])
     publisher_link = out.get("Link")
+    external_video_urls = _external_https_urls(publisher_video_urls)
 
     try:
         if is_video:
@@ -380,12 +453,18 @@ async def persist_task_result(
     except Exception as exc:
         logger.warning("persist_task_result failed %s: %s", request_id[:12], exc)
 
-    if publisher_video_urls:
-        out["video_urls"] = publisher_video_urls
-    if publisher_image_urls:
-        out["image_urls"] = publisher_image_urls
-    if publisher_link:
-        out["Link"] = publisher_link
+    if is_video:
+        out = apply_video_public_urls(request_id, out)
+        if not resolve_stored_video_path(request_id, 0) and external_video_urls:
+            out["video_urls"] = external_video_urls
+            out["Link"] = publisher_link or external_video_urls[0]
+    else:
+        if publisher_video_urls:
+            out["video_urls"] = publisher_video_urls
+        if publisher_image_urls:
+            out["image_urls"] = publisher_image_urls
+        if publisher_link:
+            out["Link"] = publisher_link
 
     return normalize_publisher_urls(out)
 
