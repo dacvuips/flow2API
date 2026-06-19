@@ -53,8 +53,8 @@ def _is_video_request_type(req_type: str) -> bool:
 
 def _invalid_argument_hint() -> str:
     return (
-        "upsample_invalid_argument — dùng request_id từ task video done, "
-        "hoặc truyền đủ media_id + project_id + profile_id (đúng Chrome profile đã tạo video)"
+        "missing_profile_id — upscale video phải dùng đúng Chrome profile đã tạo video "
+        "(hoặc gửi request_id từ task done)"
     )
 
 
@@ -164,10 +164,17 @@ async def run_upsample_video(
         raise HTTPException(503, "extension_not_connected")
     if not client.flow_key:
         raise HTTPException(503, "no_flow_token")
-    if not client.paygate_tier:
-        await client.fetch_paygate_tier()
 
     import asyncio
+
+    await client.fetch_paygate_tier()
+    if not client.paygate_tier:
+        await asyncio.sleep(0.8)
+        await client.fetch_paygate_tier()
+    try:
+        await client.refresh_flow_token()
+    except Exception:
+        pass
 
     try:
         raw = await asyncio.wait_for(
@@ -183,9 +190,6 @@ async def run_upsample_video(
     except asyncio.TimeoutError:
         raise HTTPException(504, "upsample_video_timeout") from None
     except FlowApiError as exc:
-        msg = str(exc).lower()
-        if "invalid argument" in msg or "invalid_argument" in msg:
-            raise HTTPException(400, _invalid_argument_hint()) from exc
         raise HTTPException(502, str(exc)) from exc
     except HTTPException:
         raise

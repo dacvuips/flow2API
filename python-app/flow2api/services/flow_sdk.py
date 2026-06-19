@@ -204,6 +204,24 @@ def _video_request_body(project_id: str, tier: str, request_item: dict) -> dict:
     }
 
 
+def _refresh_video_request_body_session(body: dict, client: FlowClient) -> dict:
+    """Fresh sessionId + batchId before retry — first submit often gets INVALID_ARGUMENT."""
+    if not isinstance(body, dict):
+        return body
+    out = json.loads(json.dumps(body))
+    ctx = out.get("clientContext") or {}
+    project_id = str(ctx.get("projectId") or "").strip()
+    if not project_id:
+        return out
+    tier = str(ctx.get("userPaygateTier") or _require_tier(client))
+    out["clientContext"] = _client_context(project_id, tier)
+    out["mediaGenerationContext"] = {
+        "batchId": str(uuid.uuid4()),
+        "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+    }
+    return out
+
+
 def _t2v_request_body(project_id: str, tier: str, request_item: dict) -> dict:
     """Classic text-to-video (lite / fast / quality — non lower-priority)."""
     return {
@@ -644,7 +662,6 @@ async def upsample_video(
     max_poll_rounds: int = 240,
 ) -> dict[str, Any]:
     """Upscale a generated video to 1080p via batchAsyncGenerateVideoUpsampleVideo."""
-    tier = _require_tier(client)
     media_id = normalize_source_video_media_id(media_id)
     if not media_id:
         raise ValueError("missing_media_id")
@@ -663,13 +680,46 @@ async def upsample_video(
     }
     if metadata:
         request_item["metadata"] = metadata
-    body = _video_request_body(project_id, tier, request_item)
-    submit_raw = await _video_submit_request(
-        client,
-        _api_url(VIDEO_UPSAMPLE_PATH),
-        body,
-        model_key=VIDEO_UPSAMPLE_MODEL_KEY,
-    )
+    last_exc: FlowApiError | None = None
+    submit_raw: dict | None = None
+    max_attempts = max(4, RECAPTCHA_RETRY_MAX)
+    for attempt in range(max_attempts):
+        await client.fetch_paygate_tier()
+        tier = _require_tier(client)
+        body = _video_request_body(project_id, tier, request_item)
+        try:
+            submit_raw = await _video_submit_request(
+                client,
+                _api_url(VIDEO_UPSAMPLE_PATH),
+                body,
+                model_key=VIDEO_UPSAMPLE_MODEL_KEY,
+            )
+            break
+        except FlowApiError as exc:
+            last_exc = exc
+            msg = str(exc)
+            retryable = (
+                is_recaptcha_error(msg)
+                or is_transient_flow_error(msg)
+                or is_invalid_argument_retry_failure(exc, msg)
+            )
+            if retryable and attempt < max_attempts - 1:
+                delay = _recaptcha_retry_delay(attempt)
+                logger.warning(
+                    "upsample video submit retry %s/%s: %s — wait %ss",
+                    attempt + 1,
+                    max_attempts,
+                    msg,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    if not submit_raw:
+        raise last_exc or FlowApiError(
+            "upsample_video_submit_failed",
+            step="video_upsample_submit",
+        )
     operations = extract_video_operations(submit_raw)
     media_ids = collect_video_poll_media_ids(submit_raw, operations)
     poll_project_id = resolve_poll_project_id(submit_raw, operations, project_id)
@@ -1196,6 +1246,22 @@ async def _video_submit_request(
                 delay,
             )
             await asyncio.sleep(delay)
+            body = _refresh_video_request_body_session(body, client)
+            continue
+        if (
+            is_invalid_argument_retry_failure(None, last_err, attempts)
+            or _payload_has_invalid_argument_retry(last_resp)
+        ) and attempt < max_attempts - 1:
+            delay = _recaptcha_retry_delay(attempt)
+            logger.warning(
+                "video submit INVALID_ARGUMENT retry %s/%s: %s — wait %ss",
+                attempt + 1,
+                max_attempts,
+                last_err,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            body = _refresh_video_request_body_session(body, client)
             continue
         break
     logger.warning(
