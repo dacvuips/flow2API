@@ -85,7 +85,7 @@ curl -X POST "http://127.0.0.1:1994/api/requests" ^
 curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/REQUEST_ID"
 ```
 
-Khi `status=done`, response có `result.media_ids` (dùng cho upscale 4K) và `result.project_id`.
+Khi `status=done`, response có `result.media_ids` (dùng cho upscale 4K / 1080p) và `result.project_id`.
 
 ### Tải ảnh 2K / 4K (upscale)
 
@@ -134,6 +134,53 @@ Response JSON mẫu:
 }
 ```
 
+### Tải video 1080p (upscale)
+
+Sau khi tạo video xong (`gen_text_video` / `gen_image_video`), gọi upscale 1080p. **Bắt buộc** có video đã generate thành công (`status=done`) và **đúng Chrome profile** đã tạo video (giống upscale ảnh 2K/4K).
+
+Cách đơn giản nhất — chỉ cần `request_id` (server tự lấy `media_id`, `project_id`, `profile_id`, `workflow_id`):
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"request_id\":\"REQUEST_ID\"}"
+```
+
+Hoặc truyền đủ 3 trường nếu gọi thủ công:
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"media_id\":\"MEDIA_UUID\",\"project_id\":\"PROJECT_UUID\",\"profile_id\":\"CHROME_PROFILE_ID\"}"
+```
+
+Tải thẳng file MP4: thêm query `?download=true`
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video?download=true" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"request_id\":\"REQUEST_ID\"}" ^
+  -o output_1080p.mp4
+```
+
+Response JSON mẫu:
+
+```json
+{
+  "source_media_id": "c93c41c6-df7f-453a-8cea-ef05342e432e",
+  "project_id": "0712be5e-9442-4951-8074-04f45ced1b49",
+  "target_resolution": "VIDEO_RESOLUTION_1080P",
+  "aspect_ratio": "16:9",
+  "media_id": "...",
+  "video_url": "https://..."
+}
+```
+
+Upstream Google Flow gọi `batchAsyncGenerateVideoUpsampleVideo` với `videoInput.mediaId` là video nguồn.
+
 ### Python client
 
 ```python
@@ -145,9 +192,15 @@ task = client.wait(job["id"])
 upscaled_2k = client.upsample_image_2k(request_id=job["id"])
 upscaled_4k = client.upsample_image_4k(request_id=job["id"])
 print(upscaled_2k, upscaled_4k)
+
+# Video 1080p
+video_job = client.create_text_video(prompt="...", aspect_ratio="16:9")
+video_task = client.wait(video_job["id"], max_attempts=240)
+upscaled_1080p = client.upsample_video(request_id=video_job["id"])
+print(upscaled_1080p)
 ```
 
-Hoặc chạy: `python client/example_gen_image.py` / `python client/example_upsample_4k.py` (đặt `FLOW2API_TOKEN`).
+Hoặc chạy: `python client/example_gen_image.py` / `python client/example_upsample_4k.py` / `python client/example_upsample_1080p.py` (đặt `FLOW2API_TOKEN`).
 
 ## Cloudflare Zero Trust
 

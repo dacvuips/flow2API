@@ -22,6 +22,7 @@ from flow2api.services.flow_client import get_flow_client
 from flow2api.services.flow_sdk import get_media_http_status, parse_get_media_image
 from flow2api.services.health_cache import get_health_payload
 from flow2api.services.image_upsample import run_upsample_image
+from flow2api.services.video_upsample import run_upsample_video
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,16 @@ class UpsampleImageBody(BaseModel):
     project_id: str | None = None
     profile_id: str | None = None
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
+
+
+class UpsampleVideoBody(BaseModel):
+    media_id: str | None = None
+    request_id: str | None = None
+    index: int = 0
+    project_id: str | None = None
+    profile_id: str | None = None
+    aspect_ratio: str | None = None
+    workflow_id: str | None = None
 
 
 def _bearer_token(authorization: str | None = Header(default=None)) -> str:
@@ -235,6 +246,22 @@ async def flow_upsample_image(
         project_id=body.project_id,
         profile_id=body.profile_id,
         target_resolution=body.target_resolution,
+    )
+
+
+@router.post("/api/flow/upsample-video")
+async def flow_upsample_video(
+    body: UpsampleVideoBody,
+    _: str = Depends(_bearer_token),
+):
+    return await run_upsample_video(
+        media_id=body.media_id,
+        request_id=body.request_id,
+        index=body.index,
+        project_id=body.project_id,
+        profile_id=body.profile_id,
+        aspect_ratio=body.aspect_ratio,
+        workflow_id=body.workflow_id,
     )
 
 

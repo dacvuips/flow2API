@@ -164,3 +164,42 @@ class Flow2APIClient:
             resolution="2k",
             download=download,
         )
+
+    def upsample_video(
+        self,
+        *,
+        media_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        index: int = 0,
+        project_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        download: bool = False,
+    ) -> dict | bytes:
+        """Upscale video đã generate lên 1080p."""
+        body: dict[str, Any] = {"index": index}
+        if media_id:
+            body["media_id"] = media_id
+        if request_id:
+            body["request_id"] = request_id
+        if project_id:
+            body["project_id"] = project_id
+        if profile_id:
+            body["profile_id"] = profile_id
+        if aspect_ratio:
+            body["aspect_ratio"] = aspect_ratio
+        if workflow_id:
+            body["workflow_id"] = workflow_id
+        params = {"download": "true"} if download else {}
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/requests/upsample-video",
+                headers=self._headers(),
+                params=params,
+                json=body,
+            )
+            r.raise_for_status()
+            if download:
+                return r.content
+            return r.json()

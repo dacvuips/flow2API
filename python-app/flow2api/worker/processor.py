@@ -935,6 +935,7 @@ class WorkerController:
             {"_primary_media_id": mid, "_workflow_mode": True} for mid in media_ids
         ]
         poll_project_id = flow_sdk.resolve_poll_project_id(submit_raw, operations, project_id)
+        source_workflow_id = flow_sdk.extract_workflow_id_from_submit(submit_raw)
 
         async def _finish(urls: list[str], media: list[str], **extra: Any) -> None:
             row_done = activity.get_request(rid)
@@ -948,6 +949,8 @@ class WorkerController:
                 "profile_id": done_params.get("profile_id"),
                 **extra,
             }
+            if source_workflow_id:
+                result["workflow_id"] = source_workflow_id
             if row_done:
                 result = await persist_task_result(rid, result, row_done.type)
             if row_done:

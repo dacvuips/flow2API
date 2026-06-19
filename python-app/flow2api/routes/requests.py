@@ -17,6 +17,10 @@ from flow2api.services.image_upsample import (
     run_upsample_image,
     upsample_resolution_label,
 )
+from flow2api.services.video_upsample import (
+    fetch_upsample_video_bytes,
+    run_upsample_video,
+)
 from flow2api.short_id import new_request_id
 from flow2api.worker.processor import get_worker
 
@@ -49,6 +53,16 @@ class UpsampleImageRequest(BaseModel):
     project_id: Optional[str] = None
     profile_id: Optional[str] = None
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K"
+
+
+class UpsampleVideoRequest(BaseModel):
+    media_id: Optional[str] = None
+    request_id: Optional[str] = None
+    index: int = 0
+    project_id: Optional[str] = None
+    profile_id: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    workflow_id: Optional[str] = None
 
 
 _RETRY_DROP_KEYS = frozenset(
@@ -153,6 +167,46 @@ async def upsample_image_external(
             media_type=mime,
             headers={
                 "Content-Disposition": f'attachment; filename="flow-{label}-{mid}.{ext}"'
+            },
+        )
+    return result
+
+
+@router.post("/upsample-video")
+async def upsample_video_external(
+    body: UpsampleVideoRequest,
+    download: bool = Query(False, description="Trả file video MP4 thay vì JSON"),
+    api_key_id: int = Depends(_auth_key_id),
+):
+    """Upscale video đã generate lên 1080p. Dùng media_id hoặc request_id (task video done)."""
+    result = await run_upsample_video(
+        media_id=body.media_id,
+        request_id=body.request_id,
+        index=body.index,
+        project_id=body.project_id,
+        profile_id=body.profile_id,
+        aspect_ratio=body.aspect_ratio,
+        workflow_id=body.workflow_id,
+    )
+    append_request_log(
+        body.request_id or result.get("source_media_id") or "-",
+        "http",
+        "POST /api/requests/upsample-video",
+        level="info",
+        data={
+            "source_media_id": result.get("source_media_id"),
+            "upsampled_media_id": result.get("media_id"),
+            "download": download,
+        },
+    )
+    if download:
+        raw, mime = await fetch_upsample_video_bytes(result)
+        mid = str(result.get("source_media_id") or "video")[:8]
+        return Response(
+            content=raw,
+            media_type=mime,
+            headers={
+                "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
             },
         )
     return result

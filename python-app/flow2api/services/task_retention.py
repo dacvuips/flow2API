@@ -110,6 +110,10 @@ def strip_result_to_metadata(
     if prof:
         out["profile_id"] = prof
 
+    workflow_id = str(result.get("workflow_id") or "").strip()
+    if workflow_id:
+        out["workflow_id"] = workflow_id
+
     return out
 
 

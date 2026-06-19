@@ -154,8 +154,11 @@ VIDEO_START_PATH = "/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_START_END_PATH = "/v1/video:batchAsyncGenerateVideoStartAndEndImage"
 VIDEO_REF_PATH = "/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_PATH = "/v1/video:batchCheckAsyncVideoGenerationStatus"
+VIDEO_UPSAMPLE_PATH = "/v1/video:batchAsyncGenerateVideoUpsampleVideo"
 UPLOAD_IMAGE_PATH = "/v1/flow/uploadImage"
 UPSAMPLE_IMAGE_PATH = "/v1/flow/upsampleImage"
+VIDEO_RESOLUTION_1080P = "VIDEO_RESOLUTION_1080P"
+VIDEO_UPSAMPLE_MODEL_KEY = "veo_3_1_upsampler_1080p"
 
 
 def _api_url(path: str) -> str:
@@ -580,6 +583,116 @@ async def upsample_image(
             continue
         break
     raise FlowApiError(last_err, step="upsample_image", raw=last_resp)
+
+
+def normalize_source_video_media_id(media_id: str) -> str:
+    """Upsample input must be the generated video UUID, not {id}_upsampled."""
+    mid = str(media_id or "").strip()
+    if mid.endswith("_upsampled"):
+        return mid[: -len("_upsampled")]
+    return mid
+
+
+def extract_workflow_id_from_submit(data: dict | None) -> str:
+    """Flow upsample ties to the original video workflow id (workflows[].name)."""
+    if not isinstance(data, dict):
+        return ""
+    for wf in data.get("workflows") or []:
+        if not isinstance(wf, dict):
+            continue
+        name = str(wf.get("name") or wf.get("workflowId") or "").strip()
+        if name:
+            return name
+    for entry in data.get("media") or []:
+        if not isinstance(entry, dict):
+            continue
+        wid = str(entry.get("workflowId") or "").strip()
+        if wid:
+            return wid
+    return ""
+
+
+def extract_workflow_id_from_result(result: dict | None) -> str:
+    if not isinstance(result, dict):
+        return ""
+    wid = str(result.get("workflow_id") or "").strip()
+    if wid:
+        return wid
+    for entry in result.get("api_attempts") or []:
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("data")
+        if isinstance(payload, dict):
+            found = extract_workflow_id_from_submit(payload)
+            if found:
+                return found
+        response = entry.get("response")
+        if isinstance(response, dict):
+            found = extract_workflow_id_from_submit(response)
+            if found:
+                return found
+    return ""
+
+
+async def upsample_video(
+    client: FlowClient,
+    *,
+    media_id: str,
+    project_id: str,
+    aspect_ratio: str = "16:9",
+    workflow_id: str = "",
+    max_poll_rounds: int = 240,
+) -> dict[str, Any]:
+    """Upscale a generated video to 1080p via batchAsyncGenerateVideoUpsampleVideo."""
+    tier = _require_tier(client)
+    media_id = normalize_source_video_media_id(media_id)
+    if not media_id:
+        raise ValueError("missing_media_id")
+
+    aspect = VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"])
+    workflow_id = str(workflow_id or "").strip()
+    metadata: dict[str, str] = {}
+    if workflow_id:
+        metadata["workflowId"] = workflow_id
+    request_item = {
+        "resolution": VIDEO_RESOLUTION_1080P,
+        "aspectRatio": aspect,
+        "videoModelKey": VIDEO_UPSAMPLE_MODEL_KEY,
+        "seed": random.randint(1, 99_999),
+        "videoInput": {"mediaId": media_id},
+    }
+    if metadata:
+        request_item["metadata"] = metadata
+    body = _video_request_body(project_id, tier, request_item)
+    submit_raw = await _video_submit_request(
+        client,
+        _api_url(VIDEO_UPSAMPLE_PATH),
+        body,
+        model_key=VIDEO_UPSAMPLE_MODEL_KEY,
+    )
+    operations = extract_video_operations(submit_raw)
+    media_ids = collect_video_poll_media_ids(submit_raw, operations)
+    poll_project_id = resolve_poll_project_id(submit_raw, operations, project_id)
+    if not media_ids:
+        raise FlowApiError(
+            "upsample_video_no_media_id",
+            step="video_upsample_submit",
+            raw=submit_raw,
+        )
+
+    urls, out_media_ids = await poll_workflow_videos(
+        client,
+        operations,
+        max_poll_rounds,
+        project_id=poll_project_id,
+    )
+    return {
+        "video_urls": urls,
+        "media_ids": out_media_ids,
+        "project_id": poll_project_id,
+        "source_media_id": media_id,
+        "resolution": VIDEO_RESOLUTION_1080P,
+    }
 
 
 def _video_model_key(mode: str, tier: str, aspect: str, quality: str) -> str:
@@ -1099,6 +1212,87 @@ async def _video_submit_request(
     )
 
 
+def _is_upsample_media_entry(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    name = str(entry.get("name") or entry.get("mediaId") or "")
+    if name.endswith("_upsampled"):
+        return True
+    video = entry.get("video") or {}
+    generated = (video.get("generatedVideo") or {}) if isinstance(video, dict) else {}
+    return bool((generated.get("upsampleMetadata") or {}).get("videoUpsampleResolution"))
+
+
+def _upsample_poll_media_names(data: dict) -> list[str]:
+    """Upsample submit returns media[].name like {sourceId}_upsampled — poll that, not primaryMediaId."""
+    names: list[str] = []
+    for entry in data.get("media") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or entry.get("mediaId") or "").strip()
+        if name and _is_upsample_media_entry(entry):
+            names.append(name)
+    if names:
+        return list(dict.fromkeys(names))
+    for entry in data.get("operations") or []:
+        if not isinstance(entry, dict):
+            continue
+        op = entry.get("operation") or entry
+        name = str(op.get("name") or "").strip()
+        if name.endswith("_upsampled"):
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _enrich_video_operations(data: dict, ops: list[dict]) -> list[dict]:
+    """Attach poll ids / project ids — upsample uses operation.name = {uuid}_upsampled."""
+    media_list = [m for m in (data.get("media") or []) if isinstance(m, dict)]
+    media_by_name = {
+        str(m.get("name") or m.get("mediaId")): m
+        for m in media_list
+        if m.get("name") or m.get("mediaId")
+    }
+    upsample_names = _upsample_poll_media_names(data)
+    default_project = str(data.get("projectId") or "").strip()
+    for wf in data.get("workflows") or []:
+        if isinstance(wf, dict) and wf.get("projectId"):
+            default_project = str(wf["projectId"])
+            break
+
+    enriched: list[dict] = []
+    for idx, op in enumerate(ops):
+        if not isinstance(op, dict):
+            continue
+        copy = dict(op)
+        op_inner = copy.get("operation") or copy
+        poll_id = str(copy.get("_primary_media_id") or "").strip()
+        if not poll_id:
+            video_meta = (op_inner.get("metadata") or {}).get("video") or {}
+            poll_id = str(
+                video_meta.get("mediaId") or video_meta.get("name") or op_inner.get("name") or ""
+            ).strip()
+        if upsample_names:
+            poll_id = upsample_names[idx] if idx < len(upsample_names) else upsample_names[0]
+        elif not poll_id and media_list:
+            entry = media_list[idx] if idx < len(media_list) else media_list[0]
+            poll_id = str(entry.get("name") or entry.get("mediaId") or "").strip()
+
+        media_entry = media_by_name.get(poll_id) or {}
+        project_id = (
+            copy.get("_project_id")
+            or media_entry.get("projectId")
+            or default_project
+        )
+        if poll_id:
+            copy["_primary_media_id"] = poll_id
+        if project_id:
+            copy["_project_id"] = str(project_id)
+        if upsample_names or media_list or (data.get("workflows") or []):
+            copy["_workflow_mode"] = True
+        enriched.append(copy)
+    return enriched
+
+
 def extract_video_operations(data: dict) -> list[dict]:
     """Parse submit response: classic operations[] or Low Priority workflows/media."""
     if not isinstance(data, dict):
@@ -1106,7 +1300,9 @@ def extract_video_operations(data: dict) -> list[dict]:
 
     ops = data.get("operations")
     if isinstance(ops, list) and ops:
-        return [o for o in ops if isinstance(o, dict)]
+        raw_ops = [o for o in ops if isinstance(o, dict)]
+        if raw_ops:
+            return _enrich_video_operations(data, raw_ops)
 
     synthesized: list[dict] = []
     media_list = [m for m in (data.get("media") or []) if isinstance(m, dict)]
@@ -1756,8 +1952,9 @@ def collect_video_media_ids(operations: list[dict]) -> list[str]:
         if mid:
             ids.append(str(mid))
             continue
-        video_meta = ((op.get("operation") or op).get("metadata") or {}).get("video") or {}
-        mid = video_meta.get("mediaId") or video_meta.get("name")
+        op_inner = op.get("operation") or op
+        video_meta = (op_inner.get("metadata") or {}).get("video") or {}
+        mid = video_meta.get("mediaId") or video_meta.get("name") or op_inner.get("name")
         if mid:
             ids.append(str(mid))
     return list(dict.fromkeys(ids))
@@ -1770,12 +1967,17 @@ def collect_video_poll_media_ids(
     """Media IDs for batchCheckAsync — prefer submit.media[].name (Flow UI shape)."""
     ids: list[str] = []
     if isinstance(submit_raw, dict):
+        upsample_ids = _upsample_poll_media_names(submit_raw)
+        if upsample_ids:
+            ids.extend(upsample_ids)
         project_id = submit_raw.get("projectId")
         for entry in submit_raw.get("media") or []:
             if not isinstance(entry, dict):
                 continue
             name = str(entry.get("name") or entry.get("mediaId") or "").strip()
             if not name:
+                continue
+            if name in ids:
                 continue
             if entry.get("projectId") or project_id:
                 ids.append(name)
