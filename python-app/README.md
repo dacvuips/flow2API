@@ -136,35 +136,30 @@ Response JSON mẫu:
 
 ### Tải video 1080p (upscale)
 
-Sau khi tạo video xong (`gen_text_video` / `gen_image_video`), gọi upscale 1080p. **Bắt buộc** có video đã generate thành công (`status=done`) và **đúng Chrome profile** đã tạo video (giống upscale ảnh 2K/4K).
+Sau khi tạo video xong (`gen_text_video` / `gen_image_video`), gọi upscale 1080p. **Bắt buộc** có video đã generate thành công (`status=done`) và **đúng Chrome profile** đã tạo video.
 
-Cách đơn giản nhất — chỉ cần `request_id` (server tự lấy `media_id`, `project_id`, `profile_id`, `workflow_id`):
-
-```bash
-curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video" ^
-  -H "Authorization: Bearer f2api_YOUR_KEY" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"request_id\":\"REQUEST_ID\"}"
-```
-
-Hoặc truyền đủ 3 trường nếu gọi thủ công:
+**Quan trọng qua Cloudflare Tunnel** (`flow2.viettheo.site`): upscale mất vài phút — **không** giữ 1 HTTP request mở (sẽ 502 Bad Gateway ~100s). Dùng **async**: POST trả `queued` ngay, poll status, rồi tải file.
 
 ```bash
-curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video" ^
+# Bước 1 — enqueue
+curl -X POST "https://flow2.viettheo.site/api/requests/upsample-video" ^
   -H "Authorization: Bearer f2api_YOUR_KEY" ^
   -H "Content-Type: application/json" ^
-  -d "{\"media_id\":\"MEDIA_UUID\",\"project_id\":\"PROJECT_UUID\",\"profile_id\":\"CHROME_PROFILE_ID\"}"
-```
+  -d "{\"request_id\":\"VIDEO_TASK_ID_DONE\"}"
 
-Tải thẳng file MP4: thêm query `?download=true`
+# → {"id":"UPSAMPLE_JOB_ID","status":"queued"}
 
-```bash
-curl -X POST "http://127.0.0.1:1994/api/requests/upsample-video?download=true" ^
-  -H "Authorization: Bearer f2api_YOUR_KEY" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"request_id\":\"REQUEST_ID\"}" ^
+# Bước 2 — poll đến done
+curl -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  "https://flow2.viettheo.site/api/requests/UPSAMPLE_JOB_ID"
+
+# Bước 3 — tải MP4
+curl -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  "https://flow2.viettheo.site/api/requests/UPSAMPLE_JOB_ID?download=true" ^
   -o output_1080p.mp4
 ```
+
+Chỉ dùng `?sync=true` khi gọi **local** (`127.0.0.1`) và chấp nhận chờ trong 1 request.
 
 Response JSON mẫu:
 

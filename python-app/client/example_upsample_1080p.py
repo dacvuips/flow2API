@@ -21,16 +21,11 @@ def main() -> None:
     task = client.wait(job["id"], max_attempts=240)
     print("done:", task.get("id"), task.get("result", {}).get("media_ids"))
 
-    upscaled = client.upsample_video(request_id=job["id"])
-    print("1080p json:", upscaled)
-
-    media_ids = (task.get("result") or {}).get("media_ids") or []
-    if media_ids:
-        video_bytes = client.upsample_video(media_id=media_ids[0], download=True)
-        out = "output_1080p.mp4"
-        with open(out, "wb") as f:
-            f.write(video_bytes)  # type: ignore[arg-type]
-        print("saved", out)
+    video_bytes = client.upsample_video(request_id=job["id"], download=True)
+    out = "output_1080p.mp4"
+    with open(out, "wb") as f:
+        f.write(video_bytes)  # type: ignore[arg-type]
+    print("saved", out)
 
 
 if __name__ == "__main__":

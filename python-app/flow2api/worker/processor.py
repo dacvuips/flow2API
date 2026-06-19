@@ -766,9 +766,43 @@ class WorkerController:
             await client.fetch_paygate_tier()
 
         profile_id = str(params.get("profile_id") or "")
+        req_type = row.type
+
+        if req_type == "upsample_video":
+            from flow2api.services.video_upsample import execute_upsample_video_on_client
+
+            project_id = str(params.get("project_id") or "").strip()
+            if not project_id:
+                raise RuntimeError("missing_project_id")
+            append_request_log(
+                rid,
+                "worker",
+                f"Upsample 1080p project {project_id[:12]}…",
+                level="info",
+            )
+            formatted = await execute_upsample_video_on_client(client, params)
+            video_urls = list(formatted.get("video_urls") or [])
+            if not video_urls and formatted.get("video_url"):
+                video_urls = [str(formatted["video_url"])]
+            media_ids = [str(formatted["media_id"])] if formatted.get("media_id") else []
+            result = {
+                "video_urls": video_urls,
+                "media_ids": media_ids,
+                "project_id": project_id,
+                "profile_id": profile_id,
+                "source_media_id": formatted.get("source_media_id"),
+                "target_resolution": formatted.get("target_resolution"),
+                "aspect_ratio": formatted.get("aspect_ratio"),
+                "workflow_id": formatted.get("workflow_id"),
+                "upsampled_media_id": formatted.get("upsampled_media_id"),
+            }
+            result = await persist_task_result(rid, result, req_type)
+            activity.update_request(rid, status="done", result=result, error=None)
+            events.publish("request_finished", {"id": rid, "status": "done"})
+            return
+
         project_id = await self._ensure_project(profile_id)
         append_request_log(rid, "worker", f"Project ready: {project_id[:12]}…", level="info")
-        req_type = row.type
 
         if req_type == "gen_image":
             raw = await flow_sdk.gen_image(

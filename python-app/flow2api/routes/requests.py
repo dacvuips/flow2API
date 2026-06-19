@@ -18,6 +18,8 @@ from flow2api.services.image_upsample import (
     upsample_resolution_label,
 )
 from flow2api.services.video_upsample import (
+    build_upsample_video_job_params,
+    execute_upsample_video_on_client,
     fetch_upsample_video_bytes,
     run_upsample_video,
 )
@@ -175,11 +177,15 @@ async def upsample_image_external(
 @router.post("/upsample-video")
 async def upsample_video_external(
     body: UpsampleVideoRequest,
-    download: bool = Query(False, description="Trả file video MP4 thay vì JSON"),
+    download: bool = Query(False, description="Tải file MP4 khi job done (dùng với async=false)"),
+    sync: bool = Query(
+        False,
+        description="Chờ xong trong 1 request (chỉ local; qua Cloudflare dùng async mặc định)",
+    ),
     api_key_id: int = Depends(_auth_key_id),
 ):
-    """Upscale video đã generate lên 1080p. Dùng media_id hoặc request_id (task video done)."""
-    result = await run_upsample_video(
+    """Upscale video đã generate lên 1080p. Mặc định enqueue worker (tránh Cloudflare 502)."""
+    params = build_upsample_video_job_params(
         media_id=body.media_id,
         request_id=body.request_id,
         index=body.index,
@@ -188,28 +194,60 @@ async def upsample_video_external(
         aspect_ratio=body.aspect_ratio,
         workflow_id=body.workflow_id,
     )
+    if sync:
+        result = await run_upsample_video(
+            media_id=body.media_id,
+            request_id=body.request_id,
+            index=body.index,
+            project_id=body.project_id,
+            profile_id=body.profile_id,
+            aspect_ratio=body.aspect_ratio,
+            workflow_id=body.workflow_id,
+        )
+        append_request_log(
+            body.request_id or result.get("source_media_id") or "-",
+            "http",
+            "POST /api/requests/upsample-video (sync)",
+            level="info",
+            data={"upsampled_media_id": result.get("media_id"), "download": download},
+        )
+        if download:
+            raw, mime = await fetch_upsample_video_bytes(result)
+            mid = str(result.get("source_media_id") or "video")[:8]
+            return Response(
+                content=raw,
+                media_type=mime,
+                headers={
+                    "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
+                },
+            )
+        return result
+
+    rid = new_request_id()
+    activity.create_request(
+        rid,
+        "upsample_video",
+        "upsample 1080p",
+        "1080p",
+        params,
+        api_key_id=api_key_id,
+    )
     append_request_log(
-        body.request_id or result.get("source_media_id") or "-",
+        rid,
         "http",
         "POST /api/requests/upsample-video",
         level="info",
-        data={
-            "source_media_id": result.get("source_media_id"),
-            "upsampled_media_id": result.get("media_id"),
-            "download": download,
-        },
+        data={"source_request_id": params.get("source_request_id"), "async": True},
     )
     if download:
-        raw, mime = await fetch_upsample_video_bytes(result)
-        mid = str(result.get("source_media_id") or "video")[:8]
-        return Response(
-            content=raw,
-            media_type=mime,
-            headers={
-                "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
-            },
-        )
-    return result
+        return {
+            "id": rid,
+            "status": "queued",
+            "poll": f"/api/requests/{rid}",
+            "download_when_done": f"/api/requests/{rid}?download=true",
+            "hint": "Poll đến status=done rồi GET download_when_done (upscale mất vài phút)",
+        }
+    return {"id": rid, "status": "queued"}
 
 
 @router.post("/cancel-all")
@@ -264,10 +302,29 @@ async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)
 
 
 @router.get("/{request_id}")
-async def get_request_status(request_id: str, _=Depends(_auth_key_id)):
+async def get_request_status(
+    request_id: str,
+    download: bool = Query(False, description="Tải MP4 khi upsample_video status=done"),
+    _=Depends(_auth_key_id),
+):
     row = activity.get_request(request_id)
     if not row:
         raise HTTPException(404, "not_found")
+    if download:
+        if row.type != "upsample_video":
+            raise HTTPException(400, "download_only_for_upsample_video")
+        if row.status != "done":
+            raise HTTPException(409, f"not_ready (status={row.status})")
+        result = json.loads(row.result_json or "{}")
+        raw, mime = await fetch_upsample_video_bytes(result)
+        mid = str(result.get("source_media_id") or request_id)[:8]
+        return Response(
+            content=raw,
+            media_type=mime,
+            headers={
+                "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
+            },
+        )
     data = activity.record_to_public(row)
     return await with_base64_media(data, embed=False)
 

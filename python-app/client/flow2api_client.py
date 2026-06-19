@@ -176,8 +176,10 @@ class Flow2APIClient:
         aspect_ratio: Optional[str] = None,
         workflow_id: Optional[str] = None,
         download: bool = False,
+        poll_interval: float = 2.5,
+        max_attempts: int = 240,
     ) -> dict | bytes:
-        """Upscale video đã generate lên 1080p."""
+        """Upscale video đã generate lên 1080p (async queue + poll)."""
         body: dict[str, Any] = {"index": index}
         if media_id:
             body["media_id"] = media_id
@@ -191,15 +193,25 @@ class Flow2APIClient:
             body["aspect_ratio"] = aspect_ratio
         if workflow_id:
             body["workflow_id"] = workflow_id
-        params = {"download": "true"} if download else {}
-        with httpx.Client(timeout=self.timeout) as client:
+        with httpx.Client(timeout=60.0) as client:
             r = client.post(
                 f"{self.base_url}/api/requests/upsample-video",
                 headers=self._headers(),
-                params=params,
                 json=body,
             )
             r.raise_for_status()
-            if download:
-                return r.content
-            return r.json()
+            job = r.json()
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            raise RuntimeError("missing_upsample_job_id")
+        task = self.wait(job_id, poll_interval=poll_interval, max_attempts=max_attempts)
+        if download:
+            with httpx.Client(timeout=self.timeout) as client:
+                dr = client.get(
+                    f"{self.base_url}/api/requests/{job_id}",
+                    headers=self._headers(),
+                    params={"download": "true"},
+                )
+                dr.raise_for_status()
+                return dr.content
+        return task

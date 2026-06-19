@@ -130,6 +130,81 @@ def resolve_upsample_video_inputs(
     return mid, pid, prof, aspect, wid
 
 
+def build_upsample_video_job_params(
+    *,
+    media_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    index: int = 0,
+    project_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+    workflow_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolved worker params — validates source video task / ids."""
+    mid, pid, prof, aspect, wid = resolve_upsample_video_inputs(
+        media_id=media_id,
+        request_id=request_id,
+        index=index,
+        project_id=project_id,
+        profile_id=profile_id,
+        aspect_ratio=aspect_ratio,
+        workflow_id=workflow_id,
+    )
+    out: dict[str, Any] = {
+        "media_id": mid,
+        "project_id": pid,
+        "profile_id": prof,
+        "aspect_ratio": aspect,
+    }
+    if wid:
+        out["workflow_id"] = wid
+    if request_id:
+        out["source_request_id"] = str(request_id).strip()
+    return out
+
+
+async def execute_upsample_video_on_client(
+    client,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Run upsample + poll on a bound Flow client (worker or sync HTTP)."""
+    import asyncio
+
+    mid = str(params.get("media_id") or "").strip()
+    pid = str(params.get("project_id") or "").strip()
+    aspect = str(params.get("aspect_ratio") or "16:9")
+    wid = str(params.get("workflow_id") or "").strip()
+    prof = str(params.get("profile_id") or "").strip()
+
+    await client.fetch_paygate_tier()
+    if not client.paygate_tier:
+        await asyncio.sleep(0.8)
+        await client.fetch_paygate_tier()
+    try:
+        await client.refresh_flow_token()
+    except Exception:
+        pass
+
+    raw = await asyncio.wait_for(
+        upsample_video(
+            client,
+            media_id=mid,
+            project_id=pid,
+            aspect_ratio=aspect,
+            workflow_id=wid,
+        ),
+        timeout=900,
+    )
+    return format_upsample_video_response(
+        raw,
+        source_media_id=mid,
+        project_id=pid,
+        profile_id=prof or getattr(client, "profile_id", ""),
+        aspect_ratio=aspect,
+        workflow_id=wid,
+    )
+
+
 async def run_upsample_video(
     *,
     media_id: Optional[str] = None,
@@ -167,25 +242,16 @@ async def run_upsample_video(
 
     import asyncio
 
-    await client.fetch_paygate_tier()
-    if not client.paygate_tier:
-        await asyncio.sleep(0.8)
-        await client.fetch_paygate_tier()
     try:
-        await client.refresh_flow_token()
-    except Exception:
-        pass
-
-    try:
-        raw = await asyncio.wait_for(
-            upsample_video(
-                client,
-                media_id=mid,
-                project_id=pid,
-                aspect_ratio=aspect,
-                workflow_id=wid,
-            ),
-            timeout=900,
+        return await execute_upsample_video_on_client(
+            client,
+            {
+                "media_id": mid,
+                "project_id": pid,
+                "profile_id": prof,
+                "aspect_ratio": aspect,
+                "workflow_id": wid,
+            },
         )
     except asyncio.TimeoutError:
         raise HTTPException(504, "upsample_video_timeout") from None
@@ -196,15 +262,6 @@ async def run_upsample_video(
     except Exception as exc:
         logger.warning("upsample_video failed %s profile=%s: %s", mid[:12], prof[:8], exc)
         raise HTTPException(502, "upsample_video_failed") from exc
-
-    return format_upsample_video_response(
-        raw,
-        source_media_id=mid,
-        project_id=pid,
-        profile_id=prof or client.profile_id,
-        aspect_ratio=aspect,
-        workflow_id=wid,
-    )
 
 
 def format_upsample_video_response(
