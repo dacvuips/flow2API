@@ -189,9 +189,12 @@ def _client_context(project_id: str, tier: str, session_ms: Optional[int] = None
 
 
 def _video_request_body(project_id: str, tier: str, request_item: dict) -> dict:
-    """Image-to-video / reference-video (Flow web client shape)."""
+    """Flow web v2 video submit (i2v / r2v / t2v lower priority)."""
     return {
-        "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
+        "mediaGenerationContext": {
+            "batchId": str(uuid.uuid4()),
+            "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+        },
         "clientContext": _client_context(project_id, tier),
         "requests": [request_item],
         "useV2ModelConfig": True,
@@ -199,11 +202,19 @@ def _video_request_body(project_id: str, tier: str, request_item: dict) -> dict:
 
 
 def _t2v_request_body(project_id: str, tier: str, request_item: dict) -> dict:
-    """Text-to-video — no useV2ModelConfig / mediaGenerationContext (labs.google shape)."""
+    """Classic text-to-video (lite / fast / quality — non lower-priority)."""
     return {
         "clientContext": _client_context(project_id, tier),
         "requests": [request_item],
     }
+
+
+def _is_low_priority_model_key(model_key: str) -> bool:
+    return "_low_priority" in str(model_key or "")
+
+
+def _structured_video_prompt(prompt: str) -> dict:
+    return {"structuredPrompt": {"parts": [{"text": prompt}]}}
 
 
 async def ensure_project(client: FlowClient, title: str = "Flow2API") -> str:
@@ -591,13 +602,25 @@ async def gen_text_video(
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("t2v", tier, aspect_ratio, video_quality)
-    request_item = {
-        "aspectRatio": VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"]),
-        "seed": int(time.time() * 1000) % 1_000_000,
-        "textInput": {"prompt": prompt},
-        "videoModelKey": model_key,
-    }
-    body = _t2v_request_body(project_id, tier, request_item)
+    aspect = VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"])
+    seed = int(time.time() * 1000) % 1_000_000
+    if _is_low_priority_model_key(model_key):
+        request_item = {
+            "aspectRatio": aspect,
+            "seed": seed,
+            "textInput": _structured_video_prompt(prompt),
+            "videoModelKey": model_key,
+            "metadata": {},
+        }
+        body = _video_request_body(project_id, tier, request_item)
+    else:
+        request_item = {
+            "aspectRatio": aspect,
+            "seed": seed,
+            "textInput": {"prompt": prompt},
+            "videoModelKey": model_key,
+        }
+        body = _t2v_request_body(project_id, tier, request_item)
     return await _video_submit_request(
         client, _api_url(VIDEO_T2V_PATH), body, model_key=model_key
     )
@@ -752,6 +775,34 @@ def get_media_http_status(resp: dict) -> int:
 def is_get_media_404_message(msg: str) -> bool:
     text = str(msg or "").lower()
     return "requested entity was not found" in text or "http_404" in text
+
+
+def _get_media_error_status(resp: dict) -> str:
+    data = resp.get("data")
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            return str(err.get("status") or "").upper()
+    if isinstance(resp.get("error"), dict):
+        return str(resp["error"].get("status") or "").upper()
+    return ""
+
+
+def is_get_media_not_ready_error(exc: Exception) -> bool:
+    """GET /v1/media before render completes — 404 or 400 INVALID_ARGUMENT."""
+    if isinstance(exc, GetMedia404Error):
+        return True
+    if not isinstance(exc, FlowApiError) or exc.step != "get_media":
+        return False
+    raw = exc.raw
+    if isinstance(raw, dict):
+        status = get_media_http_status(raw)
+        if status == 404:
+            return True
+        if status == 400 and _get_media_error_status(raw) == "INVALID_ARGUMENT":
+            return True
+    msg = str(exc).lower()
+    return "invalid argument" in msg or "http_404" in msg
 
 
 def is_get_media_404_failure(
@@ -1651,6 +1702,16 @@ async def poll_video_by_media(
                         _poll_entry_done(poll_status, False)
                         or mid in completed
                         or round_idx >= 5
+                    ):
+                        continue
+                    raise
+                except FlowApiError as exc:
+                    if (
+                        requeue_on_get_media_404
+                        and is_get_media_not_ready_error(exc)
+                        and not _poll_entry_done(poll_status, False)
+                        and mid not in completed
+                        and round_idx < 5
                     ):
                         continue
                     raise
