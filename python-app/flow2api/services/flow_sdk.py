@@ -2288,10 +2288,14 @@ async def _resolve_all_media_urls(
                 max_attempts=1,
                 retry_404=False,
             )
-        except FlowApiError:
+        except FlowApiError as exc:
+            if is_get_media_not_ready_error(exc):
+                ok = False
+                continue
             raise
         except GetMedia404Error:
-            raise
+            ok = False
+            continue
         if fetched:
             completed[mid] = fetched
         else:
@@ -2307,6 +2311,9 @@ async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | 
         return None
     if status == 404:
         raise GetMedia404Error(_get_media_http_error(resp, status), raw=resp)
+    if status == 400 and _get_media_error_status(resp) == "INVALID_ARGUMENT":
+        # Video still rendering — poll will retry; do not abort the task.
+        return None
     if status >= 400:
         raise FlowApiError(
             _get_media_http_error(resp, status),
@@ -2409,10 +2416,10 @@ async def poll_video_by_media(
                         client, mid, max_attempts=1, retry_404=False
                     )
                 except GetMedia404Error:
-                    if requeue_on_get_media_404 and not (
-                        _poll_entry_done(poll_status, False)
-                        or mid in completed
-                        or round_idx >= 5
+                    if (
+                        requeue_on_get_media_404
+                        and not _poll_entry_done(poll_status, False)
+                        and mid not in completed
                     ):
                         continue
                     raise
@@ -2422,7 +2429,6 @@ async def poll_video_by_media(
                         and is_get_media_not_ready_error(exc)
                         and not _poll_entry_done(poll_status, False)
                         and mid not in completed
-                        and round_idx < 5
                     ):
                         continue
                     raise

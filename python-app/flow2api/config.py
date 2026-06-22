@@ -32,6 +32,7 @@ ADMIN_SESSION_COOKIE = "flow2api_admin_session"
 POLL_INTERVAL_S = float(os.environ.get("FLOW2API_POLL_INTERVAL", "2.5"))
 IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
 VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
+VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "10"))
 WORKER_MAX_CONCURRENT = int(os.environ.get("FLOW2API_MAX_CONCURRENT", "1"))
 WORKER_TASK_STAGGER_S = float(os.environ.get("FLOW2API_TASK_STAGGER_S", "0"))

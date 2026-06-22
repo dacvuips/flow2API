@@ -14,6 +14,7 @@ from flow2api.config import (
     TASK_RUNNING_TIMEOUT_MAX_RETRIES,
     TASK_RUNNING_TIMEOUT_S,
     VIDEO_POLL_MAX,
+    VIDEO_POLL_MEDIA_MAX,
     WORKER_NUDGE_STUCK_S,
 )
 from flow2api.services.worker_settings import get_worker_settings
@@ -1198,7 +1199,7 @@ class WorkerController:
                     client,
                     poll_project_id,
                     media_ids,
-                    VIDEO_POLL_MAX,
+                    VIDEO_POLL_MEDIA_MAX,
                     should_abort=self._abort_hook(rid),
                     requeue_on_get_media_404=workflow_mode,
                 )
@@ -1216,7 +1217,7 @@ class WorkerController:
                     urls, media = await flow_sdk.poll_workflow_videos(
                         client,
                         workflow_ops,
-                        max_rounds=min(60, VIDEO_POLL_MAX),
+                        max_rounds=VIDEO_POLL_MEDIA_MAX,
                         project_id=poll_project_id,
                         should_abort=self._abort_hook(rid),
                     )
@@ -1227,7 +1228,7 @@ class WorkerController:
             urls, media = await flow_sdk.poll_workflow_videos(
                 client,
                 workflow_ops,
-                VIDEO_POLL_MAX,
+                VIDEO_POLL_MEDIA_MAX,
                 project_id=poll_project_id,
                 should_abort=self._abort_hook(rid),
             )
