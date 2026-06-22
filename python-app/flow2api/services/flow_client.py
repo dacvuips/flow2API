@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from flow2api.services.extension_pool import ExtensionSession, get_extension_pool
+from flow2api.services.request_params import get_video_quality
 
 # Back-compat alias
 FlowClient = ExtensionSession
@@ -66,7 +67,7 @@ def request_requires_credit_profile(
     rtype = str(request_type or "").lower()
     if rtype not in _OMNI_VIDEO_TYPES:
         return False
-    return flow_sdk.is_omni_flash(str(params.get("video_quality") or ""))
+    return flow_sdk.is_omni_flash(get_video_quality(params))
 
 
 def _profile_matches_credit_pool(profile_id: str, credit_required: bool) -> bool:

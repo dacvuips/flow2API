@@ -33,6 +33,7 @@ from flow2api.services.flow_sdk import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
+from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.result_media import prepare_params_for_worker_requeue
 from flow2api.services.stored_media import persist_task_result
 from flow2api.services.flow_client import (
@@ -548,7 +549,7 @@ class WorkerController:
                     break
                 if row.id in self._running:
                     continue
-                row_params = json.loads(row.params_json or "{}")
+                row_params = normalize_request_params(json.loads(row.params_json or "{}"))
                 retry_not_before = float(row_params.get("retry_not_before") or 0)
                 if retry_not_before > time.time():
                     continue
@@ -574,7 +575,7 @@ class WorkerController:
         row = activity.get_request(rid)
         if not row:
             return
-        params = json.loads(row.params_json or "{}")
+        params = normalize_request_params(json.loads(row.params_json or "{}"))
         profile_id = self._assign_profile(rid, params, row.type)
         pool = get_extension_pool()
         pool.job_started(profile_id)
@@ -932,7 +933,7 @@ class WorkerController:
 
         if req_type == "gen_text_video":
             prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
-            if flow_sdk.is_omni_flash(str(params.get("video_quality") or "")):
+            if flow_sdk.is_omni_flash(get_video_quality(params)):
                 duration_s = int(
                     params.get("video_duration_s")
                     or params.get("omni_duration_s")
@@ -951,14 +952,14 @@ class WorkerController:
                     project_id=project_id,
                     prompt=prompt,
                     aspect_ratio=params.get("aspect_ratio", "16:9"),
-                    video_quality=params.get("video_quality", "fast"),
+                    video_quality=get_video_quality(params, "fast"),
                 )
             await self._poll_video(rid, raw, project_id)
             return
 
         if req_type in _IMAGE_VIDEO_TYPES:
             video_mode = _resolve_video_mode(req_type, params)
-            if flow_sdk.is_omni_flash(str(params.get("video_quality") or "")):
+            if flow_sdk.is_omni_flash(get_video_quality(params)):
                 await self._process_omni_video(
                     rid, client, project_id, params, video_mode, req_type
                 )
@@ -1067,7 +1068,7 @@ class WorkerController:
         row = activity.get_request(rid)
         prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
-        video_quality = params.get("video_quality", "fast")
+        video_quality = get_video_quality(params, "fast")
 
         if not self._has_video_input_media(params):
             raw = await flow_sdk.gen_text_video(

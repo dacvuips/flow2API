@@ -1053,7 +1053,10 @@ def _video_model_key(mode: str, tier: str, aspect: str, quality: str) -> str:
 
 def is_omni_flash(quality: str) -> bool:
     q = str(quality or "").strip().lower().replace("-", "_")
-    return q in ("omni_flash", "omni")
+    if q in ("omni_flash", "omni"):
+        return True
+    compact = q.replace("_", "")
+    return compact in ("omniflash", "omni")
 
 
 def omni_frame_model_key(duration_s: int) -> str:

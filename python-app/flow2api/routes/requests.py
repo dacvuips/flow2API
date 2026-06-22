@@ -12,6 +12,7 @@ from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.dashboard_events import events
 from flow2api.services.result_media import prepare_params_for_manual_retry, with_base64_media
+from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.image_upsample import (
     fetch_upsample_image_bytes,
     run_upsample_image,
@@ -111,11 +112,11 @@ def _auth_key_id(token: str = Depends(_bearer)) -> int:
 
 @router.post("")
 async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_auth_key_id)):
-    params = dict(body.params)
+    params = normalize_request_params(dict(body.params))
     if body.type == "unsupported":
         raise HTTPException(400, params.get("error") or "unsupported")
     prompt = str(params.get("prompt") or "")
-    model = params.get("image_model") or params.get("video_quality") or ""
+    model = params.get("image_model") or get_video_quality(params) or ""
     rid = new_request_id()
     image_base64s = params.get("image_base64s") or params.get("imageBase64s") or []
     if image_base64s:
