@@ -259,6 +259,8 @@ function connectToAgent() {
         await handleApiRequest(msg);
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
+      } else if (msg.method === 'raw_request') {
+        await handleRawRequest(msg);
       } else if (msg.method === 'get_status') {
         sendToAgent({
           id: msg.id,
@@ -733,39 +735,113 @@ async function solveCaptcha(requestId, captchaAction) {
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ TRPC Request Proxy Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
 
+function isAllowedTrpcUrl(url) {
+  return !!url && (
+    url.startsWith('https://labs.google/fx/api/trpc/')
+    || url.startsWith('https://labs.google/fx/api/upload-video')
+  );
+}
+
+function isAllowedRawUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase();
+    return host === 'storage.googleapis.com'
+      || host.endsWith('.googleapis.com')
+      || host.endsWith('.googleusercontent.com');
+  } catch {
+    return false;
+  }
+}
+
 async function handleTrpcRequest(msg) {
   const { id, params } = msg;
   const { url, method = 'POST', headers = {}, body } = params;
 
-  // Tightly scoped to TRPC endpoints Ă¢â‚¬â€ prevents the agent from navigating to
-  // arbitrary labs.google paths (e.g. /fx/api/trpc/account.deleteAccount would
-  // also match /fx/api/trpc/ but account-level mutations should be gated server
-  // side if they're ever needed).
-  if (!url || !url.startsWith('https://labs.google/fx/api/trpc/')) {
+  if (!isAllowedTrpcUrl(url)) {
     sendToAgent({ id, error: 'INVALID_TRPC_URL' });
     return;
   }
 
   setState('running');
-  // TRPC calls are silent Ă¢â‚¬â€ don't add to request log, don't bump metrics
 
-  const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
+  const fetchHeaders = { ...headers };
   if (flowKey) {
     fetchHeaders['authorization'] = `Bearer ${flowKey}`;
+  }
+  const hasBody = body !== undefined && body !== null;
+  if (hasBody && !Object.keys(fetchHeaders).some((k) => k.toLowerCase() === 'content-type')) {
+    fetchHeaders['Content-Type'] = 'application/json';
   }
 
   try {
     const resp = await fetch(url, {
       method,
       headers: fetchHeaders,
-      body:    body ? JSON.stringify(body) : undefined,
+      body: hasBody ? JSON.stringify(body) : undefined,
       credentials: 'include',
     });
-    const data = await resp.json();
+    const text = await resp.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = text;
+    }
     sendToAgent({ id, status: resp.status, data });
   } catch (e) {
     console.error('[Flow2API] tRPC request failed:', e);
     sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+  } finally {
+    setState('idle');
+  }
+}
+
+async function handleRawRequest(msg) {
+  const { id, params } = msg;
+  const { url, method = 'GET', headers = {}, bodyBase64 } = params || {};
+
+  if (!url || !isAllowedRawUrl(url)) {
+    sendToAgent({ id, status: 400, error: 'INVALID_RAW_URL' });
+    return;
+  }
+  if (!flowKey) {
+    sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
+    return;
+  }
+
+  setState('running');
+  try {
+    const fetchHeaders = { ...(headers || {}) };
+    const authKey = Object.keys(fetchHeaders).find((k) => k.toLowerCase() === 'authorization');
+    if (!authKey) {
+      fetchHeaders.authorization = `Bearer ${flowKey}`;
+    }
+    let body;
+    if (bodyBase64) {
+      const bin = atob(bodyBase64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      body = bytes;
+    }
+    const resp = await fetch(url, {
+      method: method || 'PUT',
+      headers: fetchHeaders,
+      body,
+      credentials: 'include',
+    });
+    const text = await resp.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = text;
+    }
+    sendToAgent({ id, status: resp.status, data });
+  } catch (e) {
+    console.error('[Flow2API] raw request failed:', e);
+    sendToAgent({ id, status: 500, error: e.message || 'RAW_REQUEST_FAILED' });
   } finally {
     setState('idle');
   }

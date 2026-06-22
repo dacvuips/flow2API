@@ -16,6 +16,8 @@ from typing import Any, Optional
 import base64
 import logging
 
+import httpx
+
 from flow2api.config import (
     GOOGLE_API_KEY,
     GOOGLE_FLOW_API,
@@ -153,12 +155,25 @@ VIDEO_T2V_PATH = "/v1/video:batchAsyncGenerateVideoText"
 VIDEO_START_PATH = "/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_START_END_PATH = "/v1/video:batchAsyncGenerateVideoStartAndEndImage"
 VIDEO_REF_PATH = "/v1/video:batchAsyncGenerateVideoReferenceImages"
+VIDEO_EDIT_PATH = "/v1/video:batchAsyncGenerateVideoEditVideo"
 VIDEO_POLL_PATH = "/v1/video:batchCheckAsyncVideoGenerationStatus"
 VIDEO_UPSAMPLE_PATH = "/v1/video:batchAsyncGenerateVideoUpsampleVideo"
 UPLOAD_IMAGE_PATH = "/v1/flow/uploadImage"
+UPLOAD_VIDEO_START_URL = "https://labs.google/fx/api/upload-video?action=start"
+MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024
 UPSAMPLE_IMAGE_PATH = "/v1/flow/upsampleImage"
 VIDEO_RESOLUTION_1080P = "VIDEO_RESOLUTION_1080P"
 VIDEO_UPSAMPLE_MODEL_KEY = "veo_3_1_upsampler_1080p"
+
+OMNI_FLASH_QUALITY = "omni_flash"
+OMNI_EDIT_MODEL_KEY = "abra_edit"
+OMNI_FRAME_DURATIONS = (4, 6, 8, 10)
+OMNI_COMPONENT_DURATION_DEFAULT = 10
+OMNI_COMPONENT_WITH_VIDEO_DURATION_S = 8
+OMNI_COMPONENT_WITH_VIDEO_END_FRAME = 240  # 8s @ 30fps
+OMNI_COMPONENT_MAX_IMAGES_WITH_VIDEO = 5
+OMNI_COMPONENT_MAX_IMAGES_ONLY = 7
+OMNI_COMPONENT_MAX_VIDEOS = 1
 
 
 def _api_url(path: str) -> str:
@@ -191,8 +206,12 @@ def _client_context(project_id: str, tier: str, session_ms: Optional[int] = None
     }
 
 
-def _video_request_body(project_id: str, tier: str, request_item: dict) -> dict:
-    """Flow web v2 video submit (i2v / r2v / t2v lower priority)."""
+def _is_video_edit_url(url: str) -> bool:
+    return "batchAsyncGenerateVideoEditVideo" in str(url or "")
+
+
+def _video_edit_request_body(project_id: str, tier: str, request_item: dict) -> dict:
+    """Omni edit / V2V — must not include useV2ModelConfig (API rejects it)."""
     return {
         "mediaGenerationContext": {
             "batchId": str(uuid.uuid4()),
@@ -200,8 +219,32 @@ def _video_request_body(project_id: str, tier: str, request_item: dict) -> dict:
         },
         "clientContext": _client_context(project_id, tier),
         "requests": [request_item],
-        "useV2ModelConfig": True,
     }
+
+
+def _sanitize_video_submit_body(url: str, body: dict) -> dict:
+    if not _is_video_edit_url(url):
+        return body
+    out = json.loads(json.dumps(body))
+    out.pop("useV2ModelConfig", None)
+    return out
+
+
+def _video_request_body(
+    project_id: str, tier: str, request_item: dict, *, use_v2: bool = True
+) -> dict:
+    """Flow web v2 video submit (i2v / r2v / t2v lower priority)."""
+    body: dict[str, Any] = {
+        "mediaGenerationContext": {
+            "batchId": str(uuid.uuid4()),
+            "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+        },
+        "clientContext": _client_context(project_id, tier),
+        "requests": [request_item],
+    }
+    if use_v2:
+        body["useV2ModelConfig"] = True
+    return body
 
 
 def _refresh_video_request_body_session(body: dict, client: FlowClient) -> dict:
@@ -255,6 +298,50 @@ def _strip_data_url(b64: str) -> str:
     return b64
 
 
+def _parse_upload_ids(data: Any) -> tuple[str, str]:
+    """Extract media UUID and mediaGenerationId from uploadImage/uploadVideo response."""
+    if not isinstance(data, dict):
+        return "", ""
+    media = data.get("media") if isinstance(data.get("media"), dict) else {}
+    media_id = str(media.get("name") or "").strip()
+    mg = data.get("mediaGenerationId")
+    gen_id = ""
+    if isinstance(mg, dict):
+        gen_id = str(mg.get("mediaGenerationId") or "").strip()
+    return media_id, gen_id
+
+
+def _guess_upload_mime(raw: str, *, default: str = "image/jpeg") -> str:
+    text = str(raw or "")
+    if text.startswith("data:"):
+        head = text.split(",", 1)[0]
+        part = head.split(";", 1)[0]
+        if part.startswith("data:") and len(part) > 5:
+            return part[5:] or default
+    return default
+
+
+def _guess_upload_file_name(
+    mime_type: str,
+    file_name: str = "",
+    *,
+    fallback_stem: str = "upload",
+) -> str:
+    name = str(file_name or "").strip()
+    if name:
+        return name
+    ext = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/webp": "webp",
+        "video/mp4": "mp4",
+        "video/webm": "webm",
+        "video/quicktime": "mov",
+    }.get(str(mime_type or "").lower(), "bin")
+    return f"{fallback_stem}.{ext}"
+
+
 async def upload_images(
     client: FlowClient,
     *,
@@ -280,34 +367,49 @@ async def upload_images(
     return ids
 
 
-async def upload_image(
+async def _upload_media_bytes(
     client: FlowClient,
     *,
     project_id: str,
-    image_base64: str,
-    mime_type: str = "image/jpeg",
-    file_name: str = "upload.jpg",
-) -> str:
+    payload_b64: str,
+    mime_type: str,
+    file_name: str,
+    bytes_field: str,
+    api_path: str,
+    failure_label: str,
+    timeout: float = 120,
+) -> dict[str, Any]:
     body = {
         "clientContext": {"projectId": project_id, "tool": "PINHOLE"},
         "fileName": file_name,
-        "imageBytes": _strip_data_url(image_base64),
+        bytes_field: _strip_data_url(payload_b64),
         "isHidden": False,
         "isUserUploaded": True,
         "mimeType": mime_type,
     }
-    last_err = "upload_image_failed"
+    last_err = f"{failure_label}_failed"
     last_resp: dict = {}
     for attempt in range(RECAPTCHA_RETRY_MAX):
         resp = await client.api_request(
-            _api_url(UPLOAD_IMAGE_PATH), body=body, timeout=120, raise_on_error=False
+            _api_url(api_path), body=body, timeout=timeout, raise_on_error=False
         )
         last_resp = resp if isinstance(resp, dict) else {}
         data = resp.get("data") or {}
-        media = data.get("media") if isinstance(data, dict) else {}
-        name = (media or {}).get("name") if isinstance(media, dict) else None
-        if name:
-            return name
+        media_id, media_generation_id = _parse_upload_ids(data if isinstance(data, dict) else {})
+        if media_id or media_generation_id:
+            out: dict[str, Any] = {
+                "media_id": media_id or media_generation_id,
+                "media_generation_id": media_generation_id or media_id,
+                "project_id": project_id,
+            }
+            if isinstance(data, dict):
+                if data.get("width") is not None:
+                    out["width"] = data.get("width")
+                if data.get("height") is not None:
+                    out["height"] = data.get("height")
+                if data.get("durationSeconds") is not None:
+                    out["duration_seconds"] = data.get("durationSeconds")
+            return out
         last_err = error_from_response(resp)
         if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
             delay = _recaptcha_retry_delay(attempt)
@@ -332,7 +434,201 @@ async def upload_image(
             await asyncio.sleep(delay)
             continue
         break
-    raise RuntimeError(f"upload_image_failed: {last_err} ({last_resp})")
+    raise RuntimeError(f"{failure_label}_failed: {last_err} ({last_resp})")
+
+
+async def upload_image(
+    client: FlowClient,
+    *,
+    project_id: str,
+    image_base64: str,
+    mime_type: str = "image/jpeg",
+    file_name: str = "upload.jpg",
+) -> str:
+    mime_type = mime_type or _guess_upload_mime(image_base64)
+    file_name = _guess_upload_file_name(mime_type, file_name, fallback_stem="upload")
+    result = await _upload_media_bytes(
+        client,
+        project_id=project_id,
+        payload_b64=image_base64,
+        mime_type=mime_type,
+        file_name=file_name,
+        bytes_field="imageBytes",
+        api_path=UPLOAD_IMAGE_PATH,
+        failure_label="upload_image",
+        timeout=120,
+    )
+    return str(result["media_id"])
+
+
+def _payload_from_upload_response(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        return payload
+    return {}
+
+
+def _extract_session_url(payload: Any) -> str:
+    data = _payload_from_upload_response(payload)
+    queue: list[Any] = [data]
+    seen: set[int] = set()
+    keys = ("sessionUrl", "session_url", "uploadUrl", "upload_url")
+    while queue:
+        node = queue.pop(0)
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        if isinstance(node, dict):
+            for key in keys:
+                val = str(node.get(key) or "").strip()
+                if val.startswith("http"):
+                    return val
+            for val in node.values():
+                if isinstance(val, dict):
+                    queue.append(val)
+    return ""
+
+
+async def _finalize_video_upload(
+    client: FlowClient,
+    *,
+    session_url: str,
+    raw: bytes,
+    mime_type: str,
+) -> dict[str, Any]:
+    token = str(getattr(client, "flow_key", None) or "").strip()
+    if not token:
+        raise RuntimeError("upload_video_failed: missing_flow_key")
+    headers = {
+        "Content-Type": mime_type,
+        "Authorization": f"Bearer {token}",
+        "X-Goog-Upload-Command": "upload, finalize",
+        "X-Goog-Upload-Offset": "0",
+    }
+    async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as http:
+        resp = await http.put(session_url, content=raw, headers=headers)
+    if resp.status_code >= 400:
+        snippet = (resp.text or "")[:500]
+        raise RuntimeError(f"upload_video_failed: HTTP_{resp.status_code} ({snippet})")
+    try:
+        data = resp.json()
+    except Exception:
+        text = (resp.text or "").strip()
+        if not text:
+            raise RuntimeError("upload_video_failed: empty_finalize_response")
+        raise RuntimeError(f"upload_video_failed: invalid_finalize_json ({text[:500]})")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"upload_video_failed: unexpected_finalize_payload ({data!r})")
+    return data
+
+
+def _media_from_upload_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    media_id = str(
+        payload.get("mediaId")
+        or payload.get("name")
+        or payload.get("id")
+        or ""
+    ).strip()
+    media = payload.get("media") if isinstance(payload.get("media"), dict) else {}
+    if not media_id:
+        media_id = str(media.get("name") or media.get("mediaId") or "").strip()
+    gen_id = ""
+    mg = payload.get("mediaGenerationId")
+    if isinstance(mg, dict):
+        gen_id = str(mg.get("mediaGenerationId") or "").strip()
+    if not media_id:
+        media_id = gen_id
+    if not gen_id:
+        gen_id = media_id
+    return {
+        "media_id": media_id,
+        "media_generation_id": gen_id,
+        "width": payload.get("width"),
+        "height": payload.get("height"),
+        "duration_seconds": payload.get("durationSeconds"),
+    }
+
+
+async def upload_video(
+    client: FlowClient,
+    *,
+    project_id: str,
+    video_base64: str,
+    mime_type: str = "video/mp4",
+    file_name: str = "upload.mp4",
+) -> dict[str, Any]:
+    import base64
+
+    mime_type = mime_type or _guess_upload_mime(video_base64, default="video/mp4")
+    _guess_upload_file_name(mime_type, file_name, fallback_stem="upload")
+    raw = base64.b64decode(_strip_data_url(video_base64))
+    if not raw:
+        raise RuntimeError("upload_video_failed: empty_video")
+    if len(raw) > MAX_UPLOAD_VIDEO_BYTES:
+        raise RuntimeError("upload_video_failed: file_too_large")
+
+    logger.info(
+        "upload_video start project=%s size=%.1fMB mime=%s",
+        project_id[:12],
+        len(raw) / (1024 * 1024),
+        mime_type,
+    )
+    start_resp = await client.labs_upload_video_start(
+        project_id=project_id,
+        content_type=mime_type,
+        content_length=len(raw),
+    )
+    start_status = int(start_resp.get("status") or 0)
+    if start_status >= 400 or start_resp.get("error"):
+        raise RuntimeError(
+            f"upload_video_failed: {error_from_response(start_resp)} ({start_resp})"
+        )
+    session_url = _extract_session_url(start_resp)
+    if not session_url:
+        raise RuntimeError(f"upload_video_failed: missing_session_url ({start_resp})")
+
+    logger.info("upload_video finalize PUT %.1fMB → %s", len(raw) / (1024 * 1024), session_url[:80])
+    finalize_data = await _finalize_video_upload(
+        client,
+        session_url=session_url,
+        raw=raw,
+        mime_type=mime_type,
+    )
+    result = _media_from_upload_payload(finalize_data)
+    if not result.get("media_id"):
+        raise RuntimeError(f"upload_video_failed: missing_media_id ({finalize_data})")
+    result["project_id"] = project_id
+    return result
+
+
+async def upload_media(
+    client: FlowClient,
+    *,
+    project_id: str,
+    payload_base64: str,
+    mime_type: str = "",
+    file_name: str = "",
+) -> dict[str, Any]:
+    mime = mime_type or _guess_upload_mime(payload_base64)
+    if mime.startswith("video/"):
+        return await upload_video(
+            client,
+            project_id=project_id,
+            video_base64=payload_base64,
+            mime_type=mime,
+            file_name=file_name,
+        )
+    media_id = await upload_image(
+        client,
+        project_id=project_id,
+        image_base64=payload_base64,
+        mime_type=mime or "image/jpeg",
+        file_name=file_name or "upload.jpg",
+    )
+    return {"media_id": media_id, "media_generation_id": media_id, "project_id": project_id}
 
 
 async def gen_image(
@@ -753,6 +1049,145 @@ def _video_model_key(mode: str, tier: str, aspect: str, quality: str) -> str:
     if not key:
         raise ValueError(f"unsupported video model {quality} for {mode} {aspect} / {tier}")
     return key
+
+
+def is_omni_flash(quality: str) -> bool:
+    q = str(quality or "").strip().lower().replace("-", "_")
+    return q in ("omni_flash", "omni")
+
+
+def omni_frame_model_key(duration_s: int) -> str:
+    dur = int(duration_s or 4)
+    if dur not in OMNI_FRAME_DURATIONS:
+        raise ValueError(f"unsupported_omni_duration:{dur}")
+    return f"abra_i2v_{dur}s"
+
+
+def omni_t2v_model_key(duration_s: int) -> str:
+    dur = int(duration_s or 4)
+    if dur not in OMNI_FRAME_DURATIONS:
+        raise ValueError(f"unsupported_omni_duration:{dur}")
+    return f"abra_t2v_{dur}s"
+
+
+async def gen_omni_frame_video(
+    client: FlowClient,
+    *,
+    project_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    start_media_id: str,
+    duration_s: int = 4,
+) -> dict:
+    """Omni Flash Khung hình — startImage only, abra_i2v_{N}s."""
+    tier = _require_tier(client)
+    model_key = omni_frame_model_key(duration_s)
+    request_item = {
+        "aspectRatio": VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"]),
+        "seed": random.randint(1, 99_999),
+        "textInput": _structured_video_prompt(prompt),
+        "videoModelKey": model_key,
+        "metadata": {},
+        "startImage": {"mediaId": start_media_id},
+    }
+    body = _video_request_body(project_id, tier, request_item)
+    return await _video_submit_request(
+        client, _api_url(VIDEO_START_PATH), body, model_key=model_key
+    )
+
+
+async def gen_omni_edit_video(
+    client: FlowClient,
+    *,
+    project_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    reference_media_ids: list[str],
+    source_video_media_id: str,
+    end_frame_index: int = OMNI_COMPONENT_WITH_VIDEO_END_FRAME,
+) -> dict:
+    """Omni Flash Thành phần V2V — abra_edit + videoInput (optional referenceImages)."""
+    video_id = str(source_video_media_id or "").strip()
+    if not video_id:
+        raise ValueError("omni_edit_requires_source_video")
+    tier = _require_tier(client)
+    aspect = VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"])
+    request_item: dict[str, Any] = {
+        "aspectRatio": aspect,
+        "seed": random.randint(1, 99_999),
+        "textInput": _structured_video_prompt(prompt),
+        "videoModelKey": OMNI_EDIT_MODEL_KEY,
+        "metadata": {},
+        "videoInput": {
+            "mediaId": video_id,
+            "startFrameIndex": 0,
+            "endFrameIndex": int(end_frame_index or OMNI_COMPONENT_WITH_VIDEO_END_FRAME),
+        },
+    }
+    if reference_media_ids:
+        request_item["referenceImages"] = [
+            {"mediaId": mid, "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"}
+            for mid in reference_media_ids
+        ]
+    body = _video_edit_request_body(project_id, tier, request_item)
+    return await _video_submit_request(
+        client, _api_url(VIDEO_EDIT_PATH), body, model_key=OMNI_EDIT_MODEL_KEY
+    )
+
+
+async def gen_omni_reference_video(
+    client: FlowClient,
+    *,
+    project_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    reference_media_ids: list[str],
+    duration_s: int = OMNI_COMPONENT_DURATION_DEFAULT,
+) -> dict:
+    """Omni Flash Thành phần (ảnh only) — abra_t2v_{N}s + referenceImages."""
+    if not reference_media_ids:
+        raise ValueError("omni_reference_requires_images")
+    tier = _require_tier(client)
+    model_key = omni_t2v_model_key(duration_s)
+    request_item = {
+        "aspectRatio": VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"]),
+        "seed": random.randint(1, 99_999),
+        "textInput": _structured_video_prompt(prompt),
+        "videoModelKey": model_key,
+        "metadata": {},
+        "referenceImages": [
+            {"mediaId": mid, "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"}
+            for mid in reference_media_ids
+        ],
+    }
+    body = _video_request_body(project_id, tier, request_item)
+    return await _video_submit_request(
+        client, _api_url(VIDEO_REF_PATH), body, model_key=model_key
+    )
+
+
+async def gen_omni_text_video(
+    client: FlowClient,
+    *,
+    project_id: str,
+    prompt: str,
+    aspect_ratio: str,
+    duration_s: int = OMNI_COMPONENT_DURATION_DEFAULT,
+) -> dict:
+    """Omni Flash text-only — abra_t2v_{N}s on batchAsyncGenerateVideoText."""
+    tier = _require_tier(client)
+    model_key = omni_t2v_model_key(duration_s)
+    request_item = {
+        "aspectRatio": VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"]),
+        "seed": random.randint(1, 99_999),
+        "textInput": _structured_video_prompt(prompt),
+        "videoModelKey": model_key,
+        "metadata": {},
+    }
+    body = _video_request_body(project_id, tier, request_item)
+    return await _video_submit_request(
+        client, _api_url(VIDEO_T2V_PATH), body, model_key=model_key
+    )
 
 
 async def gen_text_video(
@@ -1214,8 +1649,9 @@ async def _video_submit_request(
     last_resp: dict = {}
     max_attempts = max(4, RECAPTCHA_RETRY_MAX)
     for attempt in range(max_attempts):
+        submit_body = _sanitize_video_submit_body(url, body)
         resp = await client.api_request(
-            url, body=body, captcha_action=captcha_action, timeout=300, raise_on_error=False
+            url, body=submit_body, captcha_action=captcha_action, timeout=300, raise_on_error=False
         )
         last_resp = resp if isinstance(resp, dict) else {}
         attempts.append(compact_api_response(resp, f"submit_attempt_{attempt + 1}"))
@@ -1246,12 +1682,20 @@ async def _video_submit_request(
                 delay,
             )
             await asyncio.sleep(delay)
-            body = _refresh_video_request_body_session(body, client)
+            body = _sanitize_video_submit_body(
+                url, _refresh_video_request_body_session(body, client)
+            )
             continue
         if (
             is_invalid_argument_retry_failure(None, last_err, attempts)
             or _payload_has_invalid_argument_retry(last_resp)
         ) and attempt < max_attempts - 1:
+            if "useV2ModelConfig" in str(last_err or ""):
+                body = _sanitize_video_submit_body(url, body)
+                logger.warning(
+                    "video submit stripped useV2ModelConfig for edit endpoint (attempt %s)",
+                    attempt + 1,
+                )
             delay = _recaptcha_retry_delay(attempt)
             logger.warning(
                 "video submit INVALID_ARGUMENT retry %s/%s: %s — wait %ss",
@@ -1261,7 +1705,9 @@ async def _video_submit_request(
                 delay,
             )
             await asyncio.sleep(delay)
-            body = _refresh_video_request_body_session(body, client)
+            body = _sanitize_video_submit_body(
+                url, _refresh_video_request_body_session(body, client)
+            )
             continue
         break
     logger.warning(

@@ -18,8 +18,13 @@ from flow2api.services.stored_media import (
 )
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
-from flow2api.services.flow_client import get_flow_client
-from flow2api.services.flow_sdk import get_media_http_status, parse_get_media_image
+from flow2api.services.flow_client import get_flow_client, get_flow_client_for_profile
+from flow2api.services.flow_sdk import (
+    ensure_project,
+    get_media_http_status,
+    parse_get_media_image,
+    upload_media,
+)
 from flow2api.services.health_cache import get_health_payload
 from flow2api.services.image_upsample import run_upsample_image
 from flow2api.services.video_upsample import run_upsample_video
@@ -46,6 +51,16 @@ class UpsampleVideoBody(BaseModel):
     profile_id: str | None = None
     aspect_ratio: str | None = None
     workflow_id: str | None = None
+
+
+class UploadMediaBody(BaseModel):
+    base64: str
+    mime_type: str | None = None
+    mimeType: str | None = None
+    file_name: str | None = None
+    name: str | None = None
+    project_id: str | None = None
+    profile_id: str | None = None
 
 
 def _bearer_token(authorization: str | None = Header(default=None)) -> str:
@@ -232,6 +247,52 @@ async def serve_media(media_id: str):
     except Exception as exc:
         logger.warning("serve_media unexpected %s: %s", media_id[:12], exc)
         raise HTTPException(404, "not_found") from None
+
+
+@router.post("/api/flow/upload")
+async def flow_upload_media(
+    body: UploadMediaBody,
+    _: str = Depends(_bearer_token),
+):
+    """Upload ảnh hoặc video lên Google Flow — trả mediaId (và mediaGenerationId với video)."""
+    payload = str(body.base64 or "").strip()
+    if not payload:
+        raise HTTPException(400, "missing_base64")
+    mime_type = str(body.mime_type or body.mimeType or "").strip()
+    file_name = str(body.file_name or body.name or "").strip()
+    client = (
+        get_flow_client_for_profile(body.profile_id)
+        if body.profile_id
+        else get_flow_client()
+    )
+    if not client.connected:
+        raise HTTPException(503, "extension_not_connected")
+    project_id = str(body.project_id or "").strip()
+    if not project_id:
+        project_id = await ensure_project(client)
+    try:
+        result = await upload_media(
+            client,
+            project_id=project_id,
+            payload_base64=payload,
+            mime_type=mime_type,
+            file_name=file_name,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    media_id = str(result.get("media_id") or "")
+    if not media_id:
+        raise HTTPException(502, "upload_missing_media_id")
+    return {
+        "mediaId": media_id,
+        "media_id": media_id,
+        "mediaGenerationId": result.get("media_generation_id") or media_id,
+        "project_id": result.get("project_id") or project_id,
+        "profile_id": body.profile_id or getattr(client, "profile_id", None),
+        "width": result.get("width"),
+        "height": result.get("height"),
+        "duration_seconds": result.get("duration_seconds"),
+    }
 
 
 @router.post("/api/flow/upsample-image")

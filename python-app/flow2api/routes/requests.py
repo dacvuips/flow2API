@@ -38,6 +38,8 @@ class RequestParams(BaseModel):
     image_base64s: Optional[list[str]] = None
     image_input_types: Optional[list[str]] = None
     video_mode: Optional[str] = None  # "frame" | "component" — bắt buộc với gen_image_video
+    video_media_id: Optional[str] = None
+    media_generation_id: Optional[str] = None
     start_media_id: Optional[str] = None
     end_media_id: Optional[str] = None
     reference_media_ids: Optional[list[str]] = None

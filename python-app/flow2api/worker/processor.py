@@ -42,6 +42,7 @@ from flow2api.services.flow_client import (
     pick_profile_for_retry,
     pick_profile_for_task,
     profile_available_for_queue,
+    request_requires_credit_profile,
     unbind_task_profile,
 )
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ class WorkerController:
                 rid,
                 prompt=str(row.prompt or ""),
             )
-            params = apply_retry_profile_rotation(params)
+            params = apply_retry_profile_rotation(params, row.type)
             activity.update_request(
                 rid,
                 status="queued",
@@ -347,7 +348,78 @@ class WorkerController:
             return True
         if params.get("reference_media_ids"):
             return True
+        if params.get("video_media_id") or params.get("source_video_media_id"):
+            return True
+        if params.get("video_media_ids"):
+            return True
+        if any(bool(x) for x in (params.get("video_base64s") or [])):
+            return True
         return any(bool(x) for x in (params.get("image_base64s") or []))
+
+    async def _resolve_omni_video_media_id(
+        self,
+        rid: str,
+        client: Any,
+        project_id: str,
+        params: dict[str, Any],
+    ) -> str:
+        video_id = str(
+            params.get("video_media_id")
+            or params.get("source_video_media_id")
+            or ""
+        ).strip()
+        if video_id:
+            return video_id
+        video_ids = params.get("video_media_ids") or []
+        if video_ids:
+            video_id = str(video_ids[0] or "").strip()
+            if video_id:
+                params["video_media_id"] = video_id
+                self._persist_params(rid, params)
+                return video_id
+        video_b64s = params.get("video_base64s") or []
+        if not video_b64s:
+            return ""
+        uploaded = await flow_sdk.upload_video(
+            client,
+            project_id=project_id,
+            video_base64=str(video_b64s[0]),
+        )
+        video_id = str(uploaded.get("media_id") or "")
+        if not video_id:
+            raise RuntimeError("upload_video_failed")
+        params["video_media_id"] = video_id
+        self._persist_params(rid, params)
+        return video_id
+
+    async def _resolve_omni_component_media(
+        self,
+        rid: str,
+        client: Any,
+        project_id: str,
+        params: dict[str, Any],
+    ) -> tuple[list[str], str]:
+        video_id = await self._resolve_omni_video_media_id(rid, client, project_id, params)
+        max_images = (
+            flow_sdk.OMNI_COMPONENT_MAX_IMAGES_WITH_VIDEO
+            if video_id
+            else flow_sdk.OMNI_COMPONENT_MAX_IMAGES_ONLY
+        )
+        ref_ids = list(params.get("reference_media_ids") or [])
+        if not ref_ids:
+            image_base64s = params.get("image_base64s") or []
+            if image_base64s:
+                ref_ids = await flow_sdk.upload_images(
+                    client,
+                    project_id=project_id,
+                    image_base64s=image_base64s[:max_images],
+                )
+        if ref_ids:
+            params["reference_media_ids"] = ref_ids
+            self._persist_params(rid, params)
+        if not ref_ids and not video_id:
+            raise RuntimeError("missing_omni_component_media")
+        return [str(x) for x in ref_ids], video_id
 
     async def _resolve_reference_media_ids(
         self,
@@ -399,15 +471,23 @@ class WorkerController:
         self._project_by_profile[profile_id] = project_id
         return project_id
 
-    def _assign_profile(self, rid: str, params: dict[str, Any]) -> str:
+    def _assign_profile(
+        self,
+        rid: str,
+        params: dict[str, Any],
+        request_type: str | None = None,
+    ) -> str:
+        credit_required = request_requires_credit_profile(params, request_type)
         existing = params.get("profile_id")
         exclude = params.get("retry_exclude_profile_id")
         if existing:
-            profile_id = pick_profile_for_task(str(existing))
+            profile_id = pick_profile_for_task(str(existing), credit_required=credit_required)
+            if not profile_id:
+                profile_id = pick_profile_for_task(None, credit_required=credit_required)
         elif exclude:
-            profile_id = pick_profile_for_retry(str(exclude))
+            profile_id = pick_profile_for_retry(str(exclude), credit_required=credit_required)
         else:
-            profile_id = pick_profile_for_task(None)
+            profile_id = pick_profile_for_task(None, credit_required=credit_required)
         if not profile_id:
             raise RuntimeError("no_extension_profile_online")
         session = get_extension_pool().get(profile_id)
@@ -429,7 +509,8 @@ class WorkerController:
         *,
         error: str | None = None,
     ) -> dict[str, Any]:
-        params = apply_retry_profile_rotation(params)
+        row = activity.get_request(rid)
+        params = apply_retry_profile_rotation(params, row.type if row else None)
         params.pop("running_started_at", None)
         activity.update_request(rid, status="queued", params=params, error=None)
         events.publish("request_finished", {"id": rid, "status": "queued"})
@@ -471,7 +552,7 @@ class WorkerController:
                 retry_not_before = float(row_params.get("retry_not_before") or 0)
                 if retry_not_before > time.time():
                     continue
-                if not profile_available_for_queue(row_params):
+                if not profile_available_for_queue(row_params, row.type):
                     continue
                 stagger = settings.task_stagger_s
                 if stagger > 0 and self._last_start_monotonic > 0:
@@ -494,7 +575,7 @@ class WorkerController:
         if not row:
             return
         params = json.loads(row.params_json or "{}")
-        profile_id = self._assign_profile(rid, params)
+        profile_id = self._assign_profile(rid, params, row.type)
         pool = get_extension_pool()
         pool.job_started(profile_id)
         bind_task_profile(profile_id)
@@ -850,24 +931,129 @@ class WorkerController:
             return
 
         if req_type == "gen_text_video":
-            raw = await flow_sdk.gen_text_video(
-                client,
-                project_id=project_id,
-                prompt=_task_prompt(row, params),
-                aspect_ratio=params.get("aspect_ratio", "16:9"),
-                video_quality=params.get("video_quality", "fast"),
-            )
+            prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
+            if flow_sdk.is_omni_flash(str(params.get("video_quality") or "")):
+                duration_s = int(
+                    params.get("video_duration_s")
+                    or params.get("omni_duration_s")
+                    or flow_sdk.OMNI_COMPONENT_DURATION_DEFAULT
+                )
+                raw = await flow_sdk.gen_omni_text_video(
+                    client,
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=params.get("aspect_ratio", "16:9"),
+                    duration_s=duration_s,
+                )
+            else:
+                raw = await flow_sdk.gen_text_video(
+                    client,
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=params.get("aspect_ratio", "16:9"),
+                    video_quality=params.get("video_quality", "fast"),
+                )
             await self._poll_video(rid, raw, project_id)
             return
 
         if req_type in _IMAGE_VIDEO_TYPES:
             video_mode = _resolve_video_mode(req_type, params)
+            if flow_sdk.is_omni_flash(str(params.get("video_quality") or "")):
+                await self._process_omni_video(
+                    rid, client, project_id, params, video_mode, req_type
+                )
+                return
             await self._process_image_video(
                 rid, client, project_id, params, video_mode, req_type
             )
             return
 
         raise RuntimeError(f"unsupported_type:{req_type}")
+
+    async def _process_omni_video(
+        self,
+        rid: str,
+        client: Any,
+        project_id: str,
+        params: dict[str, Any],
+        video_mode: str,
+        req_type: str,
+    ) -> None:
+        row = activity.get_request(rid)
+        prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
+        aspect_ratio = params.get("aspect_ratio", "16:9")
+        duration_s = int(
+            params.get("video_duration_s")
+            or params.get("omni_duration_s")
+            or flow_sdk.OMNI_COMPONENT_DURATION_DEFAULT
+        )
+
+        if not self._has_video_input_media(params):
+            raw = await flow_sdk.gen_omni_text_video(
+                client,
+                project_id=project_id,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                duration_s=duration_s,
+            )
+            await self._poll_video(rid, raw, project_id)
+            return
+
+        if video_mode == "component":
+            ref_ids, video_id = await self._resolve_omni_component_media(
+                rid, client, project_id, params
+            )
+            duration_s = int(
+                params.get("video_duration_s")
+                or params.get("omni_duration_s")
+                or flow_sdk.OMNI_COMPONENT_DURATION_DEFAULT
+            )
+            if video_id:
+                raw = await flow_sdk.gen_omni_edit_video(
+                    client,
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    reference_media_ids=ref_ids,
+                    source_video_media_id=video_id,
+                    end_frame_index=flow_sdk.OMNI_COMPONENT_WITH_VIDEO_END_FRAME,
+                )
+            else:
+                raw = await flow_sdk.gen_omni_reference_video(
+                    client,
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    reference_media_ids=ref_ids,
+                    duration_s=duration_s,
+                )
+            await self._poll_video(rid, raw, project_id)
+            return
+
+        if video_mode != "frame":
+            raise RuntimeError(f"invalid_video_mode:{video_mode}")
+
+        if params.get("video_media_id") or params.get("video_base64s"):
+            raise RuntimeError("omni_frame_no_video_input")
+
+        duration_s = int(
+            params.get("video_duration_s")
+            or params.get("omni_duration_s")
+            or 4
+        )
+        image_base64s = params.get("image_base64s") or []
+        if params.get("end_media_id") or len(image_base64s) >= 2:
+            raise RuntimeError("omni_frame_single_start_image_only")
+        start_id = await self._resolve_start_media_id(rid, client, project_id, params)
+        raw = await flow_sdk.gen_omni_frame_video(
+            client,
+            project_id=project_id,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            start_media_id=start_id,
+            duration_s=duration_s,
+        )
+        await self._poll_video(rid, raw, project_id)
 
     async def _process_image_video(
         self,

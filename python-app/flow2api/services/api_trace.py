@@ -54,6 +54,12 @@ def _label_from_url(url: str, method: str) -> str:
         return "gen_image"
     if "uploadimage" in u:
         return "upload_image"
+    if "batchasyncgeneratevideoedit" in u:
+        return "video_submit_omni_edit"
+    if "upload-video" in u or "uploadvideo" in u:
+        return "upload_video"
+    if "storage.googleapis.com" in u:
+        return "upload_video_finalize"
     if "/credits" in u:
         return "credits"
     return method.lower() or "api"

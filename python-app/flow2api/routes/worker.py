@@ -13,6 +13,7 @@ from flow2api.services.worker_settings import (
     get_worker_settings,
     save_profile_limit,
     save_worker_settings,
+    set_profile_credit_allowed,
     set_profile_dispatch_enabled,
 )
 from flow2api.worker.processor import get_worker
@@ -38,6 +39,10 @@ class ProfileLimitsBulkBody(BaseModel):
 
 class ProfileDispatchBody(BaseModel):
     enabled: bool = True
+
+
+class ProfileCreditBody(BaseModel):
+    allowed: bool = True
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -126,6 +131,30 @@ async def update_profile_dispatch(
     events.publish(
         "profile_dispatch_changed",
         {"profile_id": profile_id, "enabled": body.enabled},
+    )
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
+        "ok": True,
+    }
+
+
+@router.put("/profiles/{profile_id}/credit")
+async def update_profile_credit(
+    profile_id: str,
+    body: ProfileCreditBody,
+    _=Depends(_auth_key_id),
+):
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    try:
+        saved = set_profile_credit_allowed(profile_id, body.allowed)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    events.publish(
+        "profile_credit_changed",
+        {"profile_id": profile_id, "allowed": body.allowed},
     )
     return {
         **saved.to_dict(),

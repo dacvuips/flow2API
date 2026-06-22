@@ -62,6 +62,38 @@ class Flow2APIClient:
     def create_text_video(self, **kwargs: Any) -> dict:
         return self.create("gen_text_video", **kwargs)
 
+    def upload(
+        self,
+        *,
+        base64: str,
+        mime_type: str = "",
+        file_name: str = "",
+        project_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+    ) -> dict:
+        """Upload ảnh hoặc video lên Google Flow — trả mediaId."""
+        body: dict[str, Any] = {"base64": base64}
+        if mime_type:
+            body["mime_type"] = mime_type
+        if file_name:
+            body["file_name"] = file_name
+        if project_id:
+            body["project_id"] = project_id
+        if profile_id:
+            body["profile_id"] = profile_id
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/flow/upload",
+                headers=self._headers(),
+                json=body,
+            )
+            r.raise_for_status()
+            data = r.json()
+            media_id = data.get("mediaId") or data.get("media_id")
+            if media_id and "mediaId" not in data:
+                data["mediaId"] = media_id
+            return data
+
     def get(self, request_id: str) -> dict:
         with httpx.Client(timeout=60.0) as client:
             r = client.get(

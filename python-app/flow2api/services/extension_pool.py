@@ -200,6 +200,78 @@ class ExtensionSession:
         url = f"{GOOGLE_FLOW_API}/v1/media/{media_id}?key={GOOGLE_API_KEY}&clientContext.tool=PINHOLE"
         return await self.api_request(url, method="GET", timeout=60, raise_on_error=False)
 
+    async def labs_upload_video_start(
+        self,
+        *,
+        project_id: str,
+        content_type: str,
+        content_length: int,
+        timeout: float = 30.0,
+    ) -> dict:
+        url = "https://labs.google/fx/api/upload-video?action=start"
+        resp = await self._send(
+            "trpc_request",
+            {
+                "url": url,
+                "method": "POST",
+                "headers": {
+                    "X-Upload-Project-Id": project_id,
+                    "X-Upload-Content-Type": content_type,
+                    "X-Upload-Content-Length": str(content_length),
+                },
+            },
+            timeout=timeout,
+        )
+        status = int(resp.get("status") or 0)
+        level = "error" if status >= 400 or resp.get("error") else "info"
+        append_request_log(
+            self.trace_request_id,
+            "trpc",
+            f"upload-video start → {status}",
+            level=level,
+            data={
+                "url": url,
+                "project_id": project_id,
+                "content_type": content_type,
+                "content_length": content_length,
+                "response": resp.get("data") or resp,
+            },
+        )
+        return resp
+
+    async def raw_request(
+        self,
+        *,
+        url: str,
+        method: str = "PUT",
+        headers: Optional[dict[str, str]] = None,
+        body: bytes = b"",
+        timeout: float = 300.0,
+        raise_on_error: bool = True,
+    ) -> dict:
+        import base64
+
+        params: dict[str, Any] = {
+            "url": url,
+            "method": method,
+            "headers": headers or {},
+        }
+        if body:
+            params["bodyBase64"] = base64.b64encode(body).decode("ascii")
+        resp = await self._send("raw_request", params, timeout=timeout)
+        if not raise_on_error:
+            return resp
+        status = int(resp.get("status") or 0)
+        if status >= 400:
+            data = resp.get("data")
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                msg = data["error"].get("message") or data["error"].get("status")
+                if msg:
+                    raise RuntimeError(str(msg))
+            err = resp.get("error") or data or f"HTTP_{status}"
+            raise RuntimeError(str(err))
+        return resp
+
     async def fetch_paygate_tier(self) -> Optional[str]:
         from flow2api.config import GOOGLE_FLOW_API
 
@@ -240,14 +312,15 @@ class ExtensionSession:
     def to_public_dict(self) -> dict[str, Any]:
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
+            is_profile_credit_allowed,
             is_profile_dispatch_enabled,
         )
-
         token_age = None
         if self.token_captured_at:
             token_age = int(time.time() - self.token_captured_at)
         max_c = get_profile_max_concurrent(self.profile_id)
         dispatch_enabled = is_profile_dispatch_enabled(self.profile_id)
+        credit_allowed = is_profile_credit_allowed(self.profile_id)
         slots = max(0, max_c - self.active_jobs) if dispatch_enabled else 0
         return {
             "profile_id": self.profile_id,
@@ -257,6 +330,7 @@ class ExtensionSession:
             "online": self.connected,
             "ready": self.is_ready(),
             "dispatch_enabled": dispatch_enabled,
+            "credit_allowed": credit_allowed,
             "flow_key_present": bool(self.flow_key),
             "token_age_s": token_age,
             "paygate_tier": self.paygate_tier,
@@ -388,7 +462,18 @@ class ExtensionPool:
                 return True
         return False
 
-    def _sessions_with_capacity(self, *, exclude: Optional[set[str]] = None) -> list[ExtensionSession]:
+    def _profile_matches_credit_pool(self, profile_id: str, credit_required: bool) -> bool:
+        from flow2api.services.worker_settings import is_profile_credit_allowed
+
+        allowed = is_profile_credit_allowed(profile_id)
+        return allowed if credit_required else not allowed
+
+    def _sessions_with_capacity(
+        self,
+        *,
+        exclude: Optional[set[str]] = None,
+        credit_required: bool = False,
+    ) -> list[ExtensionSession]:
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -400,16 +485,23 @@ class ExtensionPool:
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
                 continue
+            if not self._profile_matches_credit_pool(session.profile_id, credit_required):
+                continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:
                 out.append(session)
         return out
 
-    def has_available_profile(self) -> bool:
-        return bool(self._sessions_with_capacity())
+    def has_available_profile(self, *, credit_required: bool = False) -> bool:
+        return bool(self._sessions_with_capacity(credit_required=credit_required))
 
-    def pick_round_robin(self, *, exclude: Optional[set[str]] = None) -> Optional[str]:
-        ready = self._sessions_with_capacity(exclude=exclude)
+    def pick_round_robin(
+        self,
+        *,
+        exclude: Optional[set[str]] = None,
+        credit_required: bool = False,
+    ) -> Optional[str]:
+        ready = self._sessions_with_capacity(exclude=exclude, credit_required=credit_required)
         if not ready:
             return None
         ready.sort(key=lambda s: (s.active_jobs, s.assigned_total, s.profile_id))
@@ -418,7 +510,12 @@ class ExtensionPool:
         pick.assigned_total += 1
         return pick.profile_id
 
-    def pick_profile_for_retry(self, current_profile_id: str) -> Optional[str]:
+    def pick_profile_for_retry(
+        self,
+        current_profile_id: str,
+        *,
+        credit_required: bool = False,
+    ) -> Optional[str]:
         """Next profile in stable ring order; idle first; *current* only after full cycle."""
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
@@ -431,6 +528,8 @@ class ExtensionPool:
             if session.profile_id.startswith("_"):
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
+                continue
+            if not self._profile_matches_credit_pool(session.profile_id, credit_required):
                 continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:

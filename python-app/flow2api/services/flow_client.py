@@ -54,42 +54,86 @@ def unbind_task_profile() -> None:
     get_extension_pool().unbind_profile()
 
 
-def pick_profile_for_task(existing_profile_id: Optional[str] = None) -> Optional[str]:
+_OMNI_VIDEO_TYPES = frozenset({"gen_text_video", "gen_image_video"})
+
+
+def request_requires_credit_profile(
+    params: dict[str, Any],
+    request_type: str | None = None,
+) -> bool:
+    from flow2api.services import flow_sdk
+
+    rtype = str(request_type or "").lower()
+    if rtype not in _OMNI_VIDEO_TYPES:
+        return False
+    return flow_sdk.is_omni_flash(str(params.get("video_quality") or ""))
+
+
+def _profile_matches_credit_pool(profile_id: str, credit_required: bool) -> bool:
+    from flow2api.services.worker_settings import is_profile_credit_allowed
+
+    allowed = is_profile_credit_allowed(profile_id)
+    return allowed if credit_required else not allowed
+
+
+def pick_profile_for_task(
+    existing_profile_id: Optional[str] = None,
+    *,
+    credit_required: bool = False,
+) -> Optional[str]:
     from flow2api.services.worker_settings import (
         get_profile_max_concurrent,
         is_profile_dispatch_enabled,
     )
 
     pool = get_extension_pool()
-    if existing_profile_id and is_profile_dispatch_enabled(existing_profile_id):
-        session = pool.get(existing_profile_id)
-        if session and session.is_ready():
-            limit = get_profile_max_concurrent(existing_profile_id)
-            if session.active_jobs < limit:
-                return existing_profile_id
+    if existing_profile_id:
+        pid = str(existing_profile_id).strip()
+        if is_profile_dispatch_enabled(pid) and _profile_matches_credit_pool(pid, credit_required):
+            session = pool.get(pid)
+            if session and session.is_ready():
+                limit = get_profile_max_concurrent(pid)
+                if session.active_jobs < limit:
+                    return pid
         return None
-    return pool.pick_round_robin()
+    return pool.pick_round_robin(credit_required=credit_required)
 
 
-def pick_profile_for_retry(current_profile_id: str) -> Optional[str]:
-    return get_extension_pool().pick_profile_for_retry(current_profile_id)
+def pick_profile_for_retry(
+    current_profile_id: str,
+    *,
+    credit_required: bool = False,
+) -> Optional[str]:
+    return get_extension_pool().pick_profile_for_retry(
+        current_profile_id,
+        credit_required=credit_required,
+    )
 
 
-def profile_available_for_queue(params: dict[str, Any]) -> bool:
+def profile_available_for_queue(
+    params: dict[str, Any],
+    request_type: str | None = None,
+) -> bool:
     from flow2api.services.worker_settings import is_profile_dispatch_enabled
 
+    credit_required = request_requires_credit_profile(params, request_type)
     pid = params.get("profile_id")
     if pid and not is_profile_dispatch_enabled(str(pid)):
-        return bool(pick_profile_for_task(None))
+        return bool(pick_profile_for_task(None, credit_required=credit_required))
     if pid:
-        return bool(pick_profile_for_task(str(pid)))
+        if pick_profile_for_task(str(pid), credit_required=credit_required):
+            return True
+        return bool(pick_profile_for_task(None, credit_required=credit_required))
     exclude = params.get("retry_exclude_profile_id")
     if exclude:
-        return bool(pick_profile_for_retry(str(exclude)))
-    return bool(pick_profile_for_task(None))
+        return bool(pick_profile_for_retry(str(exclude), credit_required=credit_required))
+    return bool(pick_profile_for_task(None, credit_required=credit_required))
 
 
-def apply_retry_profile_rotation(params: dict[str, Any]) -> dict[str, Any]:
+def apply_retry_profile_rotation(
+    params: dict[str, Any],
+    request_type: str | None = None,
+) -> dict[str, Any]:
     """Advance retry to the next profile in ring order (idle first; same profile after full cycle)."""
     out = dict(params or {})
     current = str(
@@ -100,7 +144,8 @@ def apply_retry_profile_rotation(params: dict[str, Any]) -> dict[str, Any]:
         return out
 
     pool = get_extension_pool()
-    next_id = pool.pick_profile_for_retry(current)
+    credit_required = request_requires_credit_profile(out, request_type)
+    next_id = pool.pick_profile_for_retry(current, credit_required=credit_required)
 
     if not next_id:
         out.pop("profile_id", None)
