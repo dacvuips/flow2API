@@ -3,7 +3,9 @@
  * Injects injected.js into MAIN world, forwards GET_CAPTCHA messages,
  * and renders the Flow2API status popup inside Google Flow pages.
  */
-(function () {
+(function injectCaptchaBridge() {
+  if (document.documentElement?.dataset?.flow2apiInjected === '1') return;
+  document.documentElement.dataset.flow2apiInjected = '1';
   const s = document.createElement('script');
   s.src = chrome.runtime.getURL('injected.js');
   s.onload = () => s.remove();

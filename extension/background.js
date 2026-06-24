@@ -28,6 +28,20 @@ let metrics = {
 
 const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
 
+// reCAPTCHA on Flow tab: first solve after page load is OK; later solves need a fresh
+// grecaptcha session (same as manual F5). Track per-tab solve count in the SW.
+const _captchaSolvesByTab = new Map();
+let _captchaChain = Promise.resolve();
+
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.status !== 'complete' || !tab?.url) return;
+  const onFlow = flowUrls.some((pattern) => {
+    const re = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+    return re.test(tab.url);
+  });
+  if (onFlow) _captchaSolvesByTab.set(tabId, 0);
+});
+
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ URL Ă¢â€ â€™ Log Type Classifier Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
 
 function classifyUrl(url) {
@@ -413,6 +427,9 @@ async function handleApiRequest(msg) {
     if (captchaAction) {
       const captchaResult = await solveCaptcha(id, captchaAction);
       captchaToken = captchaResult?.token || null;
+      if (captchaToken) {
+        console.log(`[Flow2API] reCAPTCHA solved action=${captchaAction} len=${captchaToken.length}`);
+      }
       if (!captchaToken) {
         const err = captchaResult?.error || 'CAPTCHA_FAILED';
         console.error(`[Flow2API] Captcha failed for ${captchaAction}: ${err}`);
@@ -621,6 +638,31 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function runCaptchaExclusive(fn) {
+  const run = _captchaChain.then(fn, fn);
+  _captchaChain = run.catch(() => {});
+  return run;
+}
+
+/** grecaptcha.enterprise session is effectively one-shot per page load on Flow. */
+async function prepareFlowTabForCaptcha(tabId) {
+  const prev = _captchaSolvesByTab.get(tabId) || 0;
+  if (prev >= 1) {
+    console.log('[Flow2API] Reloading Flow tab to reset reCAPTCHA session (solve #%s)', prev + 1);
+    try {
+      await chrome.tabs.reload(tabId);
+      await sleep(4500);
+      _captchaSolvesByTab.set(tabId, 0);
+    } catch (e) {
+      console.warn('[Flow2API] Flow tab reload before captcha failed:', e?.message || e);
+    }
+  }
+}
+
+function noteCaptchaSolveOnTab(tabId) {
+  _captchaSolvesByTab.set(tabId, (_captchaSolvesByTab.get(tabId) || 0) + 1);
+}
+
 async function requestCaptchaFromTab(tabId, requestId, pageAction) {
   try {
     return await chrome.tabs.sendMessage(tabId, {
@@ -670,6 +712,7 @@ async function reviveTabIfNeeded(tab) {
 }
 
 async function solveCaptcha(requestId, captchaAction) {
+  return runCaptchaExclusive(async () => {
   const tabs = await chrome.tabs.query({ url: flowUrls });
 
   // No Flow tab at all Ă¢â‚¬â€ spawn one (handles "no Chrome window" via the
@@ -692,10 +735,12 @@ async function solveCaptcha(requestId, captchaAction) {
     const live = await reviveTabIfNeeded(tab);
     if (!live) continue;
     try {
+      await prepareFlowTabForCaptcha(live.id);
       const resp = await Promise.race([
         requestCaptchaFromTab(live.id, requestId, captchaAction),
         new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
       ]);
+      if (resp?.token) noteCaptchaSolveOnTab(live.id);
       return resp;
     } catch (e) {
       const msg = e?.message || '';
@@ -722,15 +767,18 @@ async function solveCaptcha(requestId, captchaAction) {
     const fresh = await chrome.tabs.query({ url: flowUrls });
     const target = fresh.find((t) => !t.discarded) || fresh[0];
     if (!target) return { error: 'NO_FLOW_TAB' };
+    await prepareFlowTabForCaptcha(target.id);
     const resp = await Promise.race([
       requestCaptchaFromTab(target.id, requestId, captchaAction),
       new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
     ]);
+    if (resp?.token) noteCaptchaSolveOnTab(target.id);
     return resp;
   } catch (e) {
     const msg = e?.message || (errors[0] ?? 'NO_FLOW_TAB');
     return { error: msg };
   }
+  });
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ TRPC Request Proxy Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬

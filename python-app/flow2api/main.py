@@ -37,6 +37,24 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+
+class _SuppressAsyncioClientDisconnect(logging.Filter):
+    """Windows: browser closes video range requests → harmless asyncio noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "asyncio":
+            return True
+        if "_call_connection_lost" in (record.getMessage() or ""):
+            return False
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, ConnectionResetError) and getattr(exc, "winerror", None) == 10054:
+            return False
+        return True
+
+
+logging.getLogger("asyncio").addFilter(_SuppressAsyncioClientDisconnect())
+
 logger = logging.getLogger(__name__)
 
 
