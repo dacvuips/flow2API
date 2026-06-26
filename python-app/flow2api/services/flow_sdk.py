@@ -1546,6 +1546,18 @@ def is_extension_timeout_error(msg: str = "", exc: Exception | None = None) -> b
     return "extension_timeout" in str(exc).lower()
 
 
+def is_extension_disconnect_error(msg: str = "", exc: Exception | None = None) -> bool:
+    """Extension WS dropped mid-request — often a startup reconnect race; safe to retry."""
+    text = str(msg or "").strip().lower()
+    if text == "extension_disconnected" or text.startswith("extension_disconnected"):
+        return True
+    if exc is None:
+        return False
+    if isinstance(exc, ConnectionError):
+        return True
+    return "extension disconnected" in str(exc).lower()
+
+
 _RECAPTCHA_ERR_RE = re.compile(r"re\s*[-_]?\s*captcha|captcha", re.IGNORECASE)
 
 

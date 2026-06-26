@@ -282,12 +282,13 @@ def _local_video_exists(media_id: str) -> bool:
 
 def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
     """Skip bare /media/{uuid} placeholders that are not cached locally."""
-    from flow2api.config import PUBLIC_BASE_URL
+    from flow2api.config import get_public_base_url
 
     u = str(url or "").strip()
     if not u:
         return False
-    if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL):
+    base = get_public_base_url()
+    if base and u.startswith(base):
         return True
     if u.startswith(("http://", "https://", "/inputs/", "/outputs/", "/video/", "/image/")):
         return True

@@ -1,8 +1,10 @@
 """Flow2API configuration (mirrors packaged agent env vars)."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_ROOT = Path(os.environ.get("FLOW2API_ROOT", ROOT))
@@ -49,10 +51,84 @@ WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
 HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))
 PURGE_INTERVAL_S = int(os.environ.get("FLOW2API_PURGE_INTERVAL_S", "300"))
-# Public links returned in API responses: https://{PUBLIC_BASE_URL}/video/{id}
-PUBLIC_BASE_URL = os.environ.get(
-    "FLOW2API_PUBLIC_BASE_URL", "https://flow2.viettheo.site"
-).rstrip("/")
+# Public links in API responses: https://{host}/video/{id}
+# Priority: Host learned from tunnel/proxy request > FLOW2API_PUBLIC_BASE_URL > default fallback.
+_PUBLIC_BASE_URL_ENV = os.environ.get("FLOW2API_PUBLIC_BASE_URL", "").strip().rstrip("/")
+_PUBLIC_BASE_URL_DEFAULT = os.environ.get(
+    "FLOW2API_PUBLIC_BASE_URL_DEFAULT", "https://flow2.viettheo.site"
+).strip().rstrip("/")
+_learned_public_base_url: str = ""
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "[::1]"})
+
+
+def _is_public_hostname(host: str) -> bool:
+    h = str(host or "").strip().lower()
+    if not h or h in _LOCAL_HOSTS:
+        return False
+    if h.endswith(".localhost"):
+        return False
+    # Bare IPv4 / bracketed IPv6 — not a public tunnel hostname.
+    if h.replace(".", "").isdigit():
+        return False
+    if h.startswith("[") and "]" in h:
+        return False
+    return True
+
+
+def _scheme_from_cf_visitor(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        import json
+
+        data = json.loads(raw)
+        scheme = str(data.get("scheme") or "").strip().lower()
+        if scheme in ("http", "https"):
+            return scheme
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return ""
+
+
+def learn_public_base_url_from_headers(headers: Any) -> None:
+    """Remember public origin from Cloudflare Tunnel / reverse-proxy headers."""
+    global _learned_public_base_url
+
+    get = headers.get if hasattr(headers, "get") else lambda _k, _d="": ""
+
+    host = str(
+        get("x-forwarded-host") or get("host") or ""
+    ).split(",")[0].strip()
+    if not _is_public_hostname(host):
+        return
+
+    proto = str(
+        get("x-forwarded-proto")
+        or _scheme_from_cf_visitor(get("cf-visitor"))
+        or "https"
+    ).split(",")[0].strip().lower()
+    if proto not in ("http", "https"):
+        proto = "https"
+
+    base = f"{proto}://{host}".rstrip("/")
+    if base == _learned_public_base_url:
+        return
+    _learned_public_base_url = base
+    logging.getLogger(__name__).info("Learned public base URL from request: %s", base)
+
+
+def get_public_base_url() -> str:
+    if _learned_public_base_url:
+        return _learned_public_base_url
+    if _PUBLIC_BASE_URL_ENV:
+        return _PUBLIC_BASE_URL_ENV
+    return _PUBLIC_BASE_URL_DEFAULT
+
+
+# Backward-compatible name — call get_public_base_url() for fresh value.
+PUBLIC_BASE_URL = get_public_base_url()
 # How long generated outputs stay on disk (default 6 hours).
 MEDIA_STORE_TTL_S = int(os.environ.get("FLOW2API_MEDIA_STORE_TTL_S", str(6 * 3600)))
 

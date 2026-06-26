@@ -24,6 +24,7 @@ from flow2api.services.flow_sdk import (
     FlowApiError,
     GetMedia404Error,
     format_api_error,
+    is_extension_disconnect_error,
     is_extension_timeout_error,
     is_get_media_404_failure,
     is_invalid_argument_retry_failure,
@@ -714,6 +715,26 @@ class WorkerController:
                 logger.warning(
                     "extension_timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     extension_timeout_retry + 1,
+                    RECAPTCHA_RETRY_MAX,
+                    rid[:8],
+                    delay_s,
+                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                )
+                return
+            extension_disconnect_retry = int(
+                retry_params.get("extension_disconnect_retry_count") or 0
+            )
+            if (
+                is_extension_disconnect_error(msg, exc)
+                and extension_disconnect_retry < RECAPTCHA_RETRY_MAX
+            ):
+                delay_s = flow_sdk.recaptcha_retry_delay(extension_disconnect_retry)
+                retry_params["extension_disconnect_retry_count"] = extension_disconnect_retry + 1
+                retry_params["retry_not_before"] = time.time() + delay_s
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                logger.warning(
+                    "extension_disconnected retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                    extension_disconnect_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,

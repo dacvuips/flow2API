@@ -20,6 +20,7 @@ from flow2api.config import (
     PURGE_INTERVAL_S,
     RELOAD,
     WORKER_NUDGE_INTERVAL_S,
+    learn_public_base_url_from_headers,
 )
 from flow2api.db import init_db
 from flow2api.routes.activity import router as activity_router
@@ -142,6 +143,12 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Flow2API", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def _learn_public_base_url(request, call_next):
+        learn_public_base_url_from_headers(request.headers)
+        return await call_next(request)
+
     app.include_router(requests_router)
     app.include_router(auth_router)
     app.include_router(activity_router)

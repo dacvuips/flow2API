@@ -73,7 +73,16 @@ class ExtensionSession:
         self._connected_at = time.time()
         logger.info("Profile %s connected (%s)", self.profile_id[:12], self.display_name())
 
-    def detach_ws(self) -> None:
+    def detach_ws(self, ws: Any | None = None) -> None:
+        # Extension may reconnect before the old socket's close handler runs.
+        # Ignore stale closes so in-flight work on the new socket is not aborted.
+        if ws is not None and self._ws is not None and self._ws is not ws:
+            logger.debug(
+                "Profile %s ignoring stale WS close (%s)",
+                self.profile_id[:12],
+                self.display_name(),
+            )
+            return
         self._ws = None
         for fut in list(self._pending.values()):
             if not fut.done():
@@ -408,6 +417,12 @@ class ExtensionPool:
                 self._sessions[pid] = session
             elif profile_label:
                 session.profile_label = profile_label
+            stale_ws_ids = [
+                wid for wid, mapped_pid in self._ws_to_profile.items()
+                if mapped_pid == pid and wid != id(ws)
+            ]
+            for wid in stale_ws_ids:
+                self._ws_to_profile.pop(wid, None)
             session.attach_ws(ws)
             self._ws_to_profile[id(ws)] = pid
         await session.send_json({"type": "callback_secret", "secret": self.callback_secret})
@@ -427,15 +442,17 @@ class ExtensionPool:
             return
         session = self._sessions.get(pid)
         if session:
-            session.detach_ws()
-            events.publish("profile_disconnected", {"profile_id": pid})
-            append_request_log(
-                None,
-                "profile",
-                f"Chrome profile disconnected: {session.display_name()}",
-                level="warn",
-                data={"profile_id": pid},
-            )
+            session.detach_ws(ws)
+            if not session.connected:
+                events.publish("profile_disconnected", {"profile_id": pid})
+            if not session.connected:
+                append_request_log(
+                    None,
+                    "profile",
+                    f"Chrome profile disconnected: {session.display_name()}",
+                    level="warn",
+                    data={"profile_id": pid},
+                )
 
     async def handle_ws_message(self, ws: Any, data: dict) -> Optional[ExtensionSession]:
         pid = self._ws_to_profile.get(id(ws))

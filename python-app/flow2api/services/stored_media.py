@@ -16,7 +16,7 @@ from flow2api.config import (
     HTTP_HANDLER_TIMEOUT_S,
     MEDIA_STORE_TTL_S,
     OUTPUTS_DIR,
-    PUBLIC_BASE_URL,
+    get_public_base_url,
     VIDEOS_DIR,
 )
 
@@ -32,19 +32,21 @@ def _safe_request_id(request_id: str) -> bool:
 
 
 def public_video_url(request_id: str, index: int = 0) -> str:
+    base = get_public_base_url()
     if index <= 0:
-        return f"{PUBLIC_BASE_URL}/video/{request_id}"
-    return f"{PUBLIC_BASE_URL}/video/{request_id}/{index}"
+        return f"{base}/video/{request_id}"
+    return f"{base}/video/{request_id}/{index}"
 
 
 def public_image_url(request_id: str, index: int = 0) -> str:
+    base = get_public_base_url()
     if index <= 0:
-        return f"{PUBLIC_BASE_URL}/image/{request_id}"
-    return f"{PUBLIC_BASE_URL}/image/{request_id}/{index}"
+        return f"{base}/image/{request_id}"
+    return f"{base}/image/{request_id}/{index}"
 
 
 def public_media_url(media_id: str) -> str:
-    return f"{PUBLIC_BASE_URL}/media/{media_id}"
+    return f"{get_public_base_url()}/media/{media_id}"
 
 
 _STALE_PUBLIC_HOSTS = (
@@ -56,11 +58,12 @@ _STALE_PUBLIC_HOSTS = (
 def rewrite_public_base_url(url: str) -> str:
     """Fix legacy PUBLIC_BASE_URL host stored in older task results."""
     u = str(url or "").strip()
-    if not u or not PUBLIC_BASE_URL:
+    base = get_public_base_url()
+    if not u or not base:
         return u
     for stale in _STALE_PUBLIC_HOSTS:
         if u == stale or u.startswith(stale + "/"):
-            return PUBLIC_BASE_URL + u[len(stale) :]
+            return base + u[len(stale) :]
     return u
 
 
@@ -405,10 +408,11 @@ def normalize_publisher_urls(result: dict[str, Any]) -> dict[str, Any]:
 def _external_https_urls(urls: Any) -> list[str]:
     if not isinstance(urls, list):
         return []
+    base = get_public_base_url()
     out: list[str] = []
     for raw in urls:
         u = str(raw or "").strip()
-        if u.startswith(("http://", "https://")) and not u.startswith(f"{PUBLIC_BASE_URL}/"):
+        if u.startswith(("http://", "https://")) and not (base and u.startswith(f"{base}/")):
             out.append(u)
     return out
 
@@ -481,8 +485,9 @@ def finalize_video_result_urls(request_id: str, result: dict[str, Any]) -> dict[
     link = str(out.get("Link") or "").strip()
     if link.startswith(("http://", "https://")):
         rewritten_link = rewrite_public_base_url(link)
+        base = get_public_base_url()
         if rewritten_link.startswith(("http://", "https://")) and (
-            not PUBLIC_BASE_URL or not rewritten_link.startswith(PUBLIC_BASE_URL)
+            not base or not rewritten_link.startswith(base)
         ):
             external = external or [rewritten_link]
 

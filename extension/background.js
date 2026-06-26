@@ -33,6 +33,9 @@ const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/
 const _captchaSolvesByTab = new Map();
 let _captchaChain = Promise.resolve();
 
+// Cached Flow projectId (in-memory) — used when refreshing tab before reCAPTCHA.
+let _cachedProjectId = null;
+
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (info.status !== 'complete' || !tab?.url) return;
   const onFlow = flowUrls.some((pattern) => {
@@ -80,6 +83,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'reconnect') connectToAgent();
   if (alarm.name === 'keepAlive') keepAlive();
   if (alarm.name === 'flowWatchdog') runFlowWatchdog();
+  if (alarm.name === CLEAR_ALARM) {
+    loadClearState().then(() => performClearTick());
+  }
 });
 
 async function getOrCreateProfileId() {
@@ -106,6 +112,7 @@ async function init() {
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
   ensureFreshFlowToken('startup');
+  initClearFromStorage();
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Token Capture Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -425,6 +432,8 @@ async function handleApiRequest(msg) {
     // Step 2: Solve captcha if needed
     let captchaToken = null;
     if (captchaAction) {
+      const pidFromBody = extractProjectIdFromBody(body);
+      if (pidFromBody) noteProjectId(pidFromBody);
       const captchaResult = await solveCaptcha(id, captchaAction);
       captchaToken = captchaResult?.token || null;
       if (captchaToken) {
@@ -523,6 +532,50 @@ let _lastFlowWatchdogReloadAt = 0;
 let _flowWatchdogRunning = false;
 
 const FLOW_URL = 'https://labs.google/fx/tools/flow';
+
+function extractProjectIdFromUrl(url) {
+  try {
+    const match = new URL(url).pathname.match(/\/project\/([0-9a-f-]{36})/i);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildFlowProjectUrl(projectId, referenceUrl) {
+  const pid = String(projectId || '').trim();
+  if (!pid || pid === 'new') return FLOW_URL;
+  try {
+    const ref = new URL(referenceUrl || FLOW_URL);
+    const baseMatch = ref.pathname.match(/^(\/fx(?:\/[a-z]{2})?\/tools\/flow)/i);
+    if (baseMatch) return `${ref.origin}${baseMatch[1]}/project/${pid}`;
+  } catch {
+    /* fall through */
+  }
+  return `${FLOW_URL}/project/${pid}`;
+}
+
+function noteProjectId(projectId) {
+  const id = String(projectId || '').trim();
+  if (!id || id === 'new') return;
+  if (_cachedProjectId !== id) {
+    _cachedProjectId = id;
+    console.log('[Flow2API] Cached projectId:', id.slice(0, 12) + '…');
+  }
+}
+
+function extractProjectIdFromBody(body) {
+  if (!body || typeof body !== 'object') return null;
+  const direct = body.clientContext?.projectId;
+  if (direct) return String(direct);
+  if (Array.isArray(body.requests)) {
+    for (const req of body.requests) {
+      const pid = req?.clientContext?.projectId;
+      if (pid) return String(pid);
+    }
+  }
+  return null;
+}
 
 /**
  * Open a Flow tab even when Chrome has zero windows. `chrome.tabs.create`
@@ -648,9 +701,20 @@ function runCaptchaExclusive(fn) {
 async function prepareFlowTabForCaptcha(tabId) {
   const prev = _captchaSolvesByTab.get(tabId) || 0;
   if (prev >= 1) {
-    console.log('[Flow2API] Reloading Flow tab to reset reCAPTCHA session (solve #%s)', prev + 1);
+    console.log('[Flow2API] Refreshing Flow tab to reset reCAPTCHA session (solve #%s)', prev + 1);
     try {
-      await chrome.tabs.reload(tabId);
+      const tab = await chrome.tabs.get(tabId);
+      const currentUrl = tab?.url || '';
+      const currentProjectId = extractProjectIdFromUrl(currentUrl);
+      const cachedProjectId = _cachedProjectId;
+
+      if (cachedProjectId && currentProjectId !== cachedProjectId) {
+        const targetUrl = buildFlowProjectUrl(cachedProjectId, currentUrl);
+        console.log('[Flow2API] Navigating to cached project before captcha:', targetUrl);
+        await chrome.tabs.update(tabId, { url: targetUrl });
+      } else {
+        await chrome.tabs.reload(tabId);
+      }
       await sleep(4500);
       _captchaSolvesByTab.set(tabId, 0);
     } catch (e) {
@@ -838,6 +902,14 @@ async function handleTrpcRequest(msg) {
       data = text;
     }
     sendToAgent({ id, status: resp.status, data });
+    if (resp.ok && url.includes('project.createProject')) {
+      try {
+        const pid = data?.result?.data?.json?.result?.projectId;
+        if (pid) noteProjectId(pid);
+      } catch {
+        /* ignore parse errors */
+      }
+    }
   } catch (e) {
     console.error('[Flow2API] tRPC request failed:', e);
     sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
@@ -907,7 +979,250 @@ function broadcastStatus() {
   chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
 }
 
-// Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Popup Message Handlers Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
+// ─── Auto Clear Site Data (current tab) ───────────────────────────────────────
+
+const CLEAR_ALARM = 'f2api-auto-clear';
+
+const DEFAULT_CLEAR_STATE = {
+  running: false,
+  intervalSec: 10,
+  tabId: null,
+  origin: null,
+  clearCount: 0,
+  nextRunAt: null,
+};
+
+let clearState = { ...DEFAULT_CLEAR_STATE };
+
+const BROWSING_DATA_REMOVE_OPTS = {
+  cache: true,
+  cacheStorage: true,
+  cookies: true,
+  fileSystems: true,
+  indexedDB: true,
+  localStorage: true,
+  serviceWorkers: true,
+  webSQL: true,
+};
+
+function clampClearSec(sec) {
+  return Math.max(1, Math.min(3600, Math.round(Number(sec) || 10)));
+}
+
+function canReloadTab(tab) {
+  if (!tab?.id) return false;
+  const url = tab.url || '';
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+}
+
+function getOriginFromUrl(url) {
+  return new URL(url).origin;
+}
+
+function browsingDataRemove(origins, options) {
+  return new Promise((resolve, reject) => {
+    chrome.browsingData.remove({ origins }, options, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function getActiveTab() {
+  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (tabs[0]?.id) return tabs[0];
+  tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0] || null;
+}
+
+async function resolveTargetTab(tabId) {
+  if (tabId) {
+    try {
+      return await chrome.tabs.get(tabId);
+    } catch {
+      return null;
+    }
+  }
+  return getActiveTab();
+}
+
+async function loadClearState() {
+  const data = await chrome.storage.local.get('f2apiClear');
+  if (data.f2apiClear) {
+    clearState = { ...DEFAULT_CLEAR_STATE, ...data.f2apiClear };
+  }
+}
+
+async function saveClearState() {
+  await chrome.storage.local.set({ f2apiClear: clearState });
+}
+
+function getPublicClearState() {
+  let secondsUntilNext = null;
+  if (clearState.running && clearState.nextRunAt) {
+    secondsUntilNext = Math.max(0, Math.ceil((clearState.nextRunAt - Date.now()) / 1000));
+  }
+  return {
+    running: clearState.running,
+    intervalSec: clearState.intervalSec,
+    clearCount: clearState.clearCount,
+    tabId: clearState.tabId,
+    origin: clearState.origin,
+    cachedProjectId: _cachedProjectId,
+    secondsUntilNext,
+  };
+}
+
+function broadcastClearState() {
+  chrome.runtime.sendMessage({
+    type: 'CLEAR_STATE_UPDATE',
+    state: getPublicClearState(),
+  }).catch(() => {});
+}
+
+function alarmClear(name) {
+  return new Promise((resolve) => chrome.alarms.clear(name, () => resolve()));
+}
+
+function alarmGet(name) {
+  return new Promise((resolve) => chrome.alarms.get(name, (a) => resolve(a)));
+}
+
+function alarmCreate(name, info) {
+  return new Promise((resolve, reject) => {
+    chrome.alarms.create(name, info, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function scheduleClearAlarm() {
+  await alarmClear(CLEAR_ALARM);
+  if (!clearState.running || !clearState.tabId) return;
+
+  const delayMin = Math.max(0.0167, clearState.intervalSec / 60);
+  await alarmCreate(CLEAR_ALARM, { delayInMinutes: delayMin });
+  clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
+}
+
+async function sanitizeClearState() {
+  await loadClearState();
+  if (!clearState.running) return;
+
+  if (!clearState.tabId) {
+    await stopAutoClear();
+    return;
+  }
+
+  try {
+    const tab = await chrome.tabs.get(clearState.tabId);
+    if (!canReloadTab(tab)) {
+      await stopAutoClear();
+      return;
+    }
+    clearState.origin = getOriginFromUrl(tab.url);
+  } catch {
+    await stopAutoClear();
+    return;
+  }
+
+  const alarm = await alarmGet(CLEAR_ALARM);
+  if (!alarm) {
+    clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
+    await scheduleClearAlarm();
+    await saveClearState();
+  }
+}
+
+async function clearSiteDataAndReload(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!canReloadTab(tab)) throw new Error('invalid_tab');
+
+  const origin = getOriginFromUrl(tab.url);
+  await browsingDataRemove([origin], BROWSING_DATA_REMOVE_OPTS);
+  await chrome.tabs.reload(tabId);
+  return origin;
+}
+
+async function performClearTick() {
+  if (!clearState.running || !clearState.tabId) return;
+
+  try {
+    clearState.origin = await clearSiteDataAndReload(clearState.tabId);
+    clearState.clearCount += 1;
+    await scheduleClearAlarm();
+    await saveClearState();
+    broadcastClearState();
+  } catch {
+    await stopAutoClear();
+  }
+}
+
+async function stopAutoClear() {
+  clearState.running = false;
+  clearState.nextRunAt = null;
+  await alarmClear(CLEAR_ALARM);
+  await saveClearState();
+  broadcastClearState();
+}
+
+async function startAutoClear(intervalSec, tabId) {
+  const tab = await resolveTargetTab(tabId);
+  if (!tab?.id || !canReloadTab(tab)) {
+    return { ok: false, error: 'invalid_tab', url: tab?.url || '' };
+  }
+
+  clearState.intervalSec = clampClearSec(intervalSec);
+  clearState.tabId = tab.id;
+  clearState.origin = getOriginFromUrl(tab.url);
+  clearState.running = true;
+
+  try {
+    await clearSiteDataAndReload(clearState.tabId);
+    clearState.clearCount = (clearState.clearCount || 0) + 1;
+    await scheduleClearAlarm();
+    await saveClearState();
+    broadcastClearState();
+    return { ok: true, tabId: tab.id, origin: clearState.origin };
+  } catch (err) {
+    clearState.running = false;
+    clearState.nextRunAt = null;
+    clearState.tabId = null;
+    clearState.origin = null;
+    await alarmClear(CLEAR_ALARM);
+    await saveClearState();
+    broadcastClearState();
+    return { ok: false, error: 'start_failed', message: String(err?.message || err) };
+  }
+}
+
+async function initClearFromStorage() {
+  await sanitizeClearState();
+  if (clearState.running && clearState.tabId) {
+    try {
+      if (!clearState.nextRunAt || clearState.nextRunAt < Date.now()) {
+        clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
+      }
+      await scheduleClearAlarm();
+      broadcastClearState();
+    } catch {
+      await stopAutoClear();
+    }
+  }
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (clearState.tabId === tabId) stopAutoClear();
+});
+
+// ─── Popup Message Handlers ───────────────────────────────────────────────────Ă¢â€â‚¬
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === 'STATUS') {
@@ -978,6 +1293,42 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     ensureFreshFlowToken('popup', true)
       .then((ok) => reply({ ok }))
       .catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'GET_CLEAR_STATE') {
+    loadClearState().then(() => reply(getPublicClearState()));
+    return true;
+  }
+
+  if (msg.type === 'SET_CLEAR_INTERVAL') {
+    clearState.intervalSec = clampClearSec(msg.intervalSec);
+    if (clearState.running) {
+      clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
+      scheduleClearAlarm();
+    }
+    saveClearState().then(() => reply({ ok: true }));
+    return true;
+  }
+
+  if (msg.type === 'START_AUTO_CLEAR') {
+    startAutoClear(msg.intervalSec, msg.tabId)
+      .then((res) => reply(res))
+      .catch((e) => reply({ ok: false, error: 'start_failed', message: e?.message || String(e) }));
+    return true;
+  }
+
+  if (msg.type === 'STOP_AUTO_CLEAR') {
+    stopAutoClear().then(() => reply({ ok: true }));
+    return true;
+  }
+
+  if (msg.type === 'RESET_CLEAR_COUNT') {
+    clearState.clearCount = 0;
+    saveClearState().then(() => {
+      broadcastClearState();
+      reply({ ok: true });
+    });
     return true;
   }
 

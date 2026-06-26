@@ -8,7 +8,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import HTTPException
 
-from flow2api.config import HTTP_HANDLER_TIMEOUT_S, PUBLIC_BASE_URL
+from flow2api.config import HTTP_HANDLER_TIMEOUT_S, get_public_base_url
 from flow2api.services import activity
 from flow2api.services.flow_client import get_flow_client_for_profile
 from flow2api.services.flow_sdk import (
@@ -38,7 +38,7 @@ def _absolute_url(path: str) -> str:
         return ""
     if p.startswith(("http://", "https://")):
         return p
-    base = str(PUBLIC_BASE_URL or "").rstrip("/")
+    base = str(get_public_base_url() or "").rstrip("/")
     if base:
         return f"{base}{p if p.startswith('/') else '/' + p}"
     return p
