@@ -2,7 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 
-let selectedClearSec = 10;
+let selectedClearSec = 300;
 let clearCountdownTimer = null;
 
 function send(type, payload = {}, timeoutMs = 10000) {
@@ -148,7 +148,7 @@ function renderClear(cs) {
   selectedClearSec = cs.intervalSec ?? selectedClearSec;
 
   setText('clear-count', cs.clearCount ?? 0);
-  setText('clear-interval-label', formatIntervalLabel(cs.intervalSec ?? 10));
+  setText('clear-interval-label', formatIntervalLabel(cs.intervalSec ?? 300));
 
   const running = !!cs.running;
   const dot = $('clear-status-dot');

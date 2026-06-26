@@ -42,7 +42,15 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
     const re = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
     return re.test(tab.url);
   });
-  if (onFlow) _captchaSolvesByTab.set(tabId, 0);
+  if (onFlow) {
+    _captchaSolvesByTab.set(tabId, 0);
+    chrome.storage.local.get(['f2apiClearUserStopped']).then((data) => {
+      if (data.f2apiClearUserStopped) return;
+      loadClearState().then(() => {
+        if (!clearState.running) ensureAutoClearStarted().catch(() => {});
+      });
+    });
+  }
 });
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ URL Ă¢â€ â€™ Log Type Classifier Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -112,7 +120,9 @@ async function init() {
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
   ensureFreshFlowToken('startup');
-  initClearFromStorage();
+  await chrome.storage.local.set({ f2apiClearUserStopped: false });
+  await initClearFromStorage();
+  await ensureAutoClearStarted();
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Token Capture Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -982,10 +992,11 @@ function broadcastStatus() {
 // ─── Auto Clear Site Data (current tab) ───────────────────────────────────────
 
 const CLEAR_ALARM = 'f2api-auto-clear';
+const AUTO_CLEAR_INTERVAL_SEC = 300;
 
 const DEFAULT_CLEAR_STATE = {
   running: false,
-  intervalSec: 10,
+  intervalSec: AUTO_CLEAR_INTERVAL_SEC,
   tabId: null,
   origin: null,
   clearCount: 0,
@@ -993,6 +1004,7 @@ const DEFAULT_CLEAR_STATE = {
 };
 
 let clearState = { ...DEFAULT_CLEAR_STATE };
+let _autoClearBootstrapping = false;
 
 const BROWSING_DATA_REMOVE_OPTS = {
   cache: true,
@@ -1006,7 +1018,7 @@ const BROWSING_DATA_REMOVE_OPTS = {
 };
 
 function clampClearSec(sec) {
-  return Math.max(1, Math.min(3600, Math.round(Number(sec) || 10)));
+  return Math.max(1, Math.min(3600, Math.round(Number(sec) || AUTO_CLEAR_INTERVAL_SEC)));
 }
 
 function canReloadTab(tab) {
@@ -1047,6 +1059,65 @@ async function resolveTargetTab(tabId) {
     }
   }
   return getActiveTab();
+}
+
+async function findFlowTabForClear() {
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  return (
+    tabs.find((t) => !t.discarded && canReloadTab(t))
+    || tabs.find((t) => canReloadTab(t))
+    || null
+  );
+}
+
+async function ensureAutoClearStarted() {
+  if (_autoClearBootstrapping) return;
+  const prefs = await chrome.storage.local.get('f2apiClearUserStopped');
+  if (prefs.f2apiClearUserStopped) return;
+  _autoClearBootstrapping = true;
+  try {
+    await loadClearState();
+    if (clearState.running && clearState.tabId) {
+      try {
+        const tab = await chrome.tabs.get(clearState.tabId);
+        if (canReloadTab(tab)) {
+          clearState.intervalSec = AUTO_CLEAR_INTERVAL_SEC;
+          await scheduleClearAlarm();
+          await saveClearState();
+          broadcastClearState();
+          return;
+        }
+      } catch {
+        /* tab closed — start again below */
+      }
+    }
+
+    let tab = await findFlowTabForClear();
+    if (!tab?.id) {
+      try {
+        await openFlowTabResilient(false);
+        await sleep(2500);
+        tab = await findFlowTabForClear();
+      } catch (e) {
+        console.warn('[Flow2API] Auto clear: cannot open Flow tab:', e?.message || e);
+        return;
+      }
+    }
+    if (!tab?.id || !canReloadTab(tab)) return;
+
+    const res = await startAutoClear(AUTO_CLEAR_INTERVAL_SEC, tab.id);
+    if (res.ok) {
+      console.log(
+        '[Flow2API] Auto clear started: every %ss on %s',
+        AUTO_CLEAR_INTERVAL_SEC,
+        clearState.origin || tab.url,
+      );
+    } else {
+      console.warn('[Flow2API] Auto clear start failed:', res.error || res.message || res);
+    }
+  } finally {
+    _autoClearBootstrapping = false;
+  }
 }
 
 async function loadClearState() {
@@ -1170,6 +1241,7 @@ async function stopAutoClear() {
   clearState.nextRunAt = null;
   await alarmClear(CLEAR_ALARM);
   await saveClearState();
+  await chrome.storage.local.set({ f2apiClearUserStopped: true });
   broadcastClearState();
 }
 
@@ -1312,9 +1384,11 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'START_AUTO_CLEAR') {
-    startAutoClear(msg.intervalSec, msg.tabId)
-      .then((res) => reply(res))
-      .catch((e) => reply({ ok: false, error: 'start_failed', message: e?.message || String(e) }));
+    chrome.storage.local.set({ f2apiClearUserStopped: false }).then(() => {
+      startAutoClear(msg.intervalSec, msg.tabId)
+        .then((res) => reply(res))
+        .catch((e) => reply({ ok: false, error: 'start_failed', message: e?.message || String(e) }));
+    });
     return true;
   }
 

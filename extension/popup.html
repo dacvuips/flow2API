@@ -226,7 +226,7 @@
           <h1><span class="logo-flow">Flow</span><span class="logo-api">2API</span></h1>
           <p class="subtitle">Google Flow To API</p>
         </div>
-        <span class="version">v0.0.6</span>
+        <span class="version">v0.0.7</span>
       </div>
     </header>
 
@@ -294,7 +294,7 @@
             <span class="clear-stat-label">CLEARED</span>
           </div>
           <div class="clear-stat">
-            <span class="clear-stat-value" id="clear-interval-label">10s</span>
+            <span class="clear-stat-value" id="clear-interval-label">5p</span>
             <span class="clear-stat-label">INTERVAL</span>
           </div>
           <div class="clear-stat">
@@ -310,17 +310,17 @@
           <button type="button" class="preset-btn clear-preset-btn" data-sec="20">20s</button>
           <button type="button" class="preset-btn clear-preset-btn" data-sec="60">1p</button>
           <button type="button" class="preset-btn clear-preset-btn" data-sec="120">2p</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="300">5p</button>
+          <button type="button" class="preset-btn clear-preset-btn active" data-sec="300">5p</button>
           <button type="button" class="preset-btn clear-preset-btn" data-sec="600">10p</button>
         </div>
 
         <p class="section-title">Tùy chỉnh (giây)</p>
         <div class="custom-row">
-          <input type="number" id="clear-custom-input" class="custom-input" min="1" max="3600" step="1" value="10" aria-label="Clear interval seconds" />
+          <input type="number" id="clear-custom-input" class="custom-input" min="1" max="3600" step="1" value="300" aria-label="Clear interval seconds" />
           <span class="label">giây</span>
         </div>
 
-        <p class="hint" id="clear-hint">Xóa cookies, cache, localStorage, IndexedDB… của <strong>domain tab hiện tại</strong>, sau đó reload trang.</p>
+        <p class="hint" id="clear-hint">Tự bật khi mở Chrome: clear domain tab Flow mỗi <strong>300s (5 phút)</strong>.</p>
 
         <div class="actions">
           <button type="button" class="btn btn-primary" id="btn-clear-start">▶ BẮT ĐẦU</button>
