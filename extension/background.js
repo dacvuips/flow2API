@@ -33,7 +33,7 @@ const CAPTCHA_RELOAD_EVERY_N_SOLVES = 1;
 const _captchaSolvesByTab = new Map();
 let _captchaChain = Promise.resolve();
 
-// Cached Flow projectId (in-memory) — used when refreshing tab before reCAPTCHA.
+// Cached Flow projectId (in-memory) — informational / popup only.
 let _cachedProjectId = null;
 
 // Headers sniffed from real Flow page → aisandbox requests (per Chrome profile).
@@ -861,28 +861,6 @@ let _flowWatchdogRunning = false;
 
 const FLOW_URL = 'https://labs.google/fx/tools/flow';
 
-function extractProjectIdFromUrl(url) {
-  try {
-    const match = new URL(url).pathname.match(/\/project\/([0-9a-f-]{36})/i);
-    return match ? match[1] : null;
-  } catch {
-    return null;
-  }
-}
-
-function buildFlowProjectUrl(projectId, referenceUrl) {
-  const pid = String(projectId || '').trim();
-  if (!pid || pid === 'new') return FLOW_URL;
-  try {
-    const ref = new URL(referenceUrl || FLOW_URL);
-    const baseMatch = ref.pathname.match(/^(\/fx(?:\/[a-z]{2})?\/tools\/flow)/i);
-    if (baseMatch) return `${ref.origin}${baseMatch[1]}/project/${pid}`;
-  } catch {
-    /* fall through */
-  }
-  return `${FLOW_URL}/project/${pid}`;
-}
-
 function noteProjectId(projectId) {
   const id = String(projectId || '').trim();
   if (!id || id === 'new') return;
@@ -1035,18 +1013,7 @@ async function prepareFlowTabForCaptcha(tabId) {
       CAPTCHA_RELOAD_EVERY_N_SOLVES,
     );
     try {
-      const tab = await chrome.tabs.get(tabId);
-      const currentUrl = tab?.url || '';
-      const currentProjectId = extractProjectIdFromUrl(currentUrl);
-      const cachedProjectId = _cachedProjectId;
-
-      if (cachedProjectId && currentProjectId !== cachedProjectId) {
-        const targetUrl = buildFlowProjectUrl(cachedProjectId, currentUrl);
-        console.log('[Flow2API] Navigating to cached project before captcha:', targetUrl);
-        await chrome.tabs.update(tabId, { url: targetUrl });
-      } else {
-        await chrome.tabs.reload(tabId);
-      }
+      await chrome.tabs.reload(tabId);
       await sleep(4500);
       _captchaSolvesByTab.set(tabId, 0);
     } catch (e) {
