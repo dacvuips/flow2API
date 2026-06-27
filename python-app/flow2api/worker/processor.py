@@ -643,16 +643,15 @@ class WorkerController:
             cur = activity.get_request(rid)
             retry_params = json.loads(cur.params_json or "{}") if cur else {}
             recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
-            if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
+            if flow_sdk.is_recaptcha_error(msg):
                 retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
                 req_type = cur.type if cur else None
                 retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
                 same_profile = req_type in ("upsample_video", "upsample_image")
                 logger.warning(
-                    "reCAPTCHA %s %s/%s rid=%s profile=%s",
-                    "same-profile retry" if same_profile else "hit limit — switch profile now",
+                    "reCAPTCHA %s #%s rid=%s profile=%s",
+                    "same-profile retry" if same_profile else "switch profile",
                     recaptcha_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     str(retry_params.get("profile_id") or "-")[:12],
                 )
