@@ -16,6 +16,7 @@ from flow2api.services.flow_sdk import (
     VIDEO_RESOLUTION_1080P,
     extract_workflow_id_from_result,
     normalize_source_video_media_id,
+    sanitize_public_error,
     upsample_video,
 )
 
@@ -256,7 +257,8 @@ async def run_upsample_video(
     except asyncio.TimeoutError:
         raise HTTPException(504, "upsample_video_timeout") from None
     except FlowApiError as exc:
-        raise HTTPException(502, str(exc)) from exc
+        detail = sanitize_public_error(str(exc), exc, request_type="upsample_video")
+        raise HTTPException(502, detail) from exc
     except HTTPException:
         raise
     except Exception as exc:

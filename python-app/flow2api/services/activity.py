@@ -338,11 +338,11 @@ def record_to_public(
 
     status = row.status
     if status.startswith("failed:"):
-        status = f"failed: {sanitize_public_error(status[7:].strip())}"
-    error = sanitize_public_error(row.error) if row.error else None
+        status = f"failed: {sanitize_public_error(status[7:].strip(), request_type=row.type)}"
+    error = sanitize_public_error(row.error, request_type=row.type) if row.error else None
     if isinstance(result, dict) and result.get("error"):
         result = dict(result)
-        result["error"] = sanitize_public_error(str(result["error"]))
+        result["error"] = sanitize_public_error(str(result["error"]), request_type=row.type)
     payload = {
         "id": row.id,
         "type": row.type,

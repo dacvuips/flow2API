@@ -164,6 +164,7 @@ MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024
 UPSAMPLE_IMAGE_PATH = "/v1/flow/upsampleImage"
 VIDEO_RESOLUTION_1080P = "VIDEO_RESOLUTION_1080P"
 VIDEO_UPSAMPLE_MODEL_KEY = "veo_3_1_upsampler_1080p"
+VEO_UPSAMPLE_RECREATE_SOURCE_ERROR = "Veo error: please recreate the original video"
 
 OMNI_FLASH_QUALITY = "omni_flash"
 OMNI_EDIT_MODEL_KEY = "abra_edit"
@@ -989,11 +990,24 @@ async def upsample_video(
                 _api_url(VIDEO_UPSAMPLE_PATH),
                 body,
                 model_key=VIDEO_UPSAMPLE_MODEL_KEY,
+                error_step="video_upsample_submit",
             )
             break
         except FlowApiError as exc:
             last_exc = exc
             msg = str(exc)
+            mapped = veo_upsample_recreate_source_public_error(
+                msg,
+                exc,
+                request_type="upsample_video",
+            )
+            if mapped:
+                raise FlowApiError(
+                    mapped,
+                    step="video_upsample_submit",
+                    raw=exc.raw,
+                    attempts=exc.attempts,
+                ) from exc
             retryable = (
                 is_recaptcha_error(msg)
                 or is_transient_flow_error(msg)
@@ -1013,7 +1027,7 @@ async def upsample_video(
             raise
     if not submit_raw:
         raise last_exc or FlowApiError(
-            "upsample_video_submit_failed",
+            VEO_UPSAMPLE_RECREATE_SOURCE_ERROR,
             step="video_upsample_submit",
         )
     operations = extract_video_operations(submit_raw)
@@ -1657,6 +1671,7 @@ async def _video_submit_request(
     *,
     model_key: str,
     captcha_action: str = "VIDEO_GENERATION",
+    error_step: str = "video_submit",
 ) -> dict:
     """Submit video job; retry reCAPTCHA / transient errors without changing upload media."""
     last_err = "video_submit_failed"
@@ -1733,7 +1748,7 @@ async def _video_submit_request(
     )
     raise FlowApiError(
         last_err,
-        step="video_submit",
+        step=error_step,
         raw=last_resp,
         attempts=attempts,
     )
@@ -2174,8 +2189,53 @@ def is_prominent_people_filter_failure(
     return False
 
 
-def sanitize_public_error(msg: str) -> str:
+def _flow_response_is_not_found(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if get_media_http_status(raw) == 404:
+        return True
+    return _get_media_error_status(raw) == "NOT_FOUND"
+
+
+def veo_upsample_recreate_source_public_error(
+    msg: str = "",
+    exc: Exception | None = None,
+    *,
+    request_type: str = "",
+) -> str | None:
+    """Map Veo 1080p upsample NOT_FOUND to a short English message for API callers."""
+    if str(msg or "").strip() == VEO_UPSAMPLE_RECREATE_SOURCE_ERROR:
+        return VEO_UPSAMPLE_RECREATE_SOURCE_ERROR
+
+    upsample_ctx = str(request_type or "").strip().lower() == "upsample_video"
+    if isinstance(exc, FlowApiError) and exc.step == "video_upsample_submit":
+        upsample_ctx = True
+    if not upsample_ctx:
+        return None
+
+    message = str(msg or "").strip() or (str(exc) if exc else "")
+    not_found = is_get_media_404_message(message)
+    if not not_found and isinstance(exc, FlowApiError):
+        not_found = _flow_response_is_not_found(exc.raw)
+    if not_found:
+        return VEO_UPSAMPLE_RECREATE_SOURCE_ERROR
+    return None
+
+
+def sanitize_public_error(
+    msg: str,
+    exc: Exception | None = None,
+    *,
+    request_type: str = "",
+) -> str:
     """Map raw Google Flow codes to short user-facing labels."""
+    mapped = veo_upsample_recreate_source_public_error(
+        msg,
+        exc,
+        request_type=request_type,
+    )
+    if mapped:
+        return mapped
     if _payload_has_prominent_people_filter(msg):
         return "content_filter"
     return str(msg or "").strip()

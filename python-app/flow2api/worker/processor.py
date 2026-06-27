@@ -802,7 +802,11 @@ class WorkerController:
                 )
             else:
                 logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
-            display_msg = flow_sdk.sanitize_public_error(msg)
+            display_msg = flow_sdk.sanitize_public_error(
+                msg,
+                exc if isinstance(exc, FlowApiError) else None,
+                request_type=str(cur.type or "") if cur else "",
+            )
             append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
             fail_result: dict = {
                 "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
