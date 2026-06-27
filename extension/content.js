@@ -167,53 +167,47 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
 // ─── Auto-click "Create with Google Flow" on landing page ───────────────────
 
-const AUTO_CLICK_BTN = 'create with google flow';
-const AUTO_CLICK_SESSION_KEY = 'flow2apiAutoCreateClicked';
-const AUTO_CLICK_MAX_MS = 60000;
+const AUTO_CLICK_MAX_MS = 90000;
+const AUTO_CLICK_POLL_MS = 400;
 
 let autoClickObserver = null;
 let autoClickTimer = null;
 let autoClickStartedAt = 0;
+let autoClickDoneForPath = '';
+let autoClickEnabled = true;
 
 function isFlowLandingPage() {
   try {
     const path = window.location.pathname || '';
     if (/\/project\/[0-9a-f-]{36}/i.test(path)) return false;
-    return path.includes('/fx') || path.includes('/tools/flow');
+    return /\/fx(\/|$)/i.test(path) || /\/tools\/flow/i.test(path);
   } catch {
     return true;
   }
 }
 
-function normalizeBtnText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+function currentLandingPathKey() {
+  return `${window.location.pathname}${window.location.search}`;
 }
 
-function findCreateFlowButton() {
-  const selectors = 'button, a, [role="button"], input[type="button"], input[type="submit"]';
-  for (const el of document.querySelectorAll(selectors)) {
-    const text = normalizeBtnText(el.textContent);
-    const aria = normalizeBtnText(el.getAttribute('aria-label'));
-    const title = normalizeBtnText(el.getAttribute('title'));
-    const haystack = `${text} ${aria} ${title}`;
-    if (!haystack.includes(AUTO_CLICK_BTN)) continue;
-    const rect = el.getClientRects();
-    if (!rect.length) continue;
-    const style = window.getComputedStyle(el);
-    if (style.visibility === 'hidden' || style.display === 'none') continue;
-    return el;
-  }
-  return null;
-}
-
-function triggerCreateFlowClick(el) {
-  try {
-    el.focus({ preventScroll: true });
-  } catch {
-    /* ignore */
-  }
-  el.click();
-  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+function requestMainWorldAutoClick() {
+  const requestId = `ac_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  return new Promise((resolve) => {
+    const handler = (e) => {
+      if (e.detail?.requestId !== requestId) return;
+      window.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+      clearTimeout(timer);
+      resolve(e.detail || { clicked: false, reason: 'empty_result' });
+    };
+    const timer = setTimeout(() => {
+      window.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+      resolve({ clicked: false, reason: 'main_world_timeout' });
+    }, 1200);
+    window.addEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+    window.dispatchEvent(new CustomEvent('FLOW2API_TRY_AUTO_CLICK_CREATE', {
+      detail: { requestId },
+    }));
+  });
 }
 
 function stopAutoClickCreateFlow() {
@@ -227,68 +221,96 @@ function stopAutoClickCreateFlow() {
   }
 }
 
-function tryAutoClickCreateFlow() {
+async function tryAutoClickCreateFlow() {
+  if (!autoClickEnabled) {
+    stopAutoClickCreateFlow();
+    return true;
+  }
   if (!isFlowLandingPage()) {
     stopAutoClickCreateFlow();
     return true;
   }
-  if (sessionStorage.getItem(AUTO_CLICK_SESSION_KEY) === '1') {
+
+  const pathKey = currentLandingPathKey();
+  if (autoClickDoneForPath === pathKey) {
     stopAutoClickCreateFlow();
     return true;
   }
-  const btn = findCreateFlowButton();
-  if (!btn) return false;
-  sessionStorage.setItem(AUTO_CLICK_SESSION_KEY, '1');
-  triggerCreateFlowClick(btn);
-  console.log('[Flow2API] Auto-clicked "Create with Google Flow"');
-  stopAutoClickCreateFlow();
-  return true;
+
+  const result = await requestMainWorldAutoClick();
+  if (result.clicked) {
+    autoClickDoneForPath = pathKey;
+    console.log('[Flow2API] Auto-clicked "Create with Google Flow"', result);
+    stopAutoClickCreateFlow();
+    return true;
+  }
+  return false;
 }
 
 function startAutoClickCreateFlow() {
-  if (!isFlowLandingPage()) return;
+  if (!autoClickEnabled || !isFlowLandingPage()) return;
   stopAutoClickCreateFlow();
   autoClickStartedAt = Date.now();
 
-  if (tryAutoClickCreateFlow()) return;
+  const tick = () => {
+    tryAutoClickCreateFlow().then((done) => {
+      if (done) return;
+      if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) {
+        console.warn('[Flow2API] Auto-click gave up after timeout');
+        stopAutoClickCreateFlow();
+      }
+    });
+  };
 
-  autoClickObserver = new MutationObserver(() => {
-    if (tryAutoClickCreateFlow()) return;
-    if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) stopAutoClickCreateFlow();
-  });
+  tick();
+
+  autoClickObserver = new MutationObserver(tick);
   autoClickObserver.observe(document.documentElement, {
     childList: true,
     subtree: true,
   });
 
-  autoClickTimer = setInterval(() => {
-    if (tryAutoClickCreateFlow()) return;
-    if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) stopAutoClickCreateFlow();
-  }, 500);
+  autoClickTimer = setInterval(tick, AUTO_CLICK_POLL_MS);
+}
+
+function bootAutoClickCreateFlow() {
+  if (!autoClickEnabled) return;
+  // SPA / React: wait for body and late-rendered hero button.
+  const start = () => {
+    startAutoClickCreateFlow();
+    setTimeout(startAutoClickCreateFlow, 1500);
+    setTimeout(startAutoClickCreateFlow, 4000);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+  window.addEventListener('load', start, { once: true });
+  window.addEventListener('pageshow', () => {
+    autoClickDoneForPath = '';
+    startAutoClickCreateFlow();
+  });
 }
 
 function initAutoClickCreateFlow() {
   chrome.storage.local.get(['autoClickCreateFlow'], (data) => {
     if (chrome.runtime.lastError) return;
-    if (data.autoClickCreateFlow === false) return;
-    const boot = () => startAutoClickCreateFlow();
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', boot, { once: true });
-    } else {
-      boot();
-    }
+    autoClickEnabled = data.autoClickCreateFlow !== false;
+    if (!autoClickEnabled) return;
+    bootAutoClickCreateFlow();
   });
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes.autoClickCreateFlow) return;
-  if (changes.autoClickCreateFlow.newValue === false) {
+  autoClickEnabled = changes.autoClickCreateFlow.newValue !== false;
+  if (!autoClickEnabled) {
     stopAutoClickCreateFlow();
     return;
   }
-  sessionStorage.removeItem(AUTO_CLICK_SESSION_KEY);
-  startAutoClickCreateFlow();
+  autoClickDoneForPath = '';
+  bootAutoClickCreateFlow();
 });
 
 initAutoClickCreateFlow();
-
