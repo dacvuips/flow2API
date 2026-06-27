@@ -1432,13 +1432,27 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
         chrome.action.setBadgeText({ text: '✓' });
         chrome.action.setBadgeBackgroundColor({ color: '#16a34a' });
         setTimeout(() => chrome.action.setBadgeText({ text: '' }), 8000);
-      } else if (msg.status === 'timeout') {
-        chrome.action.setBadgeText({ text: '!' });
-        chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
-        setTimeout(() => chrome.action.setBadgeText({ text: '' }), 8000);
       }
     });
     return false;
+  }
+
+  if (msg.type === 'RETRY_AUTO_CLICK_CREATE') {
+    chrome.tabs.query({
+      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*', 'https://labs.google/fx', 'https://labs.google/fx/*'],
+    }).then((tabs) => {
+      const tab = tabs.find((t) => !t.discarded) || tabs[0];
+      if (!tab?.id) {
+        reply?.({ ok: false, error: 'no_flow_tab' });
+        return;
+      }
+      chrome.tabs.sendMessage(tab.id, { type: 'RETRY_AUTO_CLICK_CREATE' }).then(() => {
+        reply?.({ ok: true });
+      }).catch((e) => {
+        reply?.({ ok: false, error: e?.message || 'send_failed' });
+      });
+    });
+    return true;
   }
 
   if (msg.type === 'SET_AUTO_CLICK_CREATE') {

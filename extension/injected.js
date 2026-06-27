@@ -7,6 +7,7 @@
 (() => {
   if (window.__flow2apiCaptchaBridge) return;
   window.__flow2apiCaptchaBridge = true;
+  document.documentElement.dataset.flow2apiMainReady = "1";
 
   const SITE_KEY_FALLBACK = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
@@ -50,17 +51,17 @@
     }
   }
 
-  window.addEventListener("GET_CAPTCHA", async ({ detail }) => {
+  document.addEventListener("GET_CAPTCHA", async ({ detail }) => {
     const { requestId, pageAction } = detail;
     try {
       const token = await executeCaptcha(pageAction);
-      window.dispatchEvent(
+      document.dispatchEvent(
         new CustomEvent("CAPTCHA_RESULT", {
           detail: { requestId, token },
         }),
       );
     } catch (e) {
-      window.dispatchEvent(
+      document.dispatchEvent(
         new CustomEvent("CAPTCHA_RESULT", {
           detail: { requestId, error: e.message },
         }),
@@ -221,12 +222,12 @@
     }
   }
 
-  window.addEventListener("FLOW2API_TRY_AUTO_CLICK_CREATE", ({ detail }) => {
+  document.addEventListener("FLOW2API_TRY_AUTO_CLICK_CREATE", ({ detail }) => {
     const requestId = detail?.requestId || "";
     try {
       const btn = findCreateFlowButton();
       if (!btn) {
-        window.dispatchEvent(
+        document.dispatchEvent(
           new CustomEvent("FLOW2API_AUTO_CLICK_RESULT", {
             detail: { requestId, clicked: false, reason: "button_not_found" },
           }),
@@ -234,7 +235,7 @@
         return;
       }
       triggerCreateFlowClick(btn);
-      window.dispatchEvent(
+      document.dispatchEvent(
         new CustomEvent("FLOW2API_AUTO_CLICK_RESULT", {
           detail: {
             requestId,
@@ -245,7 +246,7 @@
         }),
       );
     } catch (e) {
-      window.dispatchEvent(
+      document.dispatchEvent(
         new CustomEvent("FLOW2API_AUTO_CLICK_RESULT", {
           detail: {
             requestId,

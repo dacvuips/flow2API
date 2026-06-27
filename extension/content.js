@@ -35,6 +35,9 @@ let statusText = null;
 let statusDot = null;
 let statusTimer = null;
 let autoClickFeedbackUntil = 0;
+let autoClickPolling = false;
+
+const AUTO_CLICK_POLL_MS = 5000;
 
 function ensureStatusPopup() {
   if (statusRoot) return;
@@ -104,7 +107,7 @@ function ensureStatusPopup() {
 }
 
 function renderStatus(status) {
-  if (Date.now() < autoClickFeedbackUntil) return;
+  if (Date.now() < autoClickFeedbackUntil || autoClickPolling) return;
   ensureStatusPopup();
   const current = status?.manualDisconnect || !status?.connected ? 'off' : (status.state || 'idle');
   const state = current === 'running' ? 'running' : (current === 'idle' ? 'idle' : 'off');
@@ -116,21 +119,23 @@ function renderStatus(status) {
 function showAutoClickFeedback(kind) {
   ensureStatusPopup();
   const configs = {
-    searching: { icon: '…', color: '#f5b301', text: 'Đang click Create Flow…' },
+    searching: { icon: '…', color: '#f5b301', text: 'Đang tìm nút Create Flow…' },
     success: { icon: '✓', color: '#22c55e', text: 'Đã click Create Flow' },
-    timeout: { icon: '!', color: '#d97706', text: 'Chưa thấy nút Create' },
   };
   const cfg = configs[kind];
   if (!cfg) return;
   statusDot.textContent = cfg.icon;
   statusDot.style.color = cfg.color;
   statusText.textContent = cfg.text;
-  const holdMs = kind === 'searching' ? 4000 : 10000;
-  autoClickFeedbackUntil = Date.now() + holdMs;
+  autoClickFeedbackUntil = kind === 'success' ? Date.now() + 10000 : 0;
   chrome.storage.local.set({
     autoClickLastStatus: { status: kind, message: cfg.text, at: Date.now() },
   });
-  chrome.runtime.sendMessage({ type: 'AUTO_CLICK_STATUS', status: kind, message: cfg.text }).catch(() => {});
+  chrome.runtime.sendMessage({
+    type: 'AUTO_CLICK_STATUS',
+    status: kind,
+    message: cfg.text,
+  }).catch(() => {});
 }
 
 function refreshStatus() {
@@ -161,26 +166,34 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return false;
   }
 
+  if (msg.type === 'RETRY_AUTO_CLICK_CREATE') {
+    autoClickDoneForPath = '';
+    stopAutoClickCreateFlow();
+    startAutoClickCreateFlow();
+    reply?.({ ok: true });
+    return false;
+  }
+
   if (msg.type !== 'GET_CAPTCHA') return false;
 
   const { requestId, pageAction } = msg;
 
   const handler = (e) => {
     if (e.detail?.requestId === requestId) {
-      window.removeEventListener('CAPTCHA_RESULT', handler);
+      document.removeEventListener('CAPTCHA_RESULT', handler);
       clearTimeout(timer);
       reply({ token: e.detail.token, error: e.detail.error });
     }
   };
 
   const timer = setTimeout(() => {
-    window.removeEventListener('CAPTCHA_RESULT', handler);
+    document.removeEventListener('CAPTCHA_RESULT', handler);
     reply({ error: 'CONTENT_TIMEOUT' });
   }, 25000);
 
-  window.addEventListener('CAPTCHA_RESULT', handler);
+  document.addEventListener('CAPTCHA_RESULT', handler);
 
-  window.dispatchEvent(new CustomEvent('GET_CAPTCHA', {
+  document.dispatchEvent(new CustomEvent('GET_CAPTCHA', {
     detail: { requestId, pageAction },
   }));
 
@@ -189,15 +202,10 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
 // ─── Auto-click "Create with Google Flow" on landing page ───────────────────
 
-const AUTO_CLICK_MAX_MS = 90000;
-const AUTO_CLICK_POLL_MS = 400;
-
-let autoClickObserver = null;
 let autoClickTimer = null;
-let autoClickStartedAt = 0;
 let autoClickDoneForPath = '';
 let autoClickEnabled = true;
-let autoClickSearchingShown = false;
+let mainWorldReady = false;
 
 function isFlowLandingPage() {
   try {
@@ -213,51 +221,67 @@ function currentLandingPathKey() {
   return `${window.location.pathname}${window.location.search}`;
 }
 
+function waitForMainWorldReady(maxMs = 15000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      if (document.documentElement?.dataset?.flow2apiMainReady === '1') {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - start > maxMs) {
+        resolve(false);
+        return;
+      }
+      setTimeout(check, 50);
+    };
+    check();
+  });
+}
+
 function requestMainWorldAutoClick() {
   const requestId = `ac_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
   return new Promise((resolve) => {
     const handler = (e) => {
       if (e.detail?.requestId !== requestId) return;
-      window.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+      document.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
       clearTimeout(timer);
       resolve(e.detail || { clicked: false, reason: 'empty_result' });
     };
     const timer = setTimeout(() => {
-      window.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+      document.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
       resolve({ clicked: false, reason: 'main_world_timeout' });
-    }, 1200);
-    window.addEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
-    window.dispatchEvent(new CustomEvent('FLOW2API_TRY_AUTO_CLICK_CREATE', {
+    }, 3000);
+    document.addEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
+    document.dispatchEvent(new CustomEvent('FLOW2API_TRY_AUTO_CLICK_CREATE', {
       detail: { requestId },
     }));
   });
 }
 
 function stopAutoClickCreateFlow() {
-  if (autoClickObserver) {
-    autoClickObserver.disconnect();
-    autoClickObserver = null;
-  }
+  autoClickPolling = false;
   if (autoClickTimer) {
     clearInterval(autoClickTimer);
     autoClickTimer = null;
   }
 }
 
-async function tryAutoClickCreateFlow() {
-  if (!autoClickEnabled) {
+async function tickAutoClickCreateFlow() {
+  if (!autoClickEnabled || !isFlowLandingPage()) {
     stopAutoClickCreateFlow();
-    return true;
-  }
-  if (!isFlowLandingPage()) {
-    stopAutoClickCreateFlow();
-    return true;
+    return;
   }
 
   const pathKey = currentLandingPathKey();
   if (autoClickDoneForPath === pathKey) {
     stopAutoClickCreateFlow();
-    return true;
+    return;
+  }
+
+  if (!mainWorldReady) {
+    mainWorldReady = await waitForMainWorldReady();
+    if (!mainWorldReady) return;
   }
 
   const result = await requestMainWorldAutoClick();
@@ -265,58 +289,31 @@ async function tryAutoClickCreateFlow() {
     autoClickDoneForPath = pathKey;
     showAutoClickFeedback('success');
     stopAutoClickCreateFlow();
-    return true;
   }
-  return false;
 }
 
 function startAutoClickCreateFlow() {
   if (!autoClickEnabled || !isFlowLandingPage()) return;
-  stopAutoClickCreateFlow();
-  autoClickStartedAt = Date.now();
-  if (!autoClickSearchingShown) {
-    autoClickSearchingShown = true;
-    showAutoClickFeedback('searching');
-  }
+  if (autoClickTimer) return;
 
-  const tick = () => {
-    tryAutoClickCreateFlow().then((done) => {
-      if (done) return;
-      if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) {
-        showAutoClickFeedback('timeout');
-        stopAutoClickCreateFlow();
-      }
-    });
-  };
-
-  tick();
-
-  autoClickObserver = new MutationObserver(tick);
-  autoClickObserver.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
-
-  autoClickTimer = setInterval(tick, AUTO_CLICK_POLL_MS);
+  autoClickPolling = true;
+  showAutoClickFeedback('searching');
+  tickAutoClickCreateFlow();
+  autoClickTimer = setInterval(tickAutoClickCreateFlow, AUTO_CLICK_POLL_MS);
 }
 
 function bootAutoClickCreateFlow() {
   if (!autoClickEnabled) return;
-  // SPA / React: wait for body and late-rendered hero button.
-  const start = () => {
-    startAutoClickCreateFlow();
-    setTimeout(startAutoClickCreateFlow, 1500);
-    setTimeout(startAutoClickCreateFlow, 4000);
-  };
+  const start = () => startAutoClickCreateFlow();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start, { once: true });
   } else {
     start();
   }
-  window.addEventListener('load', start, { once: true });
   window.addEventListener('pageshow', () => {
     autoClickDoneForPath = '';
-    autoClickSearchingShown = false;
+    mainWorldReady = document.documentElement?.dataset?.flow2apiMainReady === '1';
+    stopAutoClickCreateFlow();
     startAutoClickCreateFlow();
   });
 }
@@ -338,7 +335,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     return;
   }
   autoClickDoneForPath = '';
-  autoClickSearchingShown = false;
+  stopAutoClickCreateFlow();
   bootAutoClickCreateFlow();
 });
 

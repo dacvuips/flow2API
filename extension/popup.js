@@ -328,7 +328,6 @@ function renderAutoClickStatus(last) {
   const suffix = sec <= 90 ? '' : ` (${Math.floor(sec / 60)}p trước)`;
   el.textContent = `${last.message}${suffix}`;
   if (last.status === 'success') el.className = 'value token-ready';
-  else if (last.status === 'timeout') el.className = 'value token-missing';
   else el.className = 'value';
 }
 
