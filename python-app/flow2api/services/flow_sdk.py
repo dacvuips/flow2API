@@ -23,6 +23,7 @@ from flow2api.config import (
     GOOGLE_FLOW_API,
     POLL_INTERVAL_S,
     RECAPTCHA_RETRY_MAX,
+    RECAPTCHA_SAME_PROFILE_MAX,
     VIDEOS_DIR,
 )
 from flow2api.services.flow_client import FlowClient
@@ -390,6 +391,7 @@ async def _upload_media_bytes(
     }
     last_err = f"{failure_label}_failed"
     last_resp: dict = {}
+    recaptcha_hits = 0
     for attempt in range(RECAPTCHA_RETRY_MAX):
         resp = await client.api_request(
             _api_url(api_path), body=body, timeout=timeout, raise_on_error=False
@@ -412,17 +414,17 @@ async def _upload_media_bytes(
                     out["duration_seconds"] = data.get("durationSeconds")
             return out
         last_err = error_from_response(resp)
-        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
-            delay = _recaptcha_retry_delay(attempt)
-            logger.warning(
-                "upload reCAPTCHA retry %s/%s: %s — wait %ss",
-                attempt + 1,
-                RECAPTCHA_RETRY_MAX,
-                last_err,
-                delay,
-            )
-            await asyncio.sleep(delay)
+        recaptcha_hits, retried = await _maybe_retry_recaptcha_same_profile(
+            last_err=last_err,
+            recaptcha_hits=recaptcha_hits,
+            attempt=attempt,
+            max_attempts=RECAPTCHA_RETRY_MAX,
+            log_label="upload",
+        )
+        if retried:
             continue
+        if is_recaptcha_error(last_err):
+            break
         if is_upload_image_internal_error(resp) and attempt < RECAPTCHA_RETRY_MAX - 1:
             delay = _recaptcha_retry_delay(attempt)
             logger.warning(
@@ -657,6 +659,7 @@ async def gen_image(
 
     last_err = "image_generation_failed"
     last_resp: dict = {}
+    recaptcha_hits = 0
     for attempt in range(RECAPTCHA_RETRY_MAX):
         ts_try = int(time.time() * 1000) + attempt
         ctx_try = _client_context(project_id, tier, ts_try)
@@ -697,17 +700,17 @@ async def gen_image(
         if status < 400:
             return resp.get("data") or {}
         last_err = error_from_response(resp)
-        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
-            delay = _recaptcha_retry_delay(attempt)
-            logger.warning(
-                "image gen reCAPTCHA retry %s/%s: %s — wait %ss",
-                attempt + 1,
-                RECAPTCHA_RETRY_MAX,
-                last_err,
-                delay,
-            )
-            await asyncio.sleep(delay)
+        recaptcha_hits, retried = await _maybe_retry_recaptcha_same_profile(
+            last_err=last_err,
+            recaptcha_hits=recaptcha_hits,
+            attempt=attempt,
+            max_attempts=RECAPTCHA_RETRY_MAX,
+            log_label="image gen",
+        )
+        if retried:
             continue
+        if is_recaptcha_error(last_err):
+            break
         break
     raise FlowApiError(last_err, step="gen_image", raw=last_resp)
 
@@ -863,6 +866,7 @@ async def upsample_image(
 
     last_err = "upsample_image_failed"
     last_resp: dict = {}
+    recaptcha_hits = 0
     for attempt in range(RECAPTCHA_RETRY_MAX):
         body = {
             "mediaId": media_id,
@@ -885,17 +889,17 @@ async def upsample_image(
                 return parsed
             return {"raw": data} if data else {}
         last_err = error_from_response(resp)
-        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
-            delay = _recaptcha_retry_delay(attempt)
-            logger.warning(
-                "upsample reCAPTCHA retry %s/%s: %s — wait %ss",
-                attempt + 1,
-                RECAPTCHA_RETRY_MAX,
-                last_err,
-                delay,
-            )
-            await asyncio.sleep(delay)
+        recaptcha_hits, retried = await _maybe_retry_recaptcha_same_profile(
+            last_err=last_err,
+            recaptcha_hits=recaptcha_hits,
+            attempt=attempt,
+            max_attempts=RECAPTCHA_RETRY_MAX,
+            log_label="upsample",
+        )
+        if retried:
             continue
+        if is_recaptcha_error(last_err):
+            break
         break
     raise FlowApiError(last_err, step="upsample_image", raw=last_resp)
 
@@ -1009,10 +1013,11 @@ async def upsample_video(
                     attempts=exc.attempts,
                 ) from exc
             retryable = (
-                is_recaptcha_error(msg)
-                or is_transient_flow_error(msg)
+                is_transient_flow_error(msg)
                 or is_invalid_argument_retry_failure(exc, msg)
             )
+            if is_recaptcha_error(msg):
+                raise
             if retryable and attempt < max_attempts - 1:
                 delay = _recaptcha_retry_delay(attempt)
                 logger.warning(
@@ -1593,6 +1598,48 @@ def _recaptcha_retry_delay(attempt: int) -> float:
     return recaptcha_retry_delay(attempt)
 
 
+async def _maybe_retry_recaptcha_same_profile(
+    *,
+    last_err: str,
+    recaptcha_hits: int,
+    attempt: int,
+    max_attempts: int,
+    log_label: str,
+) -> tuple[int, bool]:
+    """Retry reCAPTCHA on same profile up to RECAPTCHA_SAME_PROFILE_MAX - 1 times.
+
+    Returns (updated_hits, retried). On the Nth hit (default 3rd), stop so worker rotates profile.
+    """
+    if not is_recaptcha_error(last_err):
+        return recaptcha_hits, False
+
+    recaptcha_hits += 1
+    if recaptcha_hits >= RECAPTCHA_SAME_PROFILE_MAX:
+        logger.warning(
+            "%s reCAPTCHA hit %s/%s on same profile — switch profile now: %s",
+            log_label,
+            recaptcha_hits,
+            RECAPTCHA_SAME_PROFILE_MAX,
+            last_err,
+        )
+        return recaptcha_hits, False
+
+    if attempt >= max_attempts - 1:
+        return recaptcha_hits, False
+
+    delay = _recaptcha_retry_delay(attempt)
+    logger.warning(
+        "%s reCAPTCHA retry %s/%s on same profile: %s — wait %ss",
+        log_label,
+        recaptcha_hits,
+        RECAPTCHA_SAME_PROFILE_MAX - 1,
+        last_err,
+        delay,
+    )
+    await asyncio.sleep(delay)
+    return recaptcha_hits, True
+
+
 def error_from_response(resp: dict) -> str:
     data = resp.get("data")
     if isinstance(data, dict):
@@ -1678,6 +1725,7 @@ async def _video_submit_request(
     attempts: list[dict] = []
     last_resp: dict = {}
     max_attempts = max(4, RECAPTCHA_RETRY_MAX)
+    recaptcha_hits = 0
     for attempt in range(max_attempts):
         submit_body = _sanitize_video_submit_body(url, body)
         resp = await client.api_request(
@@ -1692,17 +1740,17 @@ async def _video_submit_request(
         status = int(resp.get("status") or 0)
         if status < 400:
             break
-        if is_recaptcha_error(last_err) and attempt < max_attempts - 1:
-            delay = _recaptcha_retry_delay(attempt)
-            logger.warning(
-                "video submit reCAPTCHA retry %s/%s: %s — wait %ss",
-                attempt + 1,
-                max_attempts,
-                last_err,
-                delay,
-            )
-            await asyncio.sleep(delay)
+        recaptcha_hits, retried = await _maybe_retry_recaptcha_same_profile(
+            last_err=last_err,
+            recaptcha_hits=recaptcha_hits,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            log_label="video submit",
+        )
+        if retried:
             continue
+        if is_recaptcha_error(last_err):
+            break
         if is_transient_flow_error(last_err) and attempt < 3:
             delay = min(300, (2**attempt) * 10)
             logger.warning(
