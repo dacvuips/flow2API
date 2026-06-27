@@ -35,5 +35,5 @@ Gợi ý queue:
 ## Lưu ý
 
 - Một task luôn chạy trên **một profile** từ đầu đến cuối (upload + generate + poll)
-- Retry reCAPTCHA giữ nguyên profile + media đã upload (tối đa 10 lần/profile ở SDK; worker requeue tối đa 10 lần, chờ 5–10s, đổi profile mỗi lần requeue)
+- Retry reCAPTCHA giữ nguyên profile + media đã upload (tối đa 10 lần/profile ở SDK; worker requeue tối đa 10 lần, chờ 3–5s, đổi profile mỗi lần requeue)
 - Profile tắt Chrome → task mới chuyển sang profile khác; task đang chạy trên profile đó có thể lỗi
