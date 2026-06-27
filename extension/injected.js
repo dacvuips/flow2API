@@ -82,13 +82,23 @@
     });
   }
 
-  const AUTO_CLICK_BTN = "create with google flow";
+  /** Landing CTA labels (locale variants). */
+  const AUTO_CLICK_BTNS = ["create with google flow", "dự án mới"];
 
   function normalizeBtnText(value) {
     return String(value || "")
       .replace(/\s+/g, " ")
       .trim()
       .toLowerCase();
+  }
+
+  function matchesAutoClickLabel(value) {
+    const text = normalizeBtnText(value);
+    return AUTO_CLICK_BTNS.some((label) => text === label);
+  }
+
+  function haystackMatchesAutoClickLabel(haystack) {
+    return AUTO_CLICK_BTNS.some((label) => haystack.includes(label));
   }
 
   function isVisible(el) {
@@ -106,10 +116,10 @@
   }
 
   function spanLabelMatchesCreateFlow(el) {
-    return normalizeBtnText(el?.textContent) === AUTO_CLICK_BTN;
+    return matchesAutoClickLabel(el?.textContent);
   }
 
-  /** Primary: <button><span>Create with Google Flow</span></button> (Google Flow landing). */
+  /** Primary: landing CTA, e.g. Create with Google Flow / Dự án mới. */
   function findCreateFlowButtonExact(root = document) {
     let found = null;
     walkShadowRoots(root, (scope) => {
@@ -134,8 +144,8 @@
     const aria = normalizeBtnText(el.getAttribute?.("aria-label"));
     const title = normalizeBtnText(el.getAttribute?.("title"));
     const haystack = `${text} ${aria} ${title}`;
-    if (!haystack.includes(AUTO_CLICK_BTN)) return false;
-    if (text.length > 80 && !text.includes(AUTO_CLICK_BTN)) return false;
+    if (!haystackMatchesAutoClickLabel(haystack)) return false;
+    if (text.length > 80 && !AUTO_CLICK_BTNS.some((label) => text.includes(label))) return false;
     return isVisible(el);
   }
 
@@ -152,8 +162,8 @@
     const text = normalizeBtnText(el.textContent);
     let score = text.length;
     if (isClickableTag(el)) score -= 100;
-    if (text === AUTO_CLICK_BTN) score -= 200;
-    if (text.includes(AUTO_CLICK_BTN) && text.length < 40) score -= 50;
+    if (AUTO_CLICK_BTNS.some((label) => text === label)) score -= 200;
+    if (AUTO_CLICK_BTNS.some((label) => text.includes(label) && text.length < 40)) score -= 50;
     return score;
   }
 
