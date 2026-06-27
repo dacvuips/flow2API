@@ -84,8 +84,11 @@ const FLOW_API_HEADER_ALLOWLIST = new Set([
   'x-client-data',
   'x-goog-api-client',
 ]);
-let _pageApiHeaders = {};
+let _pageApiHeadersByTab = new Map();
+let _pageApiHeadersLatest = {};
 let _pageApiHeadersCapturedAt = 0;
+const FLOW_HEADERS_PROBE_WAIT_MS = 4000;
+const FLOW_HEADERS_MAX_AGE_MS = 30 * 60 * 1000;
 
 function headersArrayToMap(requestHeaders) {
   const out = {};
@@ -111,10 +114,7 @@ function isFlowSandboxPageRequest(details) {
   return details.type === 'xmlhttprequest' || details.type === 'other';
 }
 
-function captureFlowApiHeadersFromDetails(details) {
-  if (!isFlowSandboxPageRequest(details)) return;
-  const mapped = headersArrayToMap(details.requestHeaders);
-  const method = String(details.method || '').toUpperCase();
+function mergeSniffedHeadersInto(target, mapped, method) {
   let changed = false;
   for (const [lower, value] of Object.entries(mapped)) {
     if (!value || FLOW_HEADER_SKIP.has(lower)) continue;
@@ -127,38 +127,98 @@ function captureFlowApiHeadersFromDetails(details) {
       || lower === 'content-type'
       || FLOW_API_HEADER_ALLOWLIST.has(lower)
     ) {
-      if (_pageApiHeaders[lower] !== value) {
-        _pageApiHeaders[lower] = value;
+      if (target[lower] !== value) {
+        target[lower] = value;
         changed = true;
       }
     }
   }
-  if (!changed) return;
+  return changed;
+}
+
+function hasUsableApiHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return false;
+  return !!(headers['user-agent'] || headers['sec-ch-ua'] || headers['x-browser-validation']);
+}
+
+function getPageApiHeadersForTab(tabId) {
+  if (tabId != null && tabId >= 0) {
+    const entry = _pageApiHeadersByTab.get(tabId);
+    if (entry?.headers && hasUsableApiHeaders(entry.headers)) {
+      return entry.headers;
+    }
+  }
+  return _pageApiHeadersLatest;
+}
+
+function noteCapturedPageApiHeaders(tabId, mapped, method) {
+  let changed = false;
+  if (tabId != null && tabId >= 0) {
+    const prev = _pageApiHeadersByTab.get(tabId)?.headers || {};
+    const next = { ...prev };
+    if (mergeSniffedHeadersInto(next, mapped, method)) {
+      _pageApiHeadersByTab.set(tabId, { headers: next, capturedAt: Date.now() });
+      changed = true;
+    }
+  }
+  if (mergeSniffedHeadersInto(_pageApiHeadersLatest, mapped, method)) {
+    changed = true;
+  }
+  if (!changed) return false;
   _pageApiHeadersCapturedAt = Date.now();
+  const byTabObj = {};
+  for (const [id, entry] of _pageApiHeadersByTab.entries()) {
+    byTabObj[String(id)] = entry;
+  }
   chrome.storage.session.set({
-    pageApiHeaders: _pageApiHeaders,
+    pageApiHeadersByTab: byTabObj,
+    pageApiHeadersLatest: _pageApiHeadersLatest,
     pageApiHeadersCapturedAt: _pageApiHeadersCapturedAt,
   }).catch(() => {});
-  syncFlowApiHeaderDnrRules().catch(() => {});
+  syncFlowApiHeaderDnrRules(_pageApiHeadersLatest).catch(() => {});
+  return true;
+}
+
+function captureFlowApiHeadersFromDetails(details) {
+  if (!isFlowSandboxPageRequest(details)) return;
+  const mapped = headersArrayToMap(details.requestHeaders);
+  const method = String(details.method || '').toUpperCase();
+  noteCapturedPageApiHeaders(details.tabId, mapped, method);
 }
 
 async function loadCapturedFlowApiHeaders() {
   try {
-    const data = await chrome.storage.session.get(['pageApiHeaders', 'pageApiHeadersCapturedAt']);
-    if (data.pageApiHeaders && typeof data.pageApiHeaders === 'object') {
-      _pageApiHeaders = data.pageApiHeaders;
-      _pageApiHeadersCapturedAt = Number(data.pageApiHeadersCapturedAt) || 0;
-      await syncFlowApiHeaderDnrRules();
+    const data = await chrome.storage.session.get([
+      'pageApiHeadersByTab',
+      'pageApiHeadersLatest',
+      'pageApiHeadersCapturedAt',
+      'pageApiHeaders',
+    ]);
+    if (data.pageApiHeadersByTab && typeof data.pageApiHeadersByTab === 'object') {
+      _pageApiHeadersByTab = new Map();
+      for (const [id, entry] of Object.entries(data.pageApiHeadersByTab)) {
+        const tabId = Number(id);
+        if (!Number.isNaN(tabId) && entry?.headers) {
+          _pageApiHeadersByTab.set(tabId, entry);
+        }
+      }
     }
+    if (data.pageApiHeadersLatest && typeof data.pageApiHeadersLatest === 'object') {
+      _pageApiHeadersLatest = data.pageApiHeadersLatest;
+    } else if (data.pageApiHeaders && typeof data.pageApiHeaders === 'object') {
+      _pageApiHeadersLatest = data.pageApiHeaders;
+    }
+    _pageApiHeadersCapturedAt = Number(data.pageApiHeadersCapturedAt) || 0;
+    await syncFlowApiHeaderDnrRules(_pageApiHeadersLatest);
   } catch {
     /* ignore */
   }
 }
 
-async function syncFlowApiHeaderDnrRules() {
+async function syncFlowApiHeaderDnrRules(headerSource = _pageApiHeadersLatest) {
   const requestHeaders = [];
   for (const [lower, canonical] of FLOW_DNR_HEADER_KEYS) {
-    const value = _pageApiHeaders[lower];
+    const value = headerSource?.[lower];
     if (value) {
       requestHeaders.push({ header: canonical, operation: 'set', value });
     }
@@ -192,24 +252,63 @@ async function pickPrimaryFlowTab() {
   return tabs.find((t) => !t.discarded && (t.id ?? -1) >= 0) || tabs[0] || null;
 }
 
-function resolveFlowReferer(tab) {
-  if (_pageApiHeaders.referer) return _pageApiHeaders.referer;
+/** Sniff aisandbox headers from the same Flow tab used for reCAPTCHA (webRequest). */
+async function ensureFlowApiHeadersFromTab(tabId, reason = 'api_request') {
+  if (tabId == null || tabId < 0) return false;
+  const entry = _pageApiHeadersByTab.get(tabId);
+  const age = entry?.capturedAt ? Date.now() - entry.capturedAt : Infinity;
+  if (hasUsableApiHeaders(entry?.headers) && age < FLOW_HEADERS_MAX_AGE_MS) {
+    await syncFlowApiHeaderDnrRules(entry.headers);
+    return true;
+  }
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.discarded) {
+      await chrome.tabs.reload(tabId);
+      await sleep(2500);
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => fetch('https://aisandbox-pa.googleapis.com/v1/credits', { credentials: 'include' }),
+    });
+    console.log(`[Flow2API] Header sniff triggered on Flow tab ${tabId} (${reason})`);
+  } catch (e) {
+    console.warn('[Flow2API] Header sniff probe failed:', e?.message || e);
+    return hasUsableApiHeaders(entry?.headers);
+  }
+
+  const deadline = Date.now() + FLOW_HEADERS_PROBE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const fresh = _pageApiHeadersByTab.get(tabId);
+    if (hasUsableApiHeaders(fresh?.headers)) {
+      await syncFlowApiHeaderDnrRules(fresh.headers);
+      return true;
+    }
+    await sleep(200);
+  }
+  return hasUsableApiHeaders(entry?.headers) || hasUsableApiHeaders(_pageApiHeadersLatest);
+}
+
+function resolveFlowReferer(tab, headerSource) {
+  if (headerSource?.referer) return headerSource.referer;
   if (tab?.url?.includes('labs.google')) return FLOW_DEFAULT_REFERER;
   return FLOW_DEFAULT_REFERER;
 }
 
 async function buildFlowApiFetchHeaders(agentHeaders = {}, tabHint = null) {
   const tab = tabHint || await pickPrimaryFlowTab();
+  const headerSource = getPageApiHeadersForTab(tab?.id);
   const out = {};
 
-  for (const [lower, value] of Object.entries(_pageApiHeaders)) {
+  for (const [lower, value] of Object.entries(headerSource)) {
     if (!value || FLOW_HEADER_SKIP.has(lower)) continue;
     if (lower === 'content-type') continue;
     out[lower] = value;
   }
 
-  out.referer = resolveFlowReferer(tab);
-  out.origin = _pageApiHeaders.origin || 'https://labs.google';
+  out.referer = resolveFlowReferer(tab, headerSource);
+  out.origin = headerSource.origin || 'https://labs.google';
 
   if (!out.accept) out.accept = '*/*';
   if (!out['accept-language']) out['accept-language'] = 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7';
@@ -228,8 +327,9 @@ async function buildFlowApiFetchHeaders(agentHeaders = {}, tabHint = null) {
   return out;
 }
 
-function applyFlowPostContentType(fetchHeaders) {
-  const captured = _pageApiHeaders['content-type'];
+function applyFlowPostContentType(fetchHeaders, tabId = null) {
+  const headerSource = getPageApiHeadersForTab(tabId);
+  const captured = headerSource['content-type'];
   fetchHeaders['content-type'] = (captured && captured.includes('text/plain'))
     ? captured
     : FLOW_POST_CONTENT_TYPE;
@@ -691,13 +791,17 @@ async function handleApiRequest(msg) {
       }
     }
 
+    if (headerTab?.id) {
+      await ensureFlowApiHeadersFromTab(headerTab.id, captchaAction ? 'post_captcha' : 'api_request');
+    }
+
     const fetchHeaders = await buildFlowApiFetchHeaders(headers, headerTab);
     let requestBody;
     if (method !== 'GET') {
       const isPlainObject = finalBody && typeof finalBody === 'object' && !(finalBody instanceof FormData) && !(finalBody instanceof Blob) && !(finalBody instanceof ArrayBuffer);
       requestBody = isPlainObject ? JSON.stringify(finalBody) : finalBody;
       if (isPlainObject) {
-        applyFlowPostContentType(fetchHeaders);
+        applyFlowPostContentType(fetchHeaders, headerTab?.id ?? null);
       }
     }
 
