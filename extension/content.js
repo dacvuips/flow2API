@@ -207,17 +207,16 @@ let autoClickDoneForPath = '';
 let autoClickEnabled = true;
 let mainWorldReady = false;
 
-function isFlowLandingPage() {
+function isFlowPage() {
   try {
     const path = window.location.pathname || '';
-    if (/\/project\/[0-9a-f-]{36}/i.test(path)) return false;
     return /\/fx(\/|$)/i.test(path) || /\/tools\/flow/i.test(path);
   } catch {
     return true;
   }
 }
 
-function currentLandingPathKey() {
+function currentPageKey() {
   return `${window.location.pathname}${window.location.search}`;
 }
 
@@ -268,12 +267,13 @@ function stopAutoClickCreateFlow() {
 }
 
 async function tickAutoClickCreateFlow() {
-  if (!autoClickEnabled || !isFlowLandingPage()) {
+  if (!autoClickEnabled || !isFlowPage()) {
     stopAutoClickCreateFlow();
+    refreshStatus();
     return;
   }
 
-  const pathKey = currentLandingPathKey();
+  const pathKey = currentPageKey();
   if (autoClickDoneForPath === pathKey) {
     stopAutoClickCreateFlow();
     return;
@@ -293,7 +293,7 @@ async function tickAutoClickCreateFlow() {
 }
 
 function startAutoClickCreateFlow() {
-  if (!autoClickEnabled || !isFlowLandingPage()) return;
+  if (!autoClickEnabled || !isFlowPage()) return;
   if (autoClickTimer) return;
 
   autoClickPolling = true;
@@ -304,12 +304,21 @@ function startAutoClickCreateFlow() {
 
 function bootAutoClickCreateFlow() {
   if (!autoClickEnabled) return;
+  let watchedPathKey = currentPageKey();
   const start = () => startAutoClickCreateFlow();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start, { once: true });
   } else {
     start();
   }
+  setInterval(() => {
+    const key = currentPageKey();
+    if (key === watchedPathKey) return;
+    watchedPathKey = key;
+    autoClickDoneForPath = '';
+    stopAutoClickCreateFlow();
+    startAutoClickCreateFlow();
+  }, 1000);
   window.addEventListener('pageshow', () => {
     autoClickDoneForPath = '';
     mainWorldReady = document.documentElement?.dataset?.flow2apiMainReady === '1';

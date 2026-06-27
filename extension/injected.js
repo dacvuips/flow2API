@@ -114,7 +114,7 @@
     let found = null;
     walkShadowRoots(root, (scope) => {
       if (found) return;
-      scope.querySelectorAll?.("button").forEach((btn) => {
+      scope.querySelectorAll?.("button, [role='button']").forEach((btn) => {
         if (found || !isVisible(btn)) return;
         const spans = btn.querySelectorAll("span");
         for (const span of spans) {
