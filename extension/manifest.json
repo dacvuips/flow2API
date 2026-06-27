@@ -1,7 +1,7 @@
 {
     "manifest_version":  3,
     "name":  "Flow2API Bridge",
-    "version":  "0.0.7",
+    "version":  "0.0.8",
     "description":  "Local bridge that proxies Flow2API agent requests to authenticated labs.google sessions.",
     "permissions":  [
                         "storage",
@@ -35,7 +35,9 @@
                             {
                                 "matches":  [
                                                 "https://labs.google/fx/tools/flow*",
-                                                "https://labs.google/fx/*/tools/flow*"
+                                                "https://labs.google/fx/*/tools/flow*",
+                                                "https://labs.google/fx",
+                                                "https://labs.google/fx/*"
                                             ],
                                 "js":  [
                                            "content.js"

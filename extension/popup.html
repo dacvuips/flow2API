@@ -213,6 +213,49 @@
       cursor: pointer;
     }
 
+    .toggle {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .toggle input {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle-track {
+      width: 42px;
+      height: 24px;
+      border-radius: 999px;
+      background: #cbd5e1;
+      transition: background 0.2s ease;
+      position: relative;
+    }
+    .toggle-thumb {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.18);
+      transition: transform 0.2s ease;
+    }
+    .toggle input:checked + .toggle-track {
+      background: var(--brand-blue);
+    }
+    .toggle input:checked + .toggle-track .toggle-thumb {
+      transform: translateX(18px);
+    }
+    .toggle input:focus-visible + .toggle-track {
+      outline: 2px solid var(--brand-blue);
+      outline-offset: 2px;
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition: none !important; }
     }
@@ -226,7 +269,7 @@
           <h1><span class="logo-flow">Flow</span><span class="logo-api">2API</span></h1>
           <p class="subtitle">Google Flow To API</p>
         </div>
-        <span class="version">v0.0.7</span>
+        <span class="version">v0.0.8</span>
       </div>
     </header>
 
@@ -259,6 +302,13 @@
         <div class="row">
           <span class="label">Máy chủ</span>
           <span class="value">127.0.0.1:1609</span>
+        </div>
+        <div class="row">
+          <span class="label">Auto Create Flow</span>
+          <label class="toggle" title="Tự click &quot;Create with Google Flow&quot; khi mở trang landing">
+            <input type="checkbox" id="auto-click-create" checked />
+            <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          </label>
         </div>
       </section>
 
@@ -320,7 +370,7 @@
           <span class="label">giây</span>
         </div>
 
-        <p class="hint" id="clear-hint">Tự bật khi mở Chrome: clear domain tab Flow mỗi <strong>300s (5 phút)</strong>.</p>
+        <p class="hint" id="clear-hint">Tự bật khi mở Chrome: clear chỉ domain <strong>https://labs.google/</strong> mỗi <strong>300s (5 phút)</strong>.</p>
 
         <div class="actions">
           <button type="button" class="btn btn-primary" id="btn-clear-start">▶ BẮT ĐẦU</button>

@@ -121,6 +121,10 @@ async function init() {
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
   ensureFreshFlowToken('startup');
   await chrome.storage.local.set({ f2apiClearUserStopped: false });
+  const prefs = await chrome.storage.local.get(['autoClickCreateFlow']);
+  if (prefs.autoClickCreateFlow === undefined) {
+    await chrome.storage.local.set({ autoClickCreateFlow: true });
+  }
   await initClearFromStorage();
   await ensureAutoClearStarted();
 }
@@ -993,6 +997,7 @@ function broadcastStatus() {
 
 const CLEAR_ALARM = 'f2api-auto-clear';
 const AUTO_CLEAR_INTERVAL_SEC = 300;
+const CLEAR_DATA_ORIGIN = 'https://labs.google';
 
 const DEFAULT_CLEAR_STATE = {
   running: false,
@@ -1029,6 +1034,30 @@ function canReloadTab(tab) {
 
 function getOriginFromUrl(url) {
   return new URL(url).origin;
+}
+
+function isLabsGoogleUrl(url) {
+  try {
+    return new URL(String(url || '')).hostname === 'labs.google';
+  } catch {
+    return false;
+  }
+}
+
+function isLabsGoogleTab(tab) {
+  return !!tab && isLabsGoogleUrl(tab.url);
+}
+
+async function resolveClearTargetTab(tabId) {
+  if (tabId) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (isLabsGoogleTab(tab) && canReloadTab(tab)) return tab;
+    } catch {
+      /* fall through */
+    }
+  }
+  return findFlowTabForClear();
 }
 
 function browsingDataRemove(origins, options) {
@@ -1080,7 +1109,7 @@ async function ensureAutoClearStarted() {
     if (clearState.running && clearState.tabId) {
       try {
         const tab = await chrome.tabs.get(clearState.tabId);
-        if (canReloadTab(tab)) {
+        if (canReloadTab(tab) && isLabsGoogleTab(tab)) {
           clearState.intervalSec = AUTO_CLEAR_INTERVAL_SEC;
           await scheduleClearAlarm();
           await saveClearState();
@@ -1194,11 +1223,11 @@ async function sanitizeClearState() {
 
   try {
     const tab = await chrome.tabs.get(clearState.tabId);
-    if (!canReloadTab(tab)) {
+    if (!canReloadTab(tab) || !isLabsGoogleTab(tab)) {
       await stopAutoClear();
       return;
     }
-    clearState.origin = getOriginFromUrl(tab.url);
+    clearState.origin = CLEAR_DATA_ORIGIN;
   } catch {
     await stopAutoClear();
     return;
@@ -1215,11 +1244,11 @@ async function sanitizeClearState() {
 async function clearSiteDataAndReload(tabId) {
   const tab = await chrome.tabs.get(tabId);
   if (!canReloadTab(tab)) throw new Error('invalid_tab');
+  if (!isLabsGoogleUrl(tab.url)) throw new Error('not_labs_google');
 
-  const origin = getOriginFromUrl(tab.url);
-  await browsingDataRemove([origin], BROWSING_DATA_REMOVE_OPTS);
+  await browsingDataRemove([CLEAR_DATA_ORIGIN], BROWSING_DATA_REMOVE_OPTS);
   await chrome.tabs.reload(tabId);
-  return origin;
+  return CLEAR_DATA_ORIGIN;
 }
 
 async function performClearTick() {
@@ -1246,14 +1275,28 @@ async function stopAutoClear() {
 }
 
 async function startAutoClear(intervalSec, tabId) {
-  const tab = await resolveTargetTab(tabId);
-  if (!tab?.id || !canReloadTab(tab)) {
-    return { ok: false, error: 'invalid_tab', url: tab?.url || '' };
+  let tab = await resolveClearTargetTab(tabId);
+  if (!tab?.id) {
+    try {
+      await openFlowTabResilient(false);
+      await sleep(2500);
+      tab = await findFlowTabForClear();
+    } catch {
+      tab = null;
+    }
+  }
+  if (!tab?.id || !canReloadTab(tab) || !isLabsGoogleTab(tab)) {
+    return {
+      ok: false,
+      error: 'not_labs_google',
+      message: 'Clear Data chỉ áp dụng trên https://labs.google/ — mở tab Flow trước.',
+      url: tab?.url || '',
+    };
   }
 
   clearState.intervalSec = clampClearSec(intervalSec);
   clearState.tabId = tab.id;
-  clearState.origin = getOriginFromUrl(tab.url);
+  clearState.origin = CLEAR_DATA_ORIGIN;
   clearState.running = true;
 
   try {
@@ -1365,6 +1408,21 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     ensureFreshFlowToken('popup', true)
       .then((ok) => reply({ ok }))
       .catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'GET_AUTO_CLICK_CREATE') {
+    chrome.storage.local.get(['autoClickCreateFlow']).then((data) => {
+      reply({ enabled: data.autoClickCreateFlow !== false });
+    });
+    return true;
+  }
+
+  if (msg.type === 'SET_AUTO_CLICK_CREATE') {
+    const enabled = msg.enabled !== false;
+    chrome.storage.local.set({ autoClickCreateFlow: enabled }).then(() => {
+      reply({ ok: true, enabled });
+    });
     return true;
   }
 

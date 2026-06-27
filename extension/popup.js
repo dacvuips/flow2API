@@ -200,17 +200,28 @@ async function refreshClearState() {
   const hint = $('clear-hint');
   if (!hint) return;
   try {
-    if (tab?.url && (tab.url.startsWith('http://') || tab.url.startsWith('https://'))) {
-      const host = new URL(tab.url).hostname;
-      hint.innerHTML = `Sẽ xóa dữ liệu của <strong>${host}</strong> (cookies, cache, storage…) rồi reload.`;
+    if (tab?.url && isLabsGoogleUrl(tab.url)) {
+      hint.innerHTML = 'Chỉ xóa dữ liệu <strong>https://labs.google/</strong> (cookies, cache, storage…) rồi reload tab Flow.';
       hint.className = 'hint ok';
+    } else if (tab?.url && (tab.url.startsWith('http://') || tab.url.startsWith('https://'))) {
+      const host = new URL(tab.url).hostname;
+      hint.innerHTML = `Tab hiện tại (<strong>${host}</strong>) không phải labs.google — auto clear sẽ dùng tab Flow trên <strong>labs.google</strong>.`;
+      hint.className = 'hint';
     } else {
-      hint.textContent = 'Mở tab http/https rồi bấm BẮT ĐẦU.';
+      hint.textContent = 'Mở tab https://labs.google/fx/tools/flow (hoặc để extension tự mở).';
       hint.className = 'hint err';
     }
   } catch {
-    hint.textContent = 'Mở tab http/https rồi bấm BẮT ĐẦU.';
+    hint.textContent = 'Mở tab https://labs.google/fx/tools/flow (hoặc để extension tự mở).';
     hint.className = 'hint err';
+  }
+}
+
+function isLabsGoogleUrl(url) {
+  try {
+    return new URL(String(url || '')).hostname === 'labs.google';
+  } catch {
+    return false;
   }
 }
 
@@ -263,7 +274,7 @@ $('btn-clear-start').addEventListener('click', async () => {
     if (!res.ok) {
       const urlHint = tab?.url ? `\n\nTab: ${tab.url}` : '';
       const msg = res.message ? `\n\n${res.message}` : '';
-      alert(`Không bắt đầu được.\nMở tab http/https và cấp quyền browsingData.${urlHint}${msg}`);
+      alert(`Không bắt đầu được.\nCần tab trên https://labs.google/${urlHint}${msg}`);
       return;
     }
     started = true;
@@ -298,7 +309,18 @@ chrome.storage.local.get('f2apiActiveTab').then((data) => {
   if (data.f2apiActiveTab === 'clear') switchTab('clear');
 });
 
+async function loadAutoClickSetting() {
+  const res = await send('GET_AUTO_CLICK_CREATE');
+  const input = $('auto-click-create');
+  if (input) input.checked = res?.enabled !== false;
+}
+
+$('auto-click-create')?.addEventListener('change', async (e) => {
+  await send('SET_AUTO_CLICK_CREATE', { enabled: e.target.checked });
+});
+
 fetchStatus();
+loadAutoClickSetting();
 setInterval(fetchStatus, 1500);
 resetClearStartButton(false);
 refreshClearState();

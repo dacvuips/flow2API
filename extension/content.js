@@ -165,4 +165,130 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   return true; // keep channel open for async reply
 });
 
+// ─── Auto-click "Create with Google Flow" on landing page ───────────────────
+
+const AUTO_CLICK_BTN = 'create with google flow';
+const AUTO_CLICK_SESSION_KEY = 'flow2apiAutoCreateClicked';
+const AUTO_CLICK_MAX_MS = 60000;
+
+let autoClickObserver = null;
+let autoClickTimer = null;
+let autoClickStartedAt = 0;
+
+function isFlowLandingPage() {
+  try {
+    const path = window.location.pathname || '';
+    if (/\/project\/[0-9a-f-]{36}/i.test(path)) return false;
+    return path.includes('/fx') || path.includes('/tools/flow');
+  } catch {
+    return true;
+  }
+}
+
+function normalizeBtnText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function findCreateFlowButton() {
+  const selectors = 'button, a, [role="button"], input[type="button"], input[type="submit"]';
+  for (const el of document.querySelectorAll(selectors)) {
+    const text = normalizeBtnText(el.textContent);
+    const aria = normalizeBtnText(el.getAttribute('aria-label'));
+    const title = normalizeBtnText(el.getAttribute('title'));
+    const haystack = `${text} ${aria} ${title}`;
+    if (!haystack.includes(AUTO_CLICK_BTN)) continue;
+    const rect = el.getClientRects();
+    if (!rect.length) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') continue;
+    return el;
+  }
+  return null;
+}
+
+function triggerCreateFlowClick(el) {
+  try {
+    el.focus({ preventScroll: true });
+  } catch {
+    /* ignore */
+  }
+  el.click();
+  el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+}
+
+function stopAutoClickCreateFlow() {
+  if (autoClickObserver) {
+    autoClickObserver.disconnect();
+    autoClickObserver = null;
+  }
+  if (autoClickTimer) {
+    clearInterval(autoClickTimer);
+    autoClickTimer = null;
+  }
+}
+
+function tryAutoClickCreateFlow() {
+  if (!isFlowLandingPage()) {
+    stopAutoClickCreateFlow();
+    return true;
+  }
+  if (sessionStorage.getItem(AUTO_CLICK_SESSION_KEY) === '1') {
+    stopAutoClickCreateFlow();
+    return true;
+  }
+  const btn = findCreateFlowButton();
+  if (!btn) return false;
+  sessionStorage.setItem(AUTO_CLICK_SESSION_KEY, '1');
+  triggerCreateFlowClick(btn);
+  console.log('[Flow2API] Auto-clicked "Create with Google Flow"');
+  stopAutoClickCreateFlow();
+  return true;
+}
+
+function startAutoClickCreateFlow() {
+  if (!isFlowLandingPage()) return;
+  stopAutoClickCreateFlow();
+  autoClickStartedAt = Date.now();
+
+  if (tryAutoClickCreateFlow()) return;
+
+  autoClickObserver = new MutationObserver(() => {
+    if (tryAutoClickCreateFlow()) return;
+    if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) stopAutoClickCreateFlow();
+  });
+  autoClickObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  autoClickTimer = setInterval(() => {
+    if (tryAutoClickCreateFlow()) return;
+    if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) stopAutoClickCreateFlow();
+  }, 500);
+}
+
+function initAutoClickCreateFlow() {
+  chrome.storage.local.get(['autoClickCreateFlow'], (data) => {
+    if (chrome.runtime.lastError) return;
+    if (data.autoClickCreateFlow === false) return;
+    const boot = () => startAutoClickCreateFlow();
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot, { once: true });
+    } else {
+      boot();
+    }
+  });
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.autoClickCreateFlow) return;
+  if (changes.autoClickCreateFlow.newValue === false) {
+    stopAutoClickCreateFlow();
+    return;
+  }
+  sessionStorage.removeItem(AUTO_CLICK_SESSION_KEY);
+  startAutoClickCreateFlow();
+});
+
+initAutoClickCreateFlow();
 
