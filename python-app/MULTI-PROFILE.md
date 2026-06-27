@@ -35,7 +35,5 @@ Gợi ý queue:
 ## Lưu ý
 
 - Một task luôn chạy trên **một profile** từ đầu đến cuối (upload + generate + poll)
-- Retry reCAPTCHA: tối đa 2 lần trên cùng profile (SDK), lần 3 **đổi profile** — lặp đổi profile **đến khi thành công** (không giới hạn số lần ở worker)
-- Upsample video/ảnh: retry reCAPTCHA **chỉ trên profile gốc**, cũng **không giới hạn** số lần requeue
-- Extension: reload tab Flow trước mỗi lần giải captcha sau N lần (mặc định N=1) để token reCAPTCHA luôn mới
+- Retry reCAPTCHA giữ nguyên profile + media đã upload (tối đa 10 lần/profile ở SDK; worker requeue tối đa 10 lần, chờ 5–10s, đổi profile mỗi lần requeue)
 - Profile tắt Chrome → task mới chuyển sang profile khác; task đang chạy trên profile đó có thể lỗi
