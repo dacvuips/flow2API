@@ -313,10 +313,33 @@ async function loadAutoClickSetting() {
   const res = await send('GET_AUTO_CLICK_CREATE');
   const input = $('auto-click-create');
   if (input) input.checked = res?.enabled !== false;
+  renderAutoClickStatus(res?.last);
+}
+
+function renderAutoClickStatus(last) {
+  const el = $('auto-click-status');
+  if (!el) return;
+  if (!last?.message) {
+    el.textContent = '—';
+    el.className = 'value';
+    return;
+  }
+  const sec = Math.max(0, Math.floor((Date.now() - (last.at || 0)) / 1000));
+  const suffix = sec <= 90 ? '' : ` (${Math.floor(sec / 60)}p trước)`;
+  el.textContent = `${last.message}${suffix}`;
+  if (last.status === 'success') el.className = 'value token-ready';
+  else if (last.status === 'timeout') el.className = 'value token-missing';
+  else el.className = 'value';
 }
 
 $('auto-click-create')?.addEventListener('change', async (e) => {
   await send('SET_AUTO_CLICK_CREATE', { enabled: e.target.checked });
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.autoClickLastStatus) {
+    renderAutoClickStatus(changes.autoClickLastStatus.newValue);
+  }
 });
 
 fetchStatus();

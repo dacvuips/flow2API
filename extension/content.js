@@ -34,6 +34,7 @@ let statusRoot = null;
 let statusText = null;
 let statusDot = null;
 let statusTimer = null;
+let autoClickFeedbackUntil = 0;
 
 function ensureStatusPopup() {
   if (statusRoot) return;
@@ -103,12 +104,33 @@ function ensureStatusPopup() {
 }
 
 function renderStatus(status) {
+  if (Date.now() < autoClickFeedbackUntil) return;
   ensureStatusPopup();
   const current = status?.manualDisconnect || !status?.connected ? 'off' : (status.state || 'idle');
   const state = current === 'running' ? 'running' : (current === 'idle' ? 'idle' : 'off');
   statusDot.textContent = STATUS_ICONS[state];
   statusDot.style.color = STATUS_COLORS[state];
   statusText.textContent = STATUS_LABELS[state];
+}
+
+function showAutoClickFeedback(kind) {
+  ensureStatusPopup();
+  const configs = {
+    searching: { icon: '…', color: '#f5b301', text: 'Đang click Create Flow…' },
+    success: { icon: '✓', color: '#22c55e', text: 'Đã click Create Flow' },
+    timeout: { icon: '!', color: '#d97706', text: 'Chưa thấy nút Create' },
+  };
+  const cfg = configs[kind];
+  if (!cfg) return;
+  statusDot.textContent = cfg.icon;
+  statusDot.style.color = cfg.color;
+  statusText.textContent = cfg.text;
+  const holdMs = kind === 'searching' ? 4000 : 10000;
+  autoClickFeedbackUntil = Date.now() + holdMs;
+  chrome.storage.local.set({
+    autoClickLastStatus: { status: kind, message: cfg.text, at: Date.now() },
+  });
+  chrome.runtime.sendMessage({ type: 'AUTO_CLICK_STATUS', status: kind, message: cfg.text }).catch(() => {});
 }
 
 function refreshStatus() {
@@ -175,6 +197,7 @@ let autoClickTimer = null;
 let autoClickStartedAt = 0;
 let autoClickDoneForPath = '';
 let autoClickEnabled = true;
+let autoClickSearchingShown = false;
 
 function isFlowLandingPage() {
   try {
@@ -240,7 +263,7 @@ async function tryAutoClickCreateFlow() {
   const result = await requestMainWorldAutoClick();
   if (result.clicked) {
     autoClickDoneForPath = pathKey;
-    console.log('[Flow2API] Auto-clicked "Create with Google Flow"', result);
+    showAutoClickFeedback('success');
     stopAutoClickCreateFlow();
     return true;
   }
@@ -251,12 +274,16 @@ function startAutoClickCreateFlow() {
   if (!autoClickEnabled || !isFlowLandingPage()) return;
   stopAutoClickCreateFlow();
   autoClickStartedAt = Date.now();
+  if (!autoClickSearchingShown) {
+    autoClickSearchingShown = true;
+    showAutoClickFeedback('searching');
+  }
 
   const tick = () => {
     tryAutoClickCreateFlow().then((done) => {
       if (done) return;
       if (Date.now() - autoClickStartedAt > AUTO_CLICK_MAX_MS) {
-        console.warn('[Flow2API] Auto-click gave up after timeout');
+        showAutoClickFeedback('timeout');
         stopAutoClickCreateFlow();
       }
     });
@@ -289,6 +316,7 @@ function bootAutoClickCreateFlow() {
   window.addEventListener('load', start, { once: true });
   window.addEventListener('pageshow', () => {
     autoClickDoneForPath = '';
+    autoClickSearchingShown = false;
     startAutoClickCreateFlow();
   });
 }
@@ -310,6 +338,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     return;
   }
   autoClickDoneForPath = '';
+  autoClickSearchingShown = false;
   bootAutoClickCreateFlow();
 });
 

@@ -1412,10 +1412,33 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'GET_AUTO_CLICK_CREATE') {
-    chrome.storage.local.get(['autoClickCreateFlow']).then((data) => {
-      reply({ enabled: data.autoClickCreateFlow !== false });
+    chrome.storage.local.get(['autoClickCreateFlow', 'autoClickLastStatus']).then((data) => {
+      reply({
+        enabled: data.autoClickCreateFlow !== false,
+        last: data.autoClickLastStatus || null,
+      });
     });
     return true;
+  }
+
+  if (msg.type === 'AUTO_CLICK_STATUS') {
+    const payload = {
+      status: msg.status || '',
+      message: msg.message || '',
+      at: Date.now(),
+    };
+    chrome.storage.local.set({ autoClickLastStatus: payload }).then(() => {
+      if (msg.status === 'success') {
+        chrome.action.setBadgeText({ text: '✓' });
+        chrome.action.setBadgeBackgroundColor({ color: '#16a34a' });
+        setTimeout(() => chrome.action.setBadgeText({ text: '' }), 8000);
+      } else if (msg.status === 'timeout') {
+        chrome.action.setBadgeText({ text: '!' });
+        chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
+        setTimeout(() => chrome.action.setBadgeText({ text: '' }), 8000);
+      }
+    });
+    return false;
   }
 
   if (msg.type === 'SET_AUTO_CLICK_CREATE') {
