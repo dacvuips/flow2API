@@ -28,8 +28,8 @@ let metrics = {
 
 const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
 
-// reCAPTCHA on Flow tab: first solve after page load is OK; later solves need a fresh
-// grecaptcha session (same as manual F5). Track per-tab solve count in the SW.
+// Reload Flow tab before captcha when tab already solved N times (fresh grecaptcha session).
+const CAPTCHA_RELOAD_EVERY_N_SOLVES = 1;
 const _captchaSolvesByTab = new Map();
 let _captchaChain = Promise.resolve();
 
@@ -714,8 +714,12 @@ function runCaptchaExclusive(fn) {
 /** grecaptcha.enterprise session is effectively one-shot per page load on Flow. */
 async function prepareFlowTabForCaptcha(tabId) {
   const prev = _captchaSolvesByTab.get(tabId) || 0;
-  if (prev >= 1) {
-    console.log('[Flow2API] Refreshing Flow tab to reset reCAPTCHA session (solve #%s)', prev + 1);
+  if (prev >= CAPTCHA_RELOAD_EVERY_N_SOLVES) {
+    console.log(
+      '[Flow2API] Refreshing Flow tab to reset reCAPTCHA session (solve #%s, reload every %s)',
+      prev + 1,
+      CAPTCHA_RELOAD_EVERY_N_SOLVES,
+    );
     try {
       const tab = await chrome.tabs.get(tabId);
       const currentUrl = tab?.url || '';

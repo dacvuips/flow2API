@@ -131,12 +131,18 @@ def profile_available_for_queue(
     return bool(pick_profile_for_task(None, credit_required=credit_required))
 
 
+_UPSAMPLE_REQUEST_TYPES = frozenset({"upsample_video", "upsample_image"})
+
+
 def apply_retry_profile_rotation(
     params: dict[str, Any],
     request_type: str | None = None,
 ) -> dict[str, Any]:
     """Advance retry to the next profile in ring order (idle first; same profile after full cycle)."""
     out = dict(params or {})
+    if request_type in _UPSAMPLE_REQUEST_TYPES:
+        out.pop("retry_exclude_profile_id", None)
+        return out
     current = str(
         out.get("profile_id") or out.get("retry_exclude_profile_id") or ""
     ).strip()

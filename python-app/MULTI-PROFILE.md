@@ -35,5 +35,7 @@ Gợi ý queue:
 ## Lưu ý
 
 - Một task luôn chạy trên **một profile** từ đầu đến cuối (upload + generate + poll)
-- Retry reCAPTCHA giữ nguyên profile + media đã upload
+- Retry reCAPTCHA: tối đa 2 lần trên cùng profile, lần thứ 3 chuyển profile rảnh ngay (`FLOW2API_RECAPTCHA_SAME_PROFILE_MAX=3`, worker requeue không chờ)
+- Upsample video/ảnh: retry reCAPTCHA **chỉ trên profile gốc** (profile đã tạo media), không đổi profile
+- Extension: reload tab Flow trước mỗi lần giải captcha sau N lần (mặc định N=1) để token reCAPTCHA luôn mới
 - Profile tắt Chrome → task mới chuyển sang profile khác; task đang chạy trên profile đó có thể lỗi
