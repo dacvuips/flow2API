@@ -410,13 +410,24 @@ async function init() {
   // extensions on the profile that hold the `storage` permission.
   // The agent replays user_info on every WS reconnect anyway via
   // fetchAndPushUserInfo(token), so persistence buys nothing.
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'profileId']);
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'profileId', 'systemPaused', 'flowUrl']);
   if (data.flowKey)        flowKey        = data.flowKey;
   if (data.metrics)        Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  systemPaused = data.systemPaused === true;
   profileId = data.profileId || await getOrCreateProfileId();
   await loadCapturedFlowApiHeaders();
   connectToAgent();
+  try {
+    const flowTabs = await chrome.tabs.query({ url: flowUrls });
+    if (!flowTabs.length) {
+      const url = data.flowUrl || FLOW_URL;
+      await openFlowTabResilient(false);
+      console.log('[Flow2API] Auto-open Flow on startup:', url);
+    }
+  } catch (e) {
+    console.warn('[Flow2API] Auto-open Flow failed:', e?.message || e);
+  }
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
   ensureFreshFlowToken('startup');
@@ -592,6 +603,21 @@ function connectToAgent() {
         } else {
           console.log('[Flow2API] please_resend_userinfo: no token captured yet');
         }
+      } else if (msg.type === 'system_pause') {
+        systemPaused = true;
+        chrome.storage.local.set({ systemPaused: true });
+        console.log('[Flow2API] System paused by agent');
+      } else if (msg.type === 'system_resume') {
+        systemPaused = false;
+        chrome.storage.local.set({ systemPaused: false });
+        console.log('[Flow2API] System resumed by agent');
+      } else if (msg.type === 'system_force_refresh') {
+        refreshAllFlowTabs().catch((e) => console.warn('[Flow2API] force refresh failed', e));
+      } else if (msg.type === 'system_set_proxy') {
+        applyProxyConfig(msg.proxyUrl || '');
+        chrome.storage.local.set({ proxyUrl: msg.proxyUrl || '' });
+      } else if (msg.type === 'system_push_config') {
+        applySystemPushConfig(msg.config);
       } else if (msg.method === 'api_request') {
         await handleApiRequest(msg);
       } else if (msg.method === 'trpc_request') {
@@ -722,6 +748,14 @@ async function handleApiRequest(msg) {
   });
 
   try {
+    if (systemPaused) {
+      sendToAgent({ id, status: 503, error: 'SYSTEM_PAUSED' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'SYSTEM_PAUSED'; }
+      chrome.storage.local.set({ metrics });
+      updateRequestLog(id, { status: 'failed', error: 'SYSTEM_PAUSED' });
+      setState('idle');
+      return;
+    }
     // Step 0: Fail fast if we have no bearer token. Avoids burning a reCAPTCHA
     // solve (rate-limited + single-use) only to discover later that we can't
     // send the request.
@@ -859,7 +893,74 @@ let _openingFlowTab = false;
 let _lastFlowWatchdogReloadAt = 0;
 let _flowWatchdogRunning = false;
 
-const FLOW_URL = 'https://labs.google/fx/tools/flow';
+const FLOW_URL = 'https://labs.google/fx/vi/tools/flow';
+let systemPaused = false;
+let proxyAuthCredentials = null;
+
+function proxyAuthHandler(details) {
+  if (details.isProxy && proxyAuthCredentials) {
+    return { authCredentials: proxyAuthCredentials };
+  }
+}
+
+function applyProxyConfig(proxyUrl) {
+  if (!proxyUrl) {
+    chrome.proxy.settings.clear({ scope: 'regular' });
+    if (chrome.webRequest?.onAuthRequired?.hasListener?.(proxyAuthHandler)) {
+      chrome.webRequest.onAuthRequired.removeListener(proxyAuthHandler);
+    }
+    proxyAuthCredentials = null;
+    return;
+  }
+  const parts = String(proxyUrl).split(':');
+  const host = parts[0];
+  const port = parseInt(parts[1], 10) || 80;
+  const username = parts[2] || null;
+  const password = parts[3] || null;
+  chrome.proxy.settings.set({
+    value: {
+      mode: 'fixed_servers',
+      rules: {
+        singleProxy: { scheme: 'http', host, port },
+        bypassList: ['localhost', '127.0.0.1'],
+      },
+    },
+    scope: 'regular',
+  });
+  if (chrome.webRequest?.onAuthRequired?.hasListener?.(proxyAuthHandler)) {
+    chrome.webRequest.onAuthRequired.removeListener(proxyAuthHandler);
+  }
+  if (username && password) {
+    proxyAuthCredentials = { username, password };
+    chrome.webRequest.onAuthRequired.addListener(
+      proxyAuthHandler,
+      { urls: ['<all_urls>'] },
+      ['blocking'],
+    );
+  }
+}
+
+async function refreshAllFlowTabs() {
+  const tabs = await chrome.tabs.query({
+    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*', 'https://labs.google/fx', 'https://labs.google/fx/*'],
+  });
+  for (const tab of tabs) {
+    if (tab.id != null) {
+      try { await chrome.tabs.reload(tab.id); } catch { /* ignore */ }
+    }
+  }
+}
+
+async function applySystemPushConfig(config) {
+  if (!config || typeof config !== 'object') return;
+  if (typeof config.systemPaused === 'boolean') {
+    systemPaused = config.systemPaused;
+    await chrome.storage.local.set({ systemPaused });
+  }
+  if (config.flowUrl) {
+    await chrome.storage.local.set({ flowUrl: config.flowUrl });
+  }
+}
 
 function noteProjectId(projectId) {
   const id = String(projectId || '').trim();

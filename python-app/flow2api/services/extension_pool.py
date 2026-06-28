@@ -392,6 +392,9 @@ class ExtensionPool:
     def ready_sessions(self) -> list[ExtensionSession]:
         return [s for s in self._sessions.values() if s.is_ready()]
 
+    def list_sessions(self) -> list[ExtensionSession]:
+        return [s for s in self._sessions.values() if not s.profile_id.startswith("_")]
+
     def any_connected(self) -> bool:
         return any(s.connected for s in self._sessions.values())
 
@@ -434,6 +437,12 @@ class ExtensionPool:
             session.attach_ws(ws)
             self._ws_to_profile[id(ws)] = pid
         await session.send_json({"type": "callback_secret", "secret": self.callback_secret})
+        from flow2api.services.system_ops import _extension_push_config
+
+        try:
+            await session.send_json({"type": "system_push_config", "config": _extension_push_config()})
+        except Exception:
+            pass
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})
         append_request_log(
             None,

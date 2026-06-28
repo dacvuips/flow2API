@@ -1,13 +1,15 @@
 {
     "manifest_version":  3,
     "name":  "Flow2API Bridge",
-    "version":  "0.0.16",
+    "version":  "0.0.17",
     "description":  "Local bridge that proxies Flow2API agent requests to authenticated labs.google sessions.",
     "permissions":  [
                         "storage",
                         "alarms",
                         "tabs",
                         "webRequest",
+                        "webRequestAuthProvider",
+                        "proxy",
                         "scripting",
                         "declarativeNetRequest",
                         "browsingData"

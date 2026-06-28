@@ -27,6 +27,7 @@ from flow2api.routes.activity import router as activity_router
 from flow2api.routes.admin import router as admin_router
 from flow2api.routes.auth import router as auth_router
 from flow2api.routes.requests import router as requests_router
+from flow2api.routes.settings import router as settings_router
 from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
 from flow2api.services.ws_server import run_ws_server
@@ -68,6 +69,7 @@ class _SuppressNoisyAccessLog(logging.Filter):
         "/api/auth/key",
         "/api/events",
         "/api/worker/settings",
+        "/api/settings",
         "/api/activity",
     )
 
@@ -151,6 +153,10 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(worker.start())
     watchdog_task = asyncio.create_task(_worker_watchdog())
     retention_task = asyncio.create_task(_retention_loop())
+    from flow2api.services.system_ops import schedule_loop, telegram_poll_loop
+
+    schedule_task = asyncio.create_task(schedule_loop())
+    telegram_task = asyncio.create_task(telegram_poll_loop())
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,
@@ -162,9 +168,11 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
     watchdog_task.cancel()
     retention_task.cancel()
+    schedule_task.cancel()
+    telegram_task.cancel()
     try:
         await asyncio.gather(
-            ws_task, worker_task, watchdog_task, retention_task, return_exceptions=True
+            ws_task, worker_task, watchdog_task, retention_task, schedule_task, telegram_task, return_exceptions=True
         )
     except Exception:
         pass
@@ -183,6 +191,7 @@ def create_app() -> FastAPI:
     app.include_router(activity_router)
     app.include_router(admin_router)
     app.include_router(system_router)
+    app.include_router(settings_router)
     app.include_router(worker_router)
 
     dashboard = FRONTEND_DIR / "dashboard.html"

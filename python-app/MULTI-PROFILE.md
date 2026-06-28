@@ -36,4 +36,6 @@ Gợi ý queue:
 
 - Một task luôn chạy trên **một profile** từ đầu đến cuối (upload + generate + poll)
 - Retry reCAPTCHA giữ nguyên profile + media đã upload (tối đa 10 lần/profile ở SDK; worker requeue tối đa 10 lần, chờ 3–5s, đổi profile mỗi lần requeue)
+- **Settings** tab trên Dashboard: scheduler, Telegram, proxy pool, điều khiển hệ thống (Resume/Pause/F5/Launch/Close Chrome), khởi động cùng Windows
+- Flow URL mặc định: `https://labs.google/fx/vi/tools/flow`
 - Profile tắt Chrome → task mới chuyển sang profile khác; task đang chạy trên profile đó có thể lỗi

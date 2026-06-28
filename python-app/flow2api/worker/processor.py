@@ -533,6 +533,10 @@ class WorkerController:
                 await asyncio.sleep(0.25)
 
     async def _scheduler_tick(self) -> int:
+        from flow2api.services.system_ops import is_system_dispatch_allowed
+
+        if not is_system_dispatch_allowed():
+            return 0
         self._prune_running()
         self._expire_stale_running()
         settings = get_worker_settings()
