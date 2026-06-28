@@ -165,6 +165,14 @@ class ExtensionSession:
         }
         if captcha_action:
             params["captchaAction"] = captcha_action
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                f"Đang giải reCAPTCHA ({captcha_action})",
+                level="info",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
         resp = await self._send("api_request", params, timeout=timeout)
         if "aisandbox-pa.googleapis.com" in url:
             record_api_call(self.trace_request_id, url, method, body, resp)

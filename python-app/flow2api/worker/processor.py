@@ -648,13 +648,21 @@ class WorkerController:
                 retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
                 retry_params["retry_not_before"] = time.time() + delay_s
                 retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "reCAPTCHA retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    recaptcha_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                append_request_log(
+                    rid,
+                    "worker",
+                    (
+                        f"reCAPTCHA retry {recaptcha_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                        f"— chờ {delay_s:.1f}s"
+                    ),
+                    level="warn",
+                    profile_id=str(
+                        retry_params.get("profile_id")
+                        or retry_params.get("retry_exclude_profile_id")
+                        or ""
+                    )
+                    or None,
+                    profile_email=str(retry_params.get("profile_email") or "") or None,
                 )
                 return
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)

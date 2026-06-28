@@ -56,6 +56,35 @@ class _SuppressAsyncioClientDisconnect(logging.Filter):
 
 logging.getLogger("asyncio").addFilter(_SuppressAsyncioClientDisconnect())
 
+
+class _SuppressNoisyAccessLog(logging.Filter):
+    """Hide dashboard polling from CMD (health, auth scan, task list, …)."""
+
+    _QUIET_PATHS = (
+        "/api/health",
+        "/api/auth/scan",
+        "/api/auth/me",
+        "/api/auth/accounts",
+        "/api/auth/key",
+        "/api/events",
+        "/api/worker/settings",
+        "/api/activity",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage() or ""
+        for path in self._QUIET_PATHS:
+            if path in msg:
+                return False
+        if '"GET /api/requests/' in msg or '"GET /api/activity/' in msg:
+            return False
+        if '"GET /api/requests HTTP/1.1"' in msg:
+            return False
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressNoisyAccessLog())
+
 logger = logging.getLogger(__name__)
 
 
