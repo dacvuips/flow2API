@@ -28,7 +28,6 @@ _telegram_offset = 0
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "flow_url": _FLOW_URL_DEFAULT,
-    "system_paused": False,
     "telegram": {
         "bot_token": "",
         "chat_id": "",
@@ -65,7 +64,7 @@ def load_config() -> dict[str, Any]:
 def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     _ensure_storage()
     current = load_config()
-    for key in ("flow_url", "system_paused", "windows_autostart", "proxy_pool"):
+    for key in ("flow_url", "windows_autostart", "proxy_pool"):
         if key in cfg:
             current[key] = cfg[key]
     if isinstance(cfg.get("telegram"), dict):
@@ -75,10 +74,6 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return current
 
 
-def is_system_dispatch_allowed() -> bool:
-    return not bool(load_config().get("system_paused"))
-
-
 def public_config() -> dict[str, Any]:
     cfg = load_config()
     tg = dict(cfg.get("telegram") or {})
@@ -86,7 +81,6 @@ def public_config() -> dict[str, Any]:
         tg["bot_token"] = tg["bot_token"][:8] + "…"
     return {
         "flow_url": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
-        "system_paused": bool(cfg.get("system_paused")),
         "telegram": tg,
         "proxy_pool": list(cfg.get("proxy_pool") or []),
         "windows_autostart": bool(cfg.get("windows_autostart")),
@@ -223,11 +217,6 @@ def get_windows_autostart() -> dict[str, Any]:
     }
 
 
-def set_system_paused(paused: bool) -> dict[str, Any]:
-    save_config({"system_paused": paused})
-    return {"ok": True, "system_paused": paused}
-
-
 def parse_proxy_pool(text: str) -> list[str]:
     lines = []
     for line in (text or "").splitlines():
@@ -248,19 +237,6 @@ async def broadcast_system(payload: dict) -> None:
     from flow2api.services.extension_pool import get_extension_pool
 
     await get_extension_pool().broadcast(payload)
-
-
-async def resume_all() -> dict[str, Any]:
-    set_system_paused(False)
-    await broadcast_system({"type": "system_resume"})
-    await broadcast_system({"type": "system_push_config", "config": _extension_push_config()})
-    return {"ok": True, "message": "Đã Resume — tiếp tục giải captcha / worker"}
-
-
-async def pause_all() -> dict[str, Any]:
-    set_system_paused(True)
-    await broadcast_system({"type": "system_pause"})
-    return {"ok": True, "message": "Đã Pause toàn bộ"}
 
 
 async def force_refresh_all() -> dict[str, Any]:
@@ -288,7 +264,6 @@ async def push_proxy_to_extensions() -> None:
 def _extension_push_config() -> dict[str, Any]:
     cfg = load_config()
     return {
-        "systemPaused": bool(cfg.get("system_paused")),
         "flowUrl": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
     }
 
@@ -337,16 +312,7 @@ async def _handle_telegram_command(text: str) -> None:
 
         pool = get_extension_pool()
         online = sum(1 for s in pool.list_sessions() if s.is_ready())
-        cfg = load_config()
-        telegram_send(
-            f"Flow2API\nOnline profiles: {online}\nPaused: {cfg.get('system_paused')}\nDispatch: {is_system_dispatch_allowed()}"
-        )
-    elif cmd in ("/pause",):
-        await pause_all()
-        telegram_send("⏸ Đã pause hệ thống")
-    elif cmd in ("/resume",):
-        await resume_all()
-        telegram_send("▶️ Đã resume hệ thống")
+        telegram_send(f"Flow2API\nOnline profiles: {online}")
     elif cmd in ("/launch",):
         r = launch_all_profiles()
         telegram_send(r.get("message") or "launch")

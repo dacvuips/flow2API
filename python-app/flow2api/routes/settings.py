@@ -71,16 +71,6 @@ async def list_profiles():
     return {"profiles": system_ops.list_chrome_profiles()}
 
 
-@router.post("/system/resume")
-async def system_resume():
-    return await system_ops.resume_all()
-
-
-@router.post("/system/pause")
-async def system_pause():
-    return await system_ops.pause_all()
-
-
 @router.post("/system/force-refresh")
 async def system_force_refresh():
     return await system_ops.force_refresh_all()
