@@ -153,9 +153,8 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(worker.start())
     watchdog_task = asyncio.create_task(_worker_watchdog())
     retention_task = asyncio.create_task(_retention_loop())
-    from flow2api.services.system_ops import schedule_loop, telegram_poll_loop
+    from flow2api.services.system_ops import telegram_poll_loop
 
-    schedule_task = asyncio.create_task(schedule_loop())
     telegram_task = asyncio.create_task(telegram_poll_loop())
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
@@ -168,11 +167,10 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
     watchdog_task.cancel()
     retention_task.cancel()
-    schedule_task.cancel()
     telegram_task.cancel()
     try:
         await asyncio.gather(
-            ws_task, worker_task, watchdog_task, retention_task, schedule_task, telegram_task, return_exceptions=True
+            ws_task, worker_task, watchdog_task, retention_task, telegram_task, return_exceptions=True
         )
     except Exception:
         pass

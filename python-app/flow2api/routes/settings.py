@@ -1,23 +1,14 @@
-"""Dashboard settings: scheduler, Telegram, proxy, system control."""
+"""Dashboard settings: Telegram, proxy, system control."""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from flow2api.services import system_ops
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
-
-
-class ScheduleBody(BaseModel):
-    enabled: bool | None = None
-    start_hour: int | None = Field(None, ge=0, le=23)
-    start_minute: int | None = Field(None, ge=0, le=59)
-    end_hour: int | None = Field(None, ge=0, le=23)
-    end_minute: int | None = Field(None, ge=0, le=59)
-    days_of_week: list[int] | None = None
 
 
 class TelegramBody(BaseModel):
@@ -37,16 +28,6 @@ class AutostartBody(BaseModel):
 @router.get("/config")
 async def get_config():
     return system_ops.public_config()
-
-
-@router.post("/schedule")
-async def save_schedule(body: ScheduleBody):
-    cfg = system_ops.load_config()
-    sched = dict(cfg.get("schedule") or {})
-    data = body.model_dump(exclude_none=True)
-    sched.update(data)
-    saved = system_ops.save_config({"schedule": sched})
-    return {"ok": True, "schedule": saved.get("schedule"), "dispatch_allowed": system_ops.is_system_dispatch_allowed()}
 
 
 @router.post("/telegram")

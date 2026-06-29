@@ -1,4 +1,4 @@
-"""Windows ops: autostart, Chrome profiles, scheduler pause, Telegram, proxy pool."""
+"""Windows ops: autostart, Chrome profiles, Telegram, proxy pool."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +8,6 @@ import os
 import subprocess
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -26,19 +25,10 @@ _STARTUP_BAT_NAME = "Flow2API-Autostart.bat"
 
 _LOCK = threading.Lock()
 _telegram_offset = 0
-_schedule_was_active = True
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "flow_url": _FLOW_URL_DEFAULT,
     "system_paused": False,
-    "schedule": {
-        "enabled": False,
-        "start_hour": 7,
-        "start_minute": 0,
-        "end_hour": 23,
-        "end_minute": 0,
-        "days_of_week": [0, 1, 2, 3, 4, 5, 6],
-    },
     "telegram": {
         "bot_token": "",
         "chat_id": "",
@@ -64,8 +54,6 @@ def load_config() -> dict[str, Any]:
             out = json.loads(json.dumps(DEFAULT_CONFIG))
             if isinstance(raw, dict):
                 out.update({k: v for k, v in raw.items() if k in DEFAULT_CONFIG})
-                if isinstance(raw.get("schedule"), dict):
-                    out["schedule"] = {**out["schedule"], **raw["schedule"]}
                 if isinstance(raw.get("telegram"), dict):
                     out["telegram"] = {**out["telegram"], **raw["telegram"]}
             return out
@@ -80,8 +68,6 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     for key in ("flow_url", "system_paused", "windows_autostart", "proxy_pool"):
         if key in cfg:
             current[key] = cfg[key]
-    if isinstance(cfg.get("schedule"), dict):
-        current["schedule"] = {**current.get("schedule", {}), **cfg["schedule"]}
     if isinstance(cfg.get("telegram"), dict):
         current["telegram"] = {**current.get("telegram", {}), **cfg["telegram"]}
     with _LOCK:
@@ -89,35 +75,8 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return current
 
 
-def _minutes_now() -> int:
-    now = datetime.now()
-    return now.hour * 60 + now.minute
-
-
-def is_within_schedule(cfg: dict[str, Any] | None = None) -> bool:
-    cfg = cfg or load_config()
-    sched = cfg.get("schedule") or {}
-    if not sched.get("enabled"):
-        return True
-    day = datetime.now().weekday()
-    # Python weekday: Mon=0 … Sun=6 — map to UI CN=0 … T7=6
-    ui_day = (day + 1) % 7
-    days = sched.get("days_of_week") or list(range(7))
-    if ui_day not in days:
-        return False
-    start = int(sched.get("start_hour", 7)) * 60 + int(sched.get("start_minute", 0))
-    end = int(sched.get("end_hour", 23)) * 60 + int(sched.get("end_minute", 0))
-    now_m = _minutes_now()
-    if start <= end:
-        return start <= now_m < end
-    return now_m >= start or now_m < end
-
-
 def is_system_dispatch_allowed() -> bool:
-    cfg = load_config()
-    if cfg.get("system_paused"):
-        return False
-    return is_within_schedule(cfg)
+    return not bool(load_config().get("system_paused"))
 
 
 def public_config() -> dict[str, Any]:
@@ -128,11 +87,9 @@ def public_config() -> dict[str, Any]:
     return {
         "flow_url": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
         "system_paused": bool(cfg.get("system_paused")),
-        "schedule": cfg.get("schedule") or DEFAULT_CONFIG["schedule"],
         "telegram": tg,
         "proxy_pool": list(cfg.get("proxy_pool") or []),
         "windows_autostart": bool(cfg.get("windows_autostart")),
-        "dispatch_allowed": is_system_dispatch_allowed(),
         "autostart_installed": _startup_bat_path().is_file(),
     }
 
@@ -419,25 +376,3 @@ async def telegram_poll_loop() -> None:
         except Exception as exc:
             logger.debug("telegram poll: %s", exc)
         await asyncio.sleep(3)
-
-
-async def schedule_loop() -> None:
-    global _schedule_was_active
-    while True:
-        try:
-            cfg = load_config()
-            sched = cfg.get("schedule") or {}
-            if sched.get("enabled"):
-                active = is_within_schedule(cfg)
-                if _schedule_was_active and not active:
-                    logger.info("Scheduler: hết giờ → pause")
-                    await pause_all()
-                    telegram_send("⏸ Scheduler: tự động pause (hết giờ)")
-                elif not _schedule_was_active and active:
-                    logger.info("Scheduler: vào giờ → resume")
-                    await resume_all()
-                    telegram_send("▶️ Scheduler: tự động resume (vào giờ)")
-                _schedule_was_active = active
-        except Exception as exc:
-            logger.warning("schedule loop: %s", exc)
-        await asyncio.sleep(60)
