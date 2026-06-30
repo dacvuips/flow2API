@@ -5,7 +5,7 @@ import time
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from flow2api.services import system_ops
@@ -104,6 +104,21 @@ async def set_proxy_rotate(body: ProxyRotateBody):
         "proxy_rotate_enabled": bool(saved.get("proxy_rotate_enabled")),
         "proxy_rotate_interval_min": pub["proxy_rotate_interval_min"],
         "message": msg,
+    }
+
+
+@router.post("/proxy/rotate-now")
+async def rotate_proxy_now():
+    from flow2api.services import events
+    from flow2api.services.extension_pool import get_extension_pool
+
+    result = await system_ops.rotate_proxies_now()
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message") or result.get("error"))
+    events.publish("profile_proxy_changed", {"manual": True})
+    return {
+        **result,
+        "profiles": get_extension_pool().list_public(),
     }
 
 

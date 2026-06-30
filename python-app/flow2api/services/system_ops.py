@@ -264,6 +264,15 @@ def is_profile_proxy_attach_enabled(profile_id: str, cfg: dict[str, Any] | None 
     return pid not in _profile_proxy_disabled_list(cfg)
 
 
+def is_profile_proxy_pool_eligible(profile_id: str, cfg: dict[str, Any] | None = None) -> bool:
+    """Profile nhận slot proxy từ pool khi bật gắn IP và đang nhận phân bổ job."""
+    if not is_profile_proxy_attach_enabled(profile_id, cfg):
+        return False
+    from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+    return is_profile_dispatch_enabled(profile_id)
+
+
 async def set_profile_proxy_attach_enabled(profile_id: str, enabled: bool) -> dict[str, Any]:
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
@@ -275,11 +284,7 @@ async def set_profile_proxy_attach_enabled(profile_id: str, enabled: bool) -> di
     elif pid not in disabled:
         disabled.append(pid)
     save_config({"profile_proxy_disabled": disabled})
-    from flow2api.services.extension_pool import get_extension_pool
-
-    session = get_extension_pool().get(pid)
-    if session:
-        await push_proxy_to_session(session)
+    await push_proxy_to_extensions()
     return {
         "profile_id": pid,
         "proxy_attach_enabled": is_profile_proxy_attach_enabled(pid),
@@ -308,7 +313,7 @@ def format_proxy_public(proxy_url: str) -> dict[str, Any]:
 
 def proxy_url_for_profile_id(profile_id: str) -> str:
     cfg = load_config()
-    if not is_profile_proxy_attach_enabled(profile_id, cfg):
+    if not is_profile_proxy_pool_eligible(profile_id, cfg):
         return ""
     return _proxy_url_for_index(cfg, _profile_proxy_index(profile_id))
 
@@ -423,16 +428,48 @@ async def maybe_rotate_proxies() -> bool:
         return False
     if now - last_at < interval_s:
         return False
+    await _apply_proxy_rotation(cfg, now)
+    return True
+
+
+async def rotate_proxies_now() -> dict[str, Any]:
+    cfg = load_config()
+    if not is_proxy_pool_enabled(cfg):
+        return {
+            "ok": False,
+            "error": "proxy_pool_disabled",
+            "message": "Bật gắn proxy vào profile trước",
+        }
+    pool = cfg.get("proxy_pool") or []
+    if len(pool) < 2:
+        return {
+            "ok": False,
+            "error": "need_proxies",
+            "message": "Cần ít nhất 2 proxy trong pool để xoay IP",
+        }
+    now = time.time()
+    new_offset = await _apply_proxy_rotation(cfg, now)
+    pub = public_config()
+    return {
+        "ok": True,
+        "message": f"Đã xoay IP ngay (lần {new_offset})",
+        "proxy_rotate_offset": new_offset,
+        "proxy_rotate_status": pub.get("proxy_rotate_status"),
+    }
+
+
+async def _apply_proxy_rotation(cfg: dict[str, Any], now: float) -> int:
     new_offset = int(cfg.get("proxy_rotate_offset") or 0) + 1
     save_config({"proxy_rotate_offset": new_offset, "proxy_rotate_last_at": now})
     await push_proxy_to_extensions()
+    pool = cfg.get("proxy_pool") or []
     logger.info(
-        "proxy rotated offset=%s interval=%sm profiles=%s",
+        "proxy rotated offset=%s interval=%sm pool=%s",
         new_offset,
         int(cfg.get("proxy_rotate_interval_min") or 30),
         len(pool),
     )
-    return True
+    return new_offset
 
 
 async def proxy_rotate_loop() -> None:
@@ -453,7 +490,8 @@ def _profile_proxy_index(profile_id: str) -> int:
             continue
         if session.profile_id == profile_id:
             return idx
-        idx += 1
+        if is_profile_proxy_pool_eligible(session.profile_id):
+            idx += 1
     return 0
 
 
@@ -470,7 +508,7 @@ async def force_refresh_all() -> dict[str, Any]:
 
 async def push_proxy_to_session(session: Any, profile_index: int | None = None) -> None:
     cfg = load_config()
-    if not is_profile_proxy_attach_enabled(session.profile_id, cfg):
+    if not is_profile_proxy_pool_eligible(session.profile_id, cfg):
         proxy_url = ""
     else:
         idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
@@ -489,8 +527,11 @@ async def push_proxy_to_extensions() -> None:
     for session in get_extension_pool().list_sessions():
         if session.profile_id.startswith("_"):
             continue
-        await push_proxy_to_session(session, idx)
-        idx += 1
+        if is_profile_proxy_pool_eligible(session.profile_id):
+            await push_proxy_to_session(session, idx)
+            idx += 1
+        else:
+            await push_proxy_to_session(session)
 
 
 def _extension_push_config() -> dict[str, Any]:

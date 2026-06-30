@@ -332,6 +332,8 @@ class ExtensionSession:
             get_profile_max_concurrent,
             is_profile_credit_allowed,
             is_profile_dispatch_enabled,
+            is_profile_image_allowed,
+            is_profile_video_allowed,
         )
         token_age = None
         if self.token_captured_at:
@@ -343,13 +345,19 @@ class ExtensionSession:
         from flow2api.services.system_ops import (
             format_proxy_public,
             is_profile_proxy_attach_enabled,
+            is_profile_proxy_pool_eligible,
             is_proxy_pool_enabled,
             proxy_url_for_profile_id,
         )
 
         pool_on = is_proxy_pool_enabled()
         attach_on = is_profile_proxy_attach_enabled(self.profile_id)
-        proxy_raw = (self.applied_proxy_url or proxy_url_for_profile_id(self.profile_id)) if attach_on else ""
+        pool_eligible = is_profile_proxy_pool_eligible(self.profile_id)
+        proxy_raw = (
+            (self.applied_proxy_url or proxy_url_for_profile_id(self.profile_id))
+            if pool_eligible
+            else ""
+        )
         proxy_fields = format_proxy_public(proxy_raw)
         return {
             "profile_id": self.profile_id,
@@ -360,6 +368,8 @@ class ExtensionSession:
             "ready": self.is_ready(),
             "dispatch_enabled": dispatch_enabled,
             "credit_allowed": credit_allowed,
+            "image_allowed": is_profile_image_allowed(self.profile_id),
+            "video_allowed": is_profile_video_allowed(self.profile_id),
             "flow_key_present": bool(self.flow_key),
             "token_age_s": token_age,
             "paygate_tier": self.paygate_tier,
@@ -459,7 +469,12 @@ class ExtensionPool:
         except Exception:
             pass
         from flow2api.services.system_ops import push_proxy_to_session
+        from flow2api.services.worker_settings import ensure_profile_media_on_connect
 
+        try:
+            ensure_profile_media_on_connect(pid)
+        except Exception:
+            pass
         try:
             await push_proxy_to_session(session)
         except Exception:
@@ -528,7 +543,9 @@ class ExtensionPool:
         *,
         exclude: Optional[set[str]] = None,
         credit_required: bool = False,
+        request_type: str | None = None,
     ) -> list[ExtensionSession]:
+        from flow2api.services.flow_client import profile_accepts_request_type
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -540,6 +557,8 @@ class ExtensionPool:
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
                 continue
+            if not profile_accepts_request_type(session.profile_id, request_type):
+                continue
             if not self._profile_matches_credit_pool(session.profile_id, credit_required):
                 continue
             limit = get_profile_max_concurrent(session.profile_id)
@@ -547,19 +566,43 @@ class ExtensionPool:
                 out.append(session)
         return out
 
-    def has_available_profile(self, *, credit_required: bool = False) -> bool:
-        return bool(self._sessions_with_capacity(credit_required=credit_required))
+    def has_available_profile(
+        self,
+        *,
+        credit_required: bool = False,
+        request_type: str | None = None,
+    ) -> bool:
+        return bool(
+            self._sessions_with_capacity(
+                credit_required=credit_required,
+                request_type=request_type,
+            )
+        )
 
     def pick_round_robin(
         self,
         *,
         exclude: Optional[set[str]] = None,
         credit_required: bool = False,
+        request_type: str | None = None,
     ) -> Optional[str]:
-        ready = self._sessions_with_capacity(exclude=exclude, credit_required=credit_required)
+        from flow2api.services.flow_client import profile_media_pick_priority
+
+        ready = self._sessions_with_capacity(
+            exclude=exclude,
+            credit_required=credit_required,
+            request_type=request_type,
+        )
         if not ready:
             return None
-        ready.sort(key=lambda s: (s.active_jobs, s.assigned_total, s.profile_id))
+        ready.sort(
+            key=lambda s: (
+                profile_media_pick_priority(s.profile_id, request_type),
+                s.active_jobs,
+                s.assigned_total,
+                s.profile_id,
+            )
+        )
         pick = ready[self._rr_index % len(ready)]
         self._rr_index = (self._rr_index + 1) % len(ready)
         pick.assigned_total += 1
@@ -570,8 +613,13 @@ class ExtensionPool:
         current_profile_id: str,
         *,
         credit_required: bool = False,
+        request_type: str | None = None,
     ) -> Optional[str]:
         """Next profile in stable ring order; idle first; *current* only after full cycle."""
+        from flow2api.services.flow_client import (
+            profile_accepts_request_type,
+            profile_media_pick_priority,
+        )
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -584,6 +632,8 @@ class ExtensionPool:
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
                 continue
+            if not profile_accepts_request_type(session.profile_id, request_type):
+                continue
             if not self._profile_matches_credit_pool(session.profile_id, credit_required):
                 continue
             limit = get_profile_max_concurrent(session.profile_id)
@@ -592,7 +642,12 @@ class ExtensionPool:
         if not eligible:
             return None
 
-        eligible.sort(key=lambda s: s.profile_id)
+        eligible.sort(
+            key=lambda s: (
+                profile_media_pick_priority(s.profile_id, request_type),
+                s.profile_id,
+            )
+        )
         ids = [s.profile_id for s in eligible]
         by_id = {s.profile_id: s for s in eligible}
 
@@ -601,7 +656,6 @@ class ExtensionPool:
             return (idle[0] if idle else eligible[0]).profile_id
 
         start = ids.index(current)
-        # Offsets 1..n: walk the list in order; offset n returns to *current*.
         for offset in range(1, len(ids) + 1):
             pid = ids[(start + offset) % len(ids)]
             if by_id[pid].active_jobs == 0:

@@ -57,6 +57,66 @@ def unbind_task_profile() -> None:
 
 _OMNI_VIDEO_TYPES = frozenset({"gen_text_video", "gen_image_video"})
 
+_IMAGE_REQUEST_TYPES = frozenset({"gen_image", "upsample_image"})
+_VIDEO_REQUEST_TYPES = frozenset({
+    "gen_text_video",
+    "gen_image_video",
+    "gen_video",
+    "gen_video_start_end",
+    "gen_multi_image_video",
+    "upsample_video",
+})
+
+
+def request_media_kind(request_type: str | None) -> str | None:
+    rtype = str(request_type or "").lower().strip()
+    if rtype in _IMAGE_REQUEST_TYPES:
+        return "image"
+    if rtype in _VIDEO_REQUEST_TYPES:
+        return "video"
+    return None
+
+
+def profile_accepts_request_type(profile_id: str, request_type: str | None) -> bool:
+    from flow2api.services.worker_settings import (
+        is_profile_image_allowed,
+        is_profile_video_allowed,
+    )
+
+    kind = request_media_kind(request_type)
+    if kind == "image":
+        return is_profile_image_allowed(profile_id)
+    if kind == "video":
+        return is_profile_video_allowed(profile_id)
+    return is_profile_image_allowed(profile_id) or is_profile_video_allowed(profile_id)
+
+
+def profile_media_pick_priority(profile_id: str, request_type: str | None) -> int:
+    """0 = chỉ Image/Video, 1 = cả hai, 2 = không nhận loại này."""
+    from flow2api.services.worker_settings import (
+        is_profile_image_allowed,
+        is_profile_video_allowed,
+    )
+
+    img = is_profile_image_allowed(profile_id)
+    vid = is_profile_video_allowed(profile_id)
+    kind = request_media_kind(request_type)
+    if kind == "image":
+        if img and not vid:
+            return 0
+        if img and vid:
+            return 1
+        return 2
+    if kind == "video":
+        if vid and not img:
+            return 0
+        if vid and img:
+            return 1
+        return 2
+    if img or vid:
+        return 1
+    return 2
+
 
 def request_requires_credit_profile(
     params: dict[str, Any],
@@ -81,6 +141,7 @@ def pick_profile_for_task(
     existing_profile_id: Optional[str] = None,
     *,
     credit_required: bool = False,
+    request_type: str | None = None,
 ) -> Optional[str]:
     from flow2api.services.worker_settings import (
         get_profile_max_concurrent,
@@ -90,24 +151,30 @@ def pick_profile_for_task(
     pool = get_extension_pool()
     if existing_profile_id:
         pid = str(existing_profile_id).strip()
-        if is_profile_dispatch_enabled(pid) and _profile_matches_credit_pool(pid, credit_required):
+        if (
+            is_profile_dispatch_enabled(pid)
+            and _profile_matches_credit_pool(pid, credit_required)
+            and profile_accepts_request_type(pid, request_type)
+        ):
             session = pool.get(pid)
             if session and session.is_ready():
                 limit = get_profile_max_concurrent(pid)
                 if session.active_jobs < limit:
                     return pid
         return None
-    return pool.pick_round_robin(credit_required=credit_required)
+    return pool.pick_round_robin(credit_required=credit_required, request_type=request_type)
 
 
 def pick_profile_for_retry(
     current_profile_id: str,
     *,
     credit_required: bool = False,
+    request_type: str | None = None,
 ) -> Optional[str]:
     return get_extension_pool().pick_profile_for_retry(
         current_profile_id,
         credit_required=credit_required,
+        request_type=request_type,
     )
 
 
@@ -146,17 +213,39 @@ def profile_available_for_queue(
     if params.get("profile_assigned_by_user") and pid:
         if not is_profile_dispatch_enabled(str(pid)):
             return False
-        return bool(pick_profile_for_task(str(pid), credit_required=credit_required))
+        return bool(
+            pick_profile_for_task(
+                str(pid),
+                credit_required=credit_required,
+                request_type=request_type,
+            )
+        )
     if pid and not is_profile_dispatch_enabled(str(pid)):
-        return bool(pick_profile_for_task(None, credit_required=credit_required))
+        return bool(
+            pick_profile_for_task(None, credit_required=credit_required, request_type=request_type)
+        )
     if pid:
-        if pick_profile_for_task(str(pid), credit_required=credit_required):
+        if pick_profile_for_task(
+            str(pid),
+            credit_required=credit_required,
+            request_type=request_type,
+        ):
             return True
-        return bool(pick_profile_for_task(None, credit_required=credit_required))
+        return bool(
+            pick_profile_for_task(None, credit_required=credit_required, request_type=request_type)
+        )
     exclude = params.get("retry_exclude_profile_id")
     if exclude:
-        return bool(pick_profile_for_retry(str(exclude), credit_required=credit_required))
-    return bool(pick_profile_for_task(None, credit_required=credit_required))
+        return bool(
+            pick_profile_for_retry(
+                str(exclude),
+                credit_required=credit_required,
+                request_type=request_type,
+            )
+        )
+    return bool(
+        pick_profile_for_task(None, credit_required=credit_required, request_type=request_type)
+    )
 
 
 def apply_retry_profile_rotation(
@@ -174,7 +263,11 @@ def apply_retry_profile_rotation(
 
     pool = get_extension_pool()
     credit_required = request_requires_credit_profile(out, request_type)
-    next_id = pool.pick_profile_for_retry(current, credit_required=credit_required)
+    next_id = pool.pick_profile_for_retry(
+        current,
+        credit_required=credit_required,
+        request_type=request_type,
+    )
 
     if not next_id:
         out.pop("profile_id", None)

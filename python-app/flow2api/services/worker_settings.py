@@ -24,6 +24,8 @@ class WorkerSettings:
     profile_limits: dict[str, int] = field(default_factory=dict)
     profile_dispatch_disabled: list[str] = field(default_factory=list)
     profile_credit_allowed: list[str] = field(default_factory=list)
+    profile_image_allowed: list[str] = field(default_factory=list)
+    profile_video_allowed: list[str] = field(default_factory=list)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -45,6 +47,16 @@ class WorkerSettings:
             for pid in self.profile_credit_allowed:
                 if pid and not str(pid).startswith("_"):
                     credit_allowed.append(str(pid))
+        image_allowed: list[str] = []
+        if isinstance(self.profile_image_allowed, list):
+            for pid in self.profile_image_allowed:
+                if pid and not str(pid).startswith("_"):
+                    image_allowed.append(str(pid))
+        video_allowed: list[str] = []
+        if isinstance(self.profile_video_allowed, list):
+            for pid in self.profile_video_allowed:
+                if pid and not str(pid).startswith("_"):
+                    video_allowed.append(str(pid))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -52,6 +64,8 @@ class WorkerSettings:
             profile_limits=limits,
             profile_dispatch_disabled=sorted(set(disabled)),
             profile_credit_allowed=sorted(set(credit_allowed)),
+            profile_image_allowed=sorted(set(image_allowed)),
+            profile_video_allowed=sorted(set(video_allowed)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,6 +77,8 @@ class WorkerSettings:
             "profile_limits": dict(n.profile_limits),
             "profile_dispatch_disabled": list(n.profile_dispatch_disabled),
             "profile_credit_allowed": list(n.profile_credit_allowed),
+            "profile_image_allowed": list(n.profile_image_allowed),
+            "profile_video_allowed": list(n.profile_video_allowed),
         }
 
 
@@ -102,6 +118,12 @@ def _load_file() -> WorkerSettings | None:
     credit_allowed = raw.get("profile_credit_allowed") or []
     if not isinstance(credit_allowed, list):
         credit_allowed = []
+    image_allowed = raw.get("profile_image_allowed") or []
+    if not isinstance(image_allowed, list):
+        image_allowed = []
+    video_allowed = raw.get("profile_video_allowed") or []
+    if not isinstance(video_allowed, list):
+        video_allowed = []
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
@@ -109,6 +131,8 @@ def _load_file() -> WorkerSettings | None:
         profile_limits={str(k): int(v) for k, v in limits.items()},
         profile_dispatch_disabled=[str(x) for x in disabled],
         profile_credit_allowed=[str(x) for x in credit_allowed],
+        profile_image_allowed=[str(x) for x in image_allowed],
+        profile_video_allowed=[str(x) for x in video_allowed],
     ).normalized()
 
 
@@ -210,9 +234,140 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                     for x in raw_credit
                     if x and not str(x).startswith("_")
                 ]
+        if "profile_image_allowed" in fields:
+            raw_image = fields["profile_image_allowed"]
+            if isinstance(raw_image, list):
+                data["profile_image_allowed"] = [
+                    str(x)
+                    for x in raw_image
+                    if x and not str(x).startswith("_")
+                ]
+        if "profile_video_allowed" in fields:
+            raw_video = fields["profile_video_allowed"]
+            if isinstance(raw_video, list):
+                data["profile_video_allowed"] = [
+                    str(x)
+                    for x in raw_video
+                    if x and not str(x).startswith("_")
+                ]
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)
 
 
 def save_profile_limit(profile_id: str, max_concurrent: int) -> WorkerSettings:
     return save_worker_settings(profile_limits={str(profile_id): int(max_concurrent)})
+
+
+def is_profile_image_allowed(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_image_allowed
+
+
+def is_profile_video_allowed(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_video_allowed
+
+
+def set_profile_media_allowed(
+    profile_id: str,
+    *,
+    image: bool | None = None,
+    video: bool | None = None,
+) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    image_ids = [x for x in current.profile_image_allowed if x != pid]
+    video_ids = [x for x in current.profile_video_allowed if x != pid]
+    if image is True:
+        image_ids.append(pid)
+    elif image is None and pid in current.profile_image_allowed:
+        image_ids.append(pid)
+    if video is True:
+        video_ids.append(pid)
+    elif video is None and pid in current.profile_video_allowed:
+        video_ids.append(pid)
+    return save_worker_settings(
+        profile_image_allowed=sorted(set(image_ids)),
+        profile_video_allowed=sorted(set(video_ids)),
+    )
+
+
+def all_known_profile_ids() -> list[str]:
+    settings = get_worker_settings()
+    ids: set[str] = set()
+    ids.update(settings.profile_limits.keys())
+    ids.update(settings.profile_image_allowed)
+    ids.update(settings.profile_video_allowed)
+    ids.update(settings.profile_dispatch_disabled)
+    ids.update(settings.profile_credit_allowed)
+    try:
+        from flow2api.services.extension_pool import get_extension_pool
+
+        for session in get_extension_pool().list_sessions():
+            pid = str(session.profile_id or "").strip()
+            if pid and not pid.startswith("_"):
+                ids.add(pid)
+    except Exception:
+        pass
+    return sorted(ids)
+
+
+def seed_profile_media_alternating(profile_ids: list[str] | None = None) -> WorkerSettings:
+    """Xen kẽ Image / Video theo thứ tự profile (0=Image, 1=Video, …)."""
+    pids = sorted(
+        {
+            str(p).strip()
+            for p in (profile_ids if profile_ids is not None else all_known_profile_ids())
+            if p and not str(p).startswith("_")
+        }
+    )
+    if not pids:
+        return get_worker_settings()
+    image_allowed: list[str] = []
+    video_allowed: list[str] = []
+    for idx, pid in enumerate(pids):
+        if idx % 2 == 0:
+            image_allowed.append(pid)
+        else:
+            video_allowed.append(pid)
+    return save_worker_settings(
+        profile_image_allowed=image_allowed,
+        profile_video_allowed=video_allowed,
+    )
+
+
+def ensure_profile_media_on_connect(profile_id: str) -> WorkerSettings:
+    """Profile mới kết nối: gán xen kẽ Image/Video, không đổi profile cũ."""
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return get_worker_settings()
+    settings = get_worker_settings()
+    if pid in settings.profile_image_allowed or pid in settings.profile_video_allowed:
+        return settings
+    assigned = sorted(
+        set(settings.profile_image_allowed) | set(settings.profile_video_allowed)
+    )
+    idx = len(assigned)
+    image_ids = list(settings.profile_image_allowed)
+    video_ids = list(settings.profile_video_allowed)
+    if idx % 2 == 0:
+        image_ids.append(pid)
+    else:
+        video_ids.append(pid)
+    return save_worker_settings(
+        profile_image_allowed=sorted(set(image_ids)),
+        profile_video_allowed=sorted(set(video_ids)),
+    )
+
+
+def bootstrap_profile_media_on_startup() -> WorkerSettings:
+    pids = all_known_profile_ids()
+    if not pids:
+        return get_worker_settings()
+    return seed_profile_media_alternating(pids)

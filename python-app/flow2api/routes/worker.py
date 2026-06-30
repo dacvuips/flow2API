@@ -15,6 +15,7 @@ from flow2api.services.worker_settings import (
     save_worker_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
+    set_profile_media_allowed,
 )
 from flow2api.worker.processor import get_worker
 
@@ -47,6 +48,11 @@ class ProfileCreditBody(BaseModel):
 
 class ProfileProxyBody(BaseModel):
     enabled: bool = True
+
+
+class ProfileMediaBody(BaseModel):
+    image: bool | None = None
+    video: bool | None = None
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -132,9 +138,16 @@ async def update_profile_dispatch(
         saved = set_profile_dispatch_enabled(profile_id, body.enabled)
     except ValueError as exc:
         raise HTTPException(400, "invalid_profile_id") from exc
+    from flow2api.services import system_ops
+
+    await system_ops.push_proxy_to_extensions()
     events.publish(
         "profile_dispatch_changed",
         {"profile_id": profile_id, "enabled": body.enabled},
+    )
+    events.publish(
+        "profile_proxy_changed",
+        {"profile_id": profile_id, "dispatch": body.enabled},
     )
     return {
         **saved.to_dict(),
@@ -193,6 +206,40 @@ async def update_profile_proxy(
         **result,
         "profiles": pool.list_public(),
         "message": f"Đã {state} cho profile",
+        "ok": True,
+    }
+
+
+@router.put("/profiles/{profile_id}/media")
+async def update_profile_media(
+    profile_id: str,
+    body: ProfileMediaBody,
+    _=Depends(_auth_key_id),
+):
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    if body.image is None and body.video is None:
+        raise HTTPException(400, "missing_media_flags")
+    try:
+        saved = set_profile_media_allowed(
+            profile_id,
+            image=body.image,
+            video=body.video,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    events.publish(
+        "profile_media_changed",
+        {
+            "profile_id": profile_id,
+            "image": body.image,
+            "video": body.video,
+        },
+    )
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
         "ok": True,
     }
 

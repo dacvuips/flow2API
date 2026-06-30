@@ -159,6 +159,18 @@ async def lifespan(app: FastAPI):
     from flow2api.services.system_ops import proxy_rotate_loop
 
     proxy_rotate_task = asyncio.create_task(proxy_rotate_loop())
+    try:
+        from flow2api.services.worker_settings import bootstrap_profile_media_on_startup
+
+        seeded = bootstrap_profile_media_on_startup()
+        if seeded.profile_image_allowed or seeded.profile_video_allowed:
+            logger.info(
+                "profile media bootstrap: %s image · %s video",
+                len(seeded.profile_image_allowed),
+                len(seeded.profile_video_allowed),
+            )
+    except Exception as exc:
+        logger.warning("profile media bootstrap failed: %s", exc)
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,

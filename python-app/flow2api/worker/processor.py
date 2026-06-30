@@ -484,17 +484,37 @@ class WorkerController:
         existing = params.get("profile_id")
         exclude = params.get("retry_exclude_profile_id")
         if params.get("profile_assigned_by_user") and existing:
-            profile_id = pick_profile_for_task(str(existing), credit_required=credit_required)
+            profile_id = pick_profile_for_task(
+                str(existing),
+                credit_required=credit_required,
+                request_type=request_type,
+            )
             if not profile_id:
                 raise RuntimeError("assigned_profile_not_available")
         elif existing:
-            profile_id = pick_profile_for_task(str(existing), credit_required=credit_required)
+            profile_id = pick_profile_for_task(
+                str(existing),
+                credit_required=credit_required,
+                request_type=request_type,
+            )
             if not profile_id:
-                profile_id = pick_profile_for_task(None, credit_required=credit_required)
+                profile_id = pick_profile_for_task(
+                    None,
+                    credit_required=credit_required,
+                    request_type=request_type,
+                )
         elif exclude:
-            profile_id = pick_profile_for_retry(str(exclude), credit_required=credit_required)
+            profile_id = pick_profile_for_retry(
+                str(exclude),
+                credit_required=credit_required,
+                request_type=request_type,
+            )
         else:
-            profile_id = pick_profile_for_task(None, credit_required=credit_required)
+            profile_id = pick_profile_for_task(
+                None,
+                credit_required=credit_required,
+                request_type=request_type,
+            )
         if not profile_id:
             raise RuntimeError("no_extension_profile_online")
         session = get_extension_pool().get(profile_id)
