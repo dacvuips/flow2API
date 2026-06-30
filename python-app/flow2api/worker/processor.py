@@ -8,11 +8,14 @@ from datetime import datetime
 from typing import Any
 
 from flow2api.config import (
+    HTTP_404_MAX_ATTEMPTS,
+    HTTP_404_POLICY_ERROR_MSG,
     IMAGE_POLL_MAX,
     POLL_INTERVAL_S,
     RECAPTCHA_RETRY_MAX,
-    TASK_RUNNING_TIMEOUT_MAX_RETRIES,
     TASK_RUNNING_TIMEOUT_S,
+    TASK_TIMEOUT_ERROR,
+    TASK_TIMEOUT_ERROR_MSG,
     VIDEO_POLL_MAX,
     VIDEO_POLL_MEDIA_MAX,
     WORKER_NUDGE_STUCK_S,
@@ -26,7 +29,7 @@ from flow2api.services.flow_sdk import (
     format_api_error,
     is_extension_disconnect_error,
     is_extension_timeout_error,
-    is_get_media_404_failure,
+    is_http_404_failure,
     is_invalid_argument_retry_failure,
     is_prominent_people_filter_failure,
     is_trpc_401_failure,
@@ -78,9 +81,6 @@ class RequestCancelled(RuntimeError):
     """Raised when user stops a queued/running request."""
 
 
-TASK_TIMEOUT_ERROR = "task_timeout_5m"
-
-
 class WorkerController:
     def __init__(self) -> None:
         self._scheduler_task: asyncio.Task | None = None
@@ -129,74 +129,30 @@ class WorkerController:
             self._running.pop(rid, None)
 
     def _handle_running_stuck(self, rid: str) -> None:
-        """Requeue running task when stuck; fail after max retries."""
+        """Fail running task when it exceeds TASK_RUNNING_TIMEOUT_S (default 5m)."""
         row = activity.get_request(rid)
         if not row or row.status != "running":
             return
 
-        params = json.loads(row.params_json or "{}")
-        retry_count = int(params.get("running_timeout_retry_count") or 0)
-        max_retries = max(1, int(TASK_RUNNING_TIMEOUT_MAX_RETRIES or 3))
         task = self._running.get(rid)
         self._running_since.pop(rid, None)
-
-        if retry_count < max_retries:
-            params["running_timeout_retry_count"] = retry_count + 1
-            params = prepare_params_for_worker_requeue(
-                params,
-                rid,
-                prompt=str(row.prompt or ""),
-            )
-            params = apply_retry_profile_rotation(params, row.type)
-            activity.update_request(
-                rid,
-                status="queued",
-                params=params,
-                error=None,
-            )
-            append_request_log(
-                rid,
-                "worker",
-                (
-                    f"Running stuck {TASK_RUNNING_TIMEOUT_S // 60}m — "
-                    f"requeue {retry_count + 1}/{max_retries} "
-                    f"(same task id, inputs restored)"
-                ),
-                level="warn",
-            )
-            events.publish("request_finished", {"id": rid, "status": "queued"})
-            logger.warning(
-                "task stuck running rid=%s — requeue %s/%s, inputs restored",
-                rid[:8],
-                retry_count + 1,
-                max_retries,
-            )
-            if task and not task.done():
-                task.cancel()
-            self._running.pop(rid, None)
-            self._cancelled.discard(rid)
-            return
 
         activity.update_request(
             rid,
             status=f"failed: {TASK_TIMEOUT_ERROR}",
-            error=TASK_TIMEOUT_ERROR,
-            result={"error": TASK_TIMEOUT_ERROR},
+            error=TASK_TIMEOUT_ERROR_MSG,
+            result={"error": TASK_TIMEOUT_ERROR_MSG},
         )
         append_request_log(
             rid,
             "worker",
-            (
-                f"Job timed out after {max_retries} retries "
-                f"({TASK_RUNNING_TIMEOUT_S // 60}m each)"
-            ),
+            TASK_TIMEOUT_ERROR_MSG,
             level="warn",
         )
         events.publish("request_finished", {"id": rid, "status": "failed"})
         logger.warning(
-            "task timed out rid=%s after %s retries x %ss",
+            "task timed out rid=%s after %ss",
             rid[:8],
-            max_retries,
             TASK_RUNNING_TIMEOUT_S,
         )
         self.request_cancel(rid)
@@ -644,13 +600,13 @@ class WorkerController:
                 activity.update_request(
                     rid,
                     status=f"failed: {TASK_TIMEOUT_ERROR}",
-                    error=TASK_TIMEOUT_ERROR,
-                    result={"error": TASK_TIMEOUT_ERROR},
+                    error=TASK_TIMEOUT_ERROR_MSG,
+                    result={"error": TASK_TIMEOUT_ERROR_MSG},
                 )
                 append_request_log(
                     rid,
                     "worker",
-                    f"Job canceled (timeout {TASK_RUNNING_TIMEOUT_S // 60}m)",
+                    TASK_TIMEOUT_ERROR_MSG,
                     level="warn",
                 )
                 events.publish("request_finished", {"id": rid, "status": "failed"})
@@ -659,7 +615,7 @@ class WorkerController:
             cur = activity.get_request(rid)
             if cur and (
                 cur.status.startswith("failed:")
-                or cur.error in (TASK_TIMEOUT_ERROR, "canceled")
+                or cur.error in (TASK_TIMEOUT_ERROR, TASK_TIMEOUT_ERROR_MSG, "canceled")
             ):
                 return
             api_trace = end_api_trace(rid)
@@ -690,33 +646,35 @@ class WorkerController:
                 )
                 return
             get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
-            if is_get_media_404_failure(exc, msg, api_trace) and get_media_404_retry < RECAPTCHA_RETRY_MAX:
-                retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
-                row_prompt = str((cur.prompt if cur else "") or "")
-                retry_params = prepare_params_for_worker_requeue(
-                    retry_params,
-                    rid,
-                    prompt=row_prompt,
-                )
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                append_request_log(
-                    rid,
-                    "worker",
-                    (
-                        f"get_media 404 during poll — requeue "
-                        f"{get_media_404_retry + 1}/{RECAPTCHA_RETRY_MAX} "
-                        f"(same task id, inputs restored)"
-                    ),
-                    level="warn",
-                )
-                logger.warning(
-                    "get_media 404 retry %s/%s rid=%s — inputs restored, profile=%s",
-                    get_media_404_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
+            if is_http_404_failure(exc, msg, api_trace):
+                if (get_media_404_retry + 1) < HTTP_404_MAX_ATTEMPTS:
+                    retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
+                    row_prompt = str((cur.prompt if cur else "") or "")
+                    retry_params = prepare_params_for_worker_requeue(
+                        retry_params,
+                        rid,
+                        prompt=row_prompt,
+                    )
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    append_request_log(
+                        rid,
+                        "worker",
+                        (
+                            f"HTTP 404 — requeue lần "
+                            f"{get_media_404_retry + 1}/{HTTP_404_MAX_ATTEMPTS} "
+                            f"(same task id, inputs restored)"
+                        ),
+                        level="warn",
+                    )
+                    logger.warning(
+                        "HTTP 404 retry %s/%s rid=%s — inputs restored, profile=%s",
+                        get_media_404_retry + 1,
+                        HTTP_404_MAX_ATTEMPTS,
+                        rid[:8],
+                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    )
+                    return
+                msg = HTTP_404_POLICY_ERROR_MSG
             upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
             if (
                 is_upload_image_internal_failure(exc, msg, api_trace)

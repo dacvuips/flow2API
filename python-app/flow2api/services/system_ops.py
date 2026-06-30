@@ -461,10 +461,10 @@ async def rotate_proxies_now() -> dict[str, Any]:
 async def _apply_proxy_rotation(cfg: dict[str, Any], now: float) -> int:
     new_offset = int(cfg.get("proxy_rotate_offset") or 0) + 1
     save_config({"proxy_rotate_offset": new_offset, "proxy_rotate_last_at": now})
-    await push_proxy_to_extensions()
+    await push_proxy_to_extensions(defer_if_busy=True)
     pool = cfg.get("proxy_pool") or []
     logger.info(
-        "proxy rotated offset=%s interval=%sm pool=%s",
+        "proxy rotated offset=%s interval=%sm pool=%s (busy profiles deferred)",
         new_offset,
         int(cfg.get("proxy_rotate_interval_min") or 30),
         len(pool),
@@ -506,13 +506,8 @@ async def force_refresh_all() -> dict[str, Any]:
     return {"ok": True, "message": "Đã gửi lệnh F5 toàn bộ tab Flow"}
 
 
-async def push_proxy_to_session(session: Any, profile_index: int | None = None) -> None:
-    cfg = load_config()
-    if not is_profile_proxy_pool_eligible(session.profile_id, cfg):
-        proxy_url = ""
-    else:
-        idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
-        proxy_url = _proxy_url_for_index(cfg, idx)
+async def apply_proxy_to_session(session: Any, proxy_url: str) -> None:
+    """Push proxy to Chrome extension immediately."""
     session.applied_proxy_url = proxy_url or ""
     try:
         await session.send_json({"type": "system_set_proxy", "proxyUrl": proxy_url})
@@ -520,7 +515,34 @@ async def push_proxy_to_session(session: Any, profile_index: int | None = None) 
         logger.warning("proxy push failed %s: %s", session.profile_id[:8], exc)
 
 
-async def push_proxy_to_extensions() -> None:
+async def push_proxy_to_session(
+    session: Any,
+    profile_index: int | None = None,
+    *,
+    defer_if_busy: bool = True,
+) -> bool:
+    """Assign proxy from pool; defer Chrome apply while profile has active jobs."""
+    cfg = load_config()
+    if not is_profile_proxy_pool_eligible(session.profile_id, cfg):
+        proxy_url = ""
+        session.pending_proxy_url = None
+    else:
+        idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
+        proxy_url = _proxy_url_for_index(cfg, idx)
+    if defer_if_busy and int(getattr(session, "active_jobs", 0) or 0) > 0:
+        session.pending_proxy_url = proxy_url
+        logger.info(
+            "proxy deferred profile=%s active_jobs=%s",
+            session.profile_id[:12],
+            session.active_jobs,
+        )
+        return False
+    session.pending_proxy_url = None
+    await apply_proxy_to_session(session, proxy_url)
+    return True
+
+
+async def push_proxy_to_extensions(*, defer_if_busy: bool = True) -> None:
     idx = 0
     from flow2api.services.extension_pool import get_extension_pool
 
@@ -528,10 +550,10 @@ async def push_proxy_to_extensions() -> None:
         if session.profile_id.startswith("_"):
             continue
         if is_profile_proxy_pool_eligible(session.profile_id):
-            await push_proxy_to_session(session, idx)
+            await push_proxy_to_session(session, idx, defer_if_busy=defer_if_busy)
             idx += 1
         else:
-            await push_proxy_to_session(session)
+            await push_proxy_to_session(session, defer_if_busy=defer_if_busy)
 
 
 def _extension_push_config() -> dict[str, Any]:

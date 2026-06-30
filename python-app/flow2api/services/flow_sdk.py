@@ -1435,6 +1435,34 @@ def is_get_media_404_failure(
     return False
 
 
+def is_http_404_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """Any HTTP 404 / NOT_FOUND from Google Flow during a worker job."""
+    if is_get_media_404_failure(exc, msg, api_trace):
+        return True
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and get_media_http_status(raw) == 404:
+            return True
+    text = str(msg or "").strip().upper()
+    if "HTTP_404" in text:
+        return True
+    for entry in api_trace or []:
+        if int(entry.get("http_status") or 0) == 404:
+            return True
+        data = entry.get("data")
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict) and int(err.get("code") or 0) == 404:
+                return True
+            if str(err.get("status") or "").upper() == "NOT_FOUND":
+                return True
+    return False
+
+
 def compact_api_response(resp: Any, label: str = "") -> dict:
     """Shrink extension callback for logs / task result (keep structure, drop huge blobs)."""
     if not isinstance(resp, dict):

@@ -40,6 +40,7 @@ class ExtensionSession:
         self.active_jobs: int = 0
         self.assigned_total: int = 0
         self.applied_proxy_url: str = ""
+        self.pending_proxy_url: str | None = None
 
     @property
     def trace_request_id(self) -> Optional[str]:
@@ -353,12 +354,15 @@ class ExtensionSession:
         pool_on = is_proxy_pool_enabled()
         attach_on = is_profile_proxy_attach_enabled(self.profile_id)
         pool_eligible = is_profile_proxy_pool_eligible(self.profile_id)
-        proxy_raw = (
-            (self.applied_proxy_url or proxy_url_for_profile_id(self.profile_id))
-            if pool_eligible
-            else ""
-        )
+        assigned_url = proxy_url_for_profile_id(self.profile_id) if pool_eligible else ""
+        if self.pending_proxy_url is not None:
+            proxy_raw = self.pending_proxy_url
+        else:
+            proxy_raw = self.applied_proxy_url or assigned_url
         proxy_fields = format_proxy_public(proxy_raw)
+        proxy_pending = (
+            self.pending_proxy_url is not None and self.active_jobs > 0 and pool_eligible
+        )
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -380,6 +384,8 @@ class ExtensionSession:
             "user": self.user_info or {},
             "proxy_pool_enabled": pool_on,
             "proxy_attach_enabled": attach_on,
+            "proxy_pending_apply": proxy_pending,
+            "proxy_assigned": format_proxy_public(assigned_url).get("proxy_display") or "",
             **proxy_fields,
         }
 
@@ -671,6 +677,34 @@ class ExtensionPool:
         session = self._sessions.get(profile_id)
         if session and session.active_jobs > 0:
             session.active_jobs -= 1
+        if session:
+            self._schedule_pending_proxy_flush(session)
+
+    def _schedule_pending_proxy_flush(self, session: ExtensionSession) -> None:
+        if session.active_jobs > 0 or session.pending_proxy_url is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._apply_pending_proxy(session))
+
+    async def _apply_pending_proxy(self, session: ExtensionSession) -> None:
+        if session.active_jobs > 0 or session.pending_proxy_url is None:
+            return
+        from flow2api.services.system_ops import apply_proxy_to_session
+
+        proxy_url = session.pending_proxy_url
+        session.pending_proxy_url = None
+        await apply_proxy_to_session(session, proxy_url)
+        events.publish(
+            "profile_proxy_changed",
+            {"profile_id": session.profile_id, "deferred": True},
+        )
+        logger.info(
+            "proxy applied after jobs finished profile=%s",
+            session.profile_id[:12],
+        )
 
     def reconcile_active_jobs(self, actual_by_profile: dict[str, int]) -> dict[str, dict[str, int]]:
         """Reset profile slot counters to match worker tasks actually running."""
@@ -685,6 +719,8 @@ class ExtensionPool:
                     "actual": actual,
                 }
                 session.active_jobs = actual
+                if actual == 0:
+                    self._schedule_pending_proxy_flush(session)
         return drift
 
     async def broadcast(self, payload: dict) -> None:
