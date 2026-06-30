@@ -113,6 +113,40 @@
     .metric-number.success { color: var(--green); }
     .metric-number.failed { color: var(--red); }
 
+    .reload-box {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel-soft);
+    }
+    .reload-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .reload-title { font-weight: 700; color: var(--soft); }
+    .reload-presets { display: flex; gap: 6px; }
+    .reload-btn {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--soft);
+      border-radius: 8px;
+      padding: 5px 8px;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .reload-btn.active {
+      border-color: var(--brand-blue);
+      color: var(--brand-blue);
+      background: #eff6ff;
+    }
+    .reload-meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+
     .clear-panel { padding: 12px 16px 16px; background: #fff; }
     .clear-status {
       display: flex;
@@ -269,7 +303,7 @@
           <h1><span class="logo-flow">Flow</span><span class="logo-api">2API</span></h1>
           <p class="subtitle">Google Flow To API</p>
         </div>
-        <span class="version">v0.0.16</span>
+        <span class="version">v0.0.18</span>
       </div>
     </header>
 
@@ -313,6 +347,21 @@
         <div class="row">
           <span class="label">Auto click</span>
           <span class="value" id="auto-click-status">—</span>
+        </div>
+        <div class="reload-box">
+          <div class="reload-head">
+            <span class="reload-title">Auto Reload Flow</span>
+            <label class="toggle" title="Tự reload tab Flow theo chu kỳ">
+              <input type="checkbox" id="flow-reload-enabled" checked />
+              <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+          <div class="reload-presets">
+            <button type="button" class="reload-btn" data-flow-reload-sec="10">10s</button>
+            <button type="button" class="reload-btn" data-flow-reload-sec="15">15s</button>
+            <button type="button" class="reload-btn" data-flow-reload-sec="20">20s</button>
+          </div>
+          <div class="reload-meta">Lần tới: <span id="flow-reload-next">—</span></div>
         </div>
       </section>
 

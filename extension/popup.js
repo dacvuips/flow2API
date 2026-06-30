@@ -4,6 +4,8 @@ const $ = (id) => document.getElementById(id);
 
 let selectedClearSec = 300;
 let clearCountdownTimer = null;
+let flowReloadState = null;
+let flowReloadTicker = null;
 
 function send(type, payload = {}, timeoutMs = 10000) {
   return new Promise((resolve) => {
@@ -36,6 +38,43 @@ function formatTokenAge(ms) {
 function formatIntervalLabel(sec) {
   if (sec >= 60 && sec % 60 === 0) return `${sec / 60}p`;
   return `${sec}s`;
+}
+
+function renderFlowReloadPresets(sec) {
+  document.querySelectorAll('[data-flow-reload-sec]').forEach((btn) => {
+    btn.classList.toggle('active', parseInt(btn.dataset.flowReloadSec, 10) === Number(sec));
+  });
+}
+
+function renderFlowReloadState(state) {
+  flowReloadState = state || flowReloadState;
+  const cur = flowReloadState || {};
+  const enabled = cur.enabled !== false;
+  const intervalSec = Number(cur.intervalSec || 10);
+  const nextEl = $('flow-reload-next');
+  const toggle = $('flow-reload-enabled');
+  if (toggle) toggle.checked = enabled;
+  renderFlowReloadPresets(intervalSec);
+  if (nextEl) {
+    if (!enabled) nextEl.textContent = 'đã tắt';
+    else if (cur.secondsUntilNext == null) nextEl.textContent = '—';
+    else nextEl.textContent = `${cur.secondsUntilNext}s`;
+  }
+}
+
+async function refreshFlowReloadState() {
+  const res = await send('GET_FLOW_RELOAD_STATE');
+  if (res) renderFlowReloadState(res);
+}
+
+function startFlowReloadTicker() {
+  if (flowReloadTicker) clearInterval(flowReloadTicker);
+  flowReloadTicker = setInterval(() => {
+    if (!flowReloadState || flowReloadState.enabled === false) return;
+    if (flowReloadState.secondsUntilNext == null) return;
+    flowReloadState.secondsUntilNext = Math.max(0, Number(flowReloadState.secondsUntilNext) - 1);
+    renderFlowReloadState(flowReloadState);
+  }, 1000);
 }
 
 function setConnection(status) {
@@ -303,6 +342,7 @@ $('btn-clear-reset').addEventListener('click', async () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'STATUS_PUSH' || message.type === 'REQUEST_LOG_UPDATE') fetchStatus();
   if (message.type === 'CLEAR_STATE_UPDATE') renderClear(message.state);
+  if (message.type === 'FLOW_RELOAD_STATE_UPDATE') renderFlowReloadState(message.state);
 });
 
 chrome.storage.local.get('f2apiActiveTab').then((data) => {
@@ -335,6 +375,21 @@ $('auto-click-create')?.addEventListener('change', async (e) => {
   await send('SET_AUTO_CLICK_CREATE', { enabled: e.target.checked });
 });
 
+$('flow-reload-enabled')?.addEventListener('change', async (e) => {
+  const res = await send('TOGGLE_FLOW_RELOAD', { enabled: e.target.checked });
+  if (res?.state) renderFlowReloadState(res.state);
+  else refreshFlowReloadState();
+});
+
+document.querySelectorAll('[data-flow-reload-sec]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const sec = parseInt(btn.dataset.flowReloadSec, 10);
+    const res = await send('SET_FLOW_RELOAD_INTERVAL', { intervalSec: sec });
+    if (res?.state) renderFlowReloadState(res.state);
+    else refreshFlowReloadState();
+  });
+});
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.autoClickLastStatus) {
     renderAutoClickStatus(changes.autoClickLastStatus.newValue);
@@ -343,6 +398,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 fetchStatus();
 loadAutoClickSetting();
+refreshFlowReloadState();
+startFlowReloadTicker();
 setInterval(fetchStatus, 1500);
 resetClearStartButton(false);
 refreshClearState();

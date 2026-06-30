@@ -28,10 +28,20 @@ let metrics = {
 
 const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
 
-// Reload Flow tab before captcha when tab already solved N times (fresh grecaptcha session).
-const CAPTCHA_RELOAD_EVERY_N_SOLVES = 1;
+// Disable captcha-triggered tab reload; use timed auto-reload instead.
+const CAPTCHA_RELOAD_EVERY_N_SOLVES = 0;
 const _captchaSolvesByTab = new Map();
 let _captchaChain = Promise.resolve();
+
+const FLOW_RELOAD_ALARM = 'f2api-flow-auto-reload';
+const FLOW_RELOAD_ALLOWED = [10, 15, 20];
+const DEFAULT_FLOW_RELOAD_STATE = {
+  enabled: true,
+  intervalSec: 10,
+  lastReloadAt: 0,
+  nextReloadAt: 0,
+};
+let flowReloadState = { ...DEFAULT_FLOW_RELOAD_STATE };
 
 // Cached Flow projectId (in-memory) — informational / popup only.
 let _cachedProjectId = null;
@@ -94,6 +104,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === CLEAR_ALARM) {
     loadClearState().then(() => performClearTick());
   }
+  if (alarm.name === FLOW_RELOAD_ALARM) {
+    performFlowReloadTick();
+  }
 });
 
 async function getOrCreateProfileId() {
@@ -138,6 +151,7 @@ async function init() {
   }
   await initClearFromStorage();
   await ensureAutoClearStarted();
+  await initFlowReloadFromStorage();
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Token Capture Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -622,6 +636,87 @@ async function refreshAllFlowTabs() {
   }
 }
 
+function clampFlowReloadSec(sec) {
+  const n = Number(sec) || DEFAULT_FLOW_RELOAD_STATE.intervalSec;
+  return FLOW_RELOAD_ALLOWED.includes(n) ? n : DEFAULT_FLOW_RELOAD_STATE.intervalSec;
+}
+
+async function loadFlowReloadState() {
+  const data = await chrome.storage.local.get('f2apiFlowReload');
+  const raw = data.f2apiFlowReload || {};
+  flowReloadState = {
+    enabled: raw.enabled !== false,
+    intervalSec: clampFlowReloadSec(raw.intervalSec),
+    lastReloadAt: Number(raw.lastReloadAt || 0),
+    nextReloadAt: Number(raw.nextReloadAt || 0),
+  };
+}
+
+async function saveFlowReloadState() {
+  await chrome.storage.local.set({ f2apiFlowReload: flowReloadState });
+}
+
+function getPublicFlowReloadState() {
+  let secondsUntilNext = null;
+  if (flowReloadState.enabled && flowReloadState.nextReloadAt > 0) {
+    secondsUntilNext = Math.max(0, Math.ceil((flowReloadState.nextReloadAt - Date.now()) / 1000));
+  }
+  return {
+    enabled: !!flowReloadState.enabled,
+    intervalSec: flowReloadState.intervalSec,
+    lastReloadAt: flowReloadState.lastReloadAt,
+    nextReloadAt: flowReloadState.nextReloadAt,
+    secondsUntilNext,
+  };
+}
+
+function broadcastFlowReloadState() {
+  chrome.runtime.sendMessage({
+    type: 'FLOW_RELOAD_STATE_UPDATE',
+    state: getPublicFlowReloadState(),
+  }).catch(() => {});
+}
+
+async function scheduleFlowReloadAlarm() {
+  await alarmClear(FLOW_RELOAD_ALARM);
+  if (!flowReloadState.enabled) return;
+  const delayInMinutes = Math.max(0.0167, flowReloadState.intervalSec / 60);
+  await alarmCreate(FLOW_RELOAD_ALARM, { delayInMinutes });
+  flowReloadState.nextReloadAt = Date.now() + flowReloadState.intervalSec * 1000;
+}
+
+async function applyFlowReloadSettings({ enabled, intervalSec } = {}) {
+  if (enabled !== undefined) flowReloadState.enabled = enabled !== false;
+  if (intervalSec !== undefined) flowReloadState.intervalSec = clampFlowReloadSec(intervalSec);
+  await scheduleFlowReloadAlarm();
+  await saveFlowReloadState();
+  broadcastFlowReloadState();
+  return getPublicFlowReloadState();
+}
+
+async function performFlowReloadTick() {
+  if (!flowReloadState.enabled) return;
+  try {
+    await refreshAllFlowTabs();
+    flowReloadState.lastReloadAt = Date.now();
+  } catch (e) {
+    console.warn('[Flow2API] auto flow reload failed:', e?.message || e);
+  } finally {
+    await scheduleFlowReloadAlarm();
+    await saveFlowReloadState();
+    broadcastFlowReloadState();
+  }
+}
+
+async function initFlowReloadFromStorage() {
+  await loadFlowReloadState();
+  // Per requirement: always default to ON when extension starts.
+  flowReloadState.enabled = true;
+  await scheduleFlowReloadAlarm();
+  await saveFlowReloadState();
+  broadcastFlowReloadState();
+}
+
 async function applySystemPushConfig(config) {
   if (!config || typeof config !== 'object') return;
   if (config.flowUrl) {
@@ -773,6 +868,7 @@ function runCaptchaExclusive(fn) {
 
 /** grecaptcha.enterprise session is effectively one-shot per page load on Flow. */
 async function prepareFlowTabForCaptcha(tabId) {
+  if (CAPTCHA_RELOAD_EVERY_N_SOLVES <= 0) return;
   const prev = _captchaSolvesByTab.get(tabId) || 0;
   if (prev >= CAPTCHA_RELOAD_EVERY_N_SOLVES) {
     console.log(
@@ -1524,6 +1620,25 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'GET_CLEAR_STATE') {
     loadClearState().then(() => reply(getPublicClearState()));
+    return true;
+  }
+
+  if (msg.type === 'GET_FLOW_RELOAD_STATE') {
+    loadFlowReloadState().then(() => reply(getPublicFlowReloadState()));
+    return true;
+  }
+
+  if (msg.type === 'SET_FLOW_RELOAD_INTERVAL') {
+    applyFlowReloadSettings({ intervalSec: msg.intervalSec }).then((state) => {
+      reply({ ok: true, state });
+    });
+    return true;
+  }
+
+  if (msg.type === 'TOGGLE_FLOW_RELOAD') {
+    applyFlowReloadSettings({ enabled: msg.enabled !== false }).then((state) => {
+      reply({ ok: true, state });
+    });
     return true;
   }
 
