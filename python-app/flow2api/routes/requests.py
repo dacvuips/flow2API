@@ -410,7 +410,9 @@ async def cancel_request(request_id: str, _=Depends(_auth_key_id)):
         raise HTTPException(404, "not_found")
     if row.status not in ("queued", "running"):
         raise HTTPException(409, f"cannot cancel (status={row.status})")
-    get_worker().request_cancel(request_id)
+    worker = get_worker()
+    worker.request_cancel(request_id)
+    worker.cancel_running_tasks({request_id})
     append_request_log(request_id, "http", "DELETE /api/requests — cancel", level="warn")
     activity.update_request(
         request_id,
