@@ -109,7 +109,7 @@ async def set_proxy_rotate(body: ProxyRotateBody):
 
 @router.post("/proxy/rotate-now")
 async def rotate_proxy_now():
-    from flow2api.services import events
+    from flow2api.services.dashboard_events import events
     from flow2api.services.extension_pool import get_extension_pool
 
     result = await system_ops.rotate_proxies_now()

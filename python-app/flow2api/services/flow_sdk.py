@@ -1575,9 +1575,9 @@ def is_recaptcha_error(msg: str) -> bool:
 
 
 def recaptcha_retry_delay(attempt: int = 0) -> float:
-    """Chờ ngẫu nhiên 3–5s trước mỗi lần retry reCAPTCHA (không retry ngay)."""
+    """Chờ 10s trước mỗi lần retry reCAPTCHA (không retry ngay)."""
     del attempt
-    return random.uniform(3.0, 5.0)
+    return 10.0
 
 
 def _recaptcha_retry_delay(attempt: int) -> float:
