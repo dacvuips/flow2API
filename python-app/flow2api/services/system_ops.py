@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "proxy_rotate_interval_min": 30,
     "proxy_rotate_offset": 0,
     "proxy_rotate_last_at": 0,
+    "profile_proxy_disabled": [],
     "windows_autostart": True,
 }
 
@@ -80,6 +81,7 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "proxy_rotate_interval_min",
         "proxy_rotate_offset",
         "proxy_rotate_last_at",
+        "profile_proxy_disabled",
     ):
         if key in cfg:
             current[key] = cfg[key]
@@ -103,6 +105,8 @@ def public_config() -> dict[str, Any]:
         "proxy_rotate_enabled": bool(cfg.get("proxy_rotate_enabled")),
         "proxy_rotate_interval_min": max(1, int(cfg.get("proxy_rotate_interval_min") or 30)),
         "proxy_rotate_last_at": float(cfg.get("proxy_rotate_last_at") or 0),
+        "proxy_rotate_offset": int(cfg.get("proxy_rotate_offset") or 0),
+        "proxy_rotate_status": proxy_rotate_status(cfg),
         "windows_autostart": bool(cfg.get("windows_autostart")),
         "autostart_installed": _startup_bat_path().is_file(),
     }
@@ -242,6 +246,46 @@ def is_proxy_pool_enabled(cfg: dict[str, Any] | None = None) -> bool:
     return bool(cfg.get("proxy_pool_enabled"))
 
 
+def _profile_proxy_disabled_list(cfg: dict[str, Any] | None = None) -> list[str]:
+    cfg = cfg if cfg is not None else load_config()
+    raw = cfg.get("profile_proxy_disabled") or []
+    if not isinstance(raw, list):
+        return []
+    return sorted({str(x) for x in raw if x and not str(x).startswith("_")})
+
+
+def is_profile_proxy_attach_enabled(profile_id: str, cfg: dict[str, Any] | None = None) -> bool:
+    cfg = cfg if cfg is not None else load_config()
+    if not is_proxy_pool_enabled(cfg):
+        return False
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid not in _profile_proxy_disabled_list(cfg)
+
+
+async def set_profile_proxy_attach_enabled(profile_id: str, enabled: bool) -> dict[str, Any]:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    cfg = load_config()
+    disabled = _profile_proxy_disabled_list(cfg)
+    if enabled:
+        disabled = [x for x in disabled if x != pid]
+    elif pid not in disabled:
+        disabled.append(pid)
+    save_config({"profile_proxy_disabled": disabled})
+    from flow2api.services.extension_pool import get_extension_pool
+
+    session = get_extension_pool().get(pid)
+    if session:
+        await push_proxy_to_session(session)
+    return {
+        "profile_id": pid,
+        "proxy_attach_enabled": is_profile_proxy_attach_enabled(pid),
+    }
+
+
 def parse_proxy_pool(text: str) -> list[str]:
     lines = []
     for line in (text or "").splitlines():
@@ -249,6 +293,99 @@ def parse_proxy_pool(text: str) -> list[str]:
         if line and not line.startswith("#"):
             lines.append(line)
     return lines
+
+
+def format_proxy_public(proxy_url: str) -> dict[str, Any]:
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return {"proxy": "", "proxy_display": "", "proxy_attached": False}
+    parts = raw.split(":")
+    host = parts[0] if parts else ""
+    port = parts[1] if len(parts) > 1 else ""
+    display = f"{host}:{port}" if host and port else host
+    return {"proxy": display, "proxy_display": display, "proxy_attached": bool(display)}
+
+
+def proxy_url_for_profile_id(profile_id: str) -> str:
+    cfg = load_config()
+    if not is_profile_proxy_attach_enabled(profile_id, cfg):
+        return ""
+    return _proxy_url_for_index(cfg, _profile_proxy_index(profile_id))
+
+
+def proxy_rotate_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = cfg if cfg is not None else load_config()
+    attach = is_proxy_pool_enabled(cfg)
+    enabled = bool(cfg.get("proxy_rotate_enabled"))
+    pool = cfg.get("proxy_pool") or []
+    interval_min = max(1, int(cfg.get("proxy_rotate_interval_min") or 30))
+    interval_s = proxy_rotate_interval_seconds(cfg)
+    last_at = float(cfg.get("proxy_rotate_last_at") or 0)
+    offset = int(cfg.get("proxy_rotate_offset") or 0)
+    now = time.time()
+    rotated = offset > 0
+
+    if not enabled:
+        return {
+            "active": False,
+            "rotated": rotated,
+            "rotate_count": offset,
+            "seconds_remaining": None,
+            "interval_sec": interval_s,
+            "last_rotated_at": last_at if rotated else 0,
+            "status": "disabled",
+            "status_text": "Xoay proxy đang tắt",
+        }
+    if not attach:
+        return {
+            "active": False,
+            "rotated": rotated,
+            "rotate_count": offset,
+            "seconds_remaining": None,
+            "interval_sec": interval_s,
+            "last_rotated_at": last_at if rotated else 0,
+            "status": "need_attach",
+            "status_text": "Bật gắn proxy vào profile để xoay",
+        }
+    if len(pool) < 2:
+        return {
+            "active": False,
+            "rotated": rotated,
+            "rotate_count": offset,
+            "seconds_remaining": None,
+            "interval_sec": interval_s,
+            "last_rotated_at": last_at if rotated else 0,
+            "status": "need_proxies",
+            "status_text": "Cần ít nhất 2 proxy trong pool",
+        }
+
+    if last_at <= 0:
+        remaining = interval_s
+        status = "arming"
+        status_text = "Đang khởi động bộ đếm — chưa xoay"
+    else:
+        remaining = max(0, int(last_at + interval_s - now))
+        if not rotated:
+            status = "arming"
+            status_text = "Chưa xoay lần nào — đang đếm"
+        elif remaining <= 0:
+            status = "due"
+            status_text = f"Đã xoay {offset} lần — sắp xoay tiếp"
+        else:
+            status = "countdown"
+            status_text = f"Đã xoay {offset} lần — lần xoay gần nhất đã áp dụng"
+
+    return {
+        "active": True,
+        "rotated": rotated,
+        "rotate_count": offset,
+        "seconds_remaining": remaining,
+        "interval_sec": interval_s,
+        "last_rotated_at": last_at,
+        "next_at": (last_at + interval_s) if last_at > 0 else now + interval_s,
+        "status": status,
+        "status_text": status_text,
+    }
 
 
 def next_proxy_for_profile(profile_index: int = 0) -> str:
@@ -333,8 +470,12 @@ async def force_refresh_all() -> dict[str, Any]:
 
 async def push_proxy_to_session(session: Any, profile_index: int | None = None) -> None:
     cfg = load_config()
-    idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
-    proxy_url = _proxy_url_for_index(cfg, idx)
+    if not is_profile_proxy_attach_enabled(session.profile_id, cfg):
+        proxy_url = ""
+    else:
+        idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
+        proxy_url = _proxy_url_for_index(cfg, idx)
+    session.applied_proxy_url = proxy_url or ""
     try:
         await session.send_json({"type": "system_set_proxy", "proxyUrl": proxy_url})
     except Exception as exc:

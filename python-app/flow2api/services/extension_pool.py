@@ -39,6 +39,7 @@ class ExtensionSession:
         self._connected_at: Optional[float] = None
         self.active_jobs: int = 0
         self.assigned_total: int = 0
+        self.applied_proxy_url: str = ""
 
     @property
     def trace_request_id(self) -> Optional[str]:
@@ -339,6 +340,17 @@ class ExtensionSession:
         dispatch_enabled = is_profile_dispatch_enabled(self.profile_id)
         credit_allowed = is_profile_credit_allowed(self.profile_id)
         slots = max(0, max_c - self.active_jobs) if dispatch_enabled else 0
+        from flow2api.services.system_ops import (
+            format_proxy_public,
+            is_profile_proxy_attach_enabled,
+            is_proxy_pool_enabled,
+            proxy_url_for_profile_id,
+        )
+
+        pool_on = is_proxy_pool_enabled()
+        attach_on = is_profile_proxy_attach_enabled(self.profile_id)
+        proxy_raw = (self.applied_proxy_url or proxy_url_for_profile_id(self.profile_id)) if attach_on else ""
+        proxy_fields = format_proxy_public(proxy_raw)
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -356,6 +368,9 @@ class ExtensionSession:
             "slots_available": slots,
             "assigned_total": self.assigned_total,
             "user": self.user_info or {},
+            "proxy_pool_enabled": pool_on,
+            "proxy_attach_enabled": attach_on,
+            **proxy_fields,
         }
 
 

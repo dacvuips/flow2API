@@ -45,6 +45,10 @@ class ProfileCreditBody(BaseModel):
     allowed: bool = True
 
 
+class ProfileProxyBody(BaseModel):
+    enabled: bool = True
+
+
 def _bearer(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing_bearer_token")
@@ -159,6 +163,36 @@ async def update_profile_credit(
     return {
         **saved.to_dict(),
         "profiles": pool.list_public(),
+        "ok": True,
+    }
+
+
+@router.put("/profiles/{profile_id}/proxy")
+async def update_profile_proxy(
+    profile_id: str,
+    body: ProfileProxyBody,
+    _=Depends(_auth_key_id),
+):
+    from flow2api.services import system_ops
+
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    if not system_ops.is_proxy_pool_enabled():
+        raise HTTPException(409, "proxy_pool_disabled")
+    try:
+        result = await system_ops.set_profile_proxy_attach_enabled(profile_id, body.enabled)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    events.publish(
+        "profile_proxy_changed",
+        {"profile_id": profile_id, "enabled": body.enabled},
+    )
+    state = "gắn IP" if body.enabled else "ngừng gắn IP"
+    return {
+        **result,
+        "profiles": pool.list_public(),
+        "message": f"Đã {state} cho profile",
         "ok": True,
     }
 

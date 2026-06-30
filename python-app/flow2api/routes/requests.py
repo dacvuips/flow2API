@@ -11,7 +11,11 @@ from flow2api.services import activity
 from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.dashboard_events import events
-from flow2api.services.result_media import prepare_params_for_manual_retry, with_base64_media
+from flow2api.services.result_media import (
+    prepare_params_for_manual_retry,
+    prepare_params_for_worker_requeue,
+    with_base64_media,
+)
 from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.image_upsample import (
     fetch_upsample_image_bytes,
@@ -325,27 +329,48 @@ async def assign_request_profile(
     row = activity.get_request(request_id)
     if not row:
         raise HTTPException(404, "not_found")
-    if row.status != "queued":
-        raise HTTPException(409, f"cannot_assign_profile (status={row.status})")
+    status = str(row.status or "")
+    if status not in ("queued", "running"):
+        raise HTTPException(409, f"cannot_assign_profile (status={status})")
     params = json.loads(row.params_json or "{}")
+    was_running = status == "running"
+    if was_running:
+        params = prepare_params_for_worker_requeue(
+            params,
+            request_id,
+            prompt=str(row.prompt or ""),
+        )
     try:
         params = apply_user_profile_assignment(params, body.profile_id)
     except ValueError as exc:
         raise HTTPException(400, "profile_not_found") from exc
-    activity.update_request(request_id, params=params)
+    if was_running:
+        activity.requeue_request(request_id, params)
+        get_worker().prepare_retry(request_id)
+        log_msg = (
+            f"PUT /api/requests/{request_id}/profile → {body.profile_id or 'auto'} "
+            "(requeued from running)"
+        )
+    else:
+        activity.update_request(request_id, params=params)
+        log_msg = f"PUT /api/requests/{request_id}/profile → {body.profile_id or 'auto'}"
     append_request_log(
         request_id,
         "http",
-        f"PUT /api/requests/{request_id}/profile → {body.profile_id or 'auto'}",
+        log_msg,
         level="info",
     )
-    events.publish("queue_changed", {"id": request_id, "profile_id": body.profile_id})
+    events.publish(
+        "queue_changed",
+        {"id": request_id, "profile_id": body.profile_id, "requeued": was_running},
+    )
     return {
         "id": request_id,
-        "status": row.status,
+        "status": "queued" if was_running else status,
         "profile_id": params.get("profile_id"),
         "profile_assigned_by_user": bool(params.get("profile_assigned_by_user")),
         "profiles": get_extension_pool().list_public(),
+        "requeued": was_running,
         "ok": True,
     }
 
