@@ -13,6 +13,7 @@ from flow2api.services.worker_settings import (
     get_worker_settings,
     save_profile_limit,
     save_worker_settings,
+    set_profile_clear_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
     set_profile_media_allowed,
@@ -53,6 +54,11 @@ class ProfileProxyBody(BaseModel):
 class ProfileMediaBody(BaseModel):
     image: bool | None = None
     video: bool | None = None
+
+
+class ProfileClearBody(BaseModel):
+    enabled: bool = True
+    interval_sec: int | None = Field(None, ge=1, le=3600)
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -241,5 +247,76 @@ async def update_profile_media(
         **saved.to_dict(),
         "profiles": pool.list_public(),
         "ok": True,
+    }
+
+
+@router.put("/profiles/{profile_id}/clear")
+async def update_profile_clear(
+    profile_id: str,
+    body: ProfileClearBody,
+    _=Depends(_auth_key_id),
+):
+    from flow2api.services import system_ops
+
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        raise HTTPException(404, "profile_not_found")
+    try:
+        saved = set_profile_clear_settings(
+            profile_id,
+            enabled=body.enabled,
+            interval_sec=body.interval_sec,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    clear_result = None
+    if session.connected:
+        try:
+            clear_result = await system_ops.sync_profile_clear_settings(session)
+        except Exception as exc:
+            raise HTTPException(502, str(exc)) from exc
+    events.publish(
+        "profile_clear_changed",
+        {"profile_id": profile_id, "enabled": body.enabled},
+    )
+    state = "bật" if body.enabled else "tắt"
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
+        "clear_result": clear_result,
+        "message": f"Đã {state} Clear Data cho profile",
+        "ok": True,
+    }
+
+
+@router.post("/profiles/{profile_id}/clear/now")
+async def clear_profile_now(
+    profile_id: str,
+    _=Depends(_auth_key_id),
+):
+    from flow2api.services import system_ops
+
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        raise HTTPException(404, "profile_not_found")
+    if not session.connected:
+        raise HTTPException(503, "extension_not_connected")
+    try:
+        result = await system_ops.apply_profile_clear_now(session)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(
+            400,
+            result.get("message") or result.get("error") or "clear_failed",
+        )
+    events.publish("profile_clear_changed", {"profile_id": profile_id, "manual": True})
+    return {
+        "ok": True,
+        "message": "Đã clear labs.google và reload tab Flow",
+        "clear_result": result,
+        "profiles": pool.list_public(),
     }
 

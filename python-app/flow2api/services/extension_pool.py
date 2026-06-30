@@ -41,6 +41,7 @@ class ExtensionSession:
         self.assigned_total: int = 0
         self.applied_proxy_url: str = ""
         self.pending_proxy_url: str | None = None
+        self.clear_state: dict[str, Any] = {}
 
     @property
     def trace_request_id(self) -> Optional[str]:
@@ -145,6 +146,41 @@ class ExtensionSession:
             raise RuntimeError("extension_timeout") from exc
         finally:
             self._pending.pop(req_id, None)
+
+    def _update_clear_state(self, payload: dict | None) -> None:
+        if not isinstance(payload, dict):
+            return
+        state = payload.get("state")
+        if isinstance(state, dict):
+            self.clear_state = dict(state)
+        elif payload.get("running") is not None:
+            self.clear_state = {
+                "running": bool(payload.get("running")),
+                "intervalSec": int(payload.get("intervalSec") or 0),
+                "clearCount": int(payload.get("clearCount") or 0),
+                "secondsUntilNext": payload.get("secondsUntilNext"),
+            }
+
+    async def clear_control(
+        self,
+        action: str,
+        *,
+        interval_sec: int | None = None,
+        timeout: float = 30.0,
+    ) -> dict:
+        params: dict[str, Any] = {"action": str(action or "").strip().lower()}
+        if interval_sec is not None:
+            params["intervalSec"] = max(1, min(3600, int(interval_sec)))
+        resp = await self._send("clear_control", params, timeout=timeout)
+        result = resp.get("result") if isinstance(resp.get("result"), dict) else None
+        if not result and isinstance(resp.get("data"), dict):
+            result = resp["data"]
+        if isinstance(result, dict):
+            self._update_clear_state(result)
+            return result
+        if resp.get("error"):
+            raise RuntimeError(str(resp.get("error")))
+        return {"ok": False, "error": "clear_control_failed", "raw": resp}
 
     async def api_request(
         self,
@@ -331,6 +367,8 @@ class ExtensionSession:
     def to_public_dict(self) -> dict[str, Any]:
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
+            get_profile_clear_interval_sec,
+            is_profile_clear_enabled,
             is_profile_credit_allowed,
             is_profile_dispatch_enabled,
             is_profile_image_allowed,
@@ -363,6 +401,10 @@ class ExtensionSession:
         proxy_pending = (
             self.pending_proxy_url is not None and self.active_jobs > 0 and pool_eligible
         )
+        clear_enabled = is_profile_clear_enabled(self.profile_id)
+        clear_interval = get_profile_clear_interval_sec(self.profile_id)
+        cs = self.clear_state if isinstance(self.clear_state, dict) else {}
+        clear_running = bool(cs.get("running"))
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -386,6 +428,11 @@ class ExtensionSession:
             "proxy_attach_enabled": attach_on,
             "proxy_pending_apply": proxy_pending,
             "proxy_assigned": format_proxy_public(assigned_url).get("proxy_display") or "",
+            "clear_enabled": clear_enabled,
+            "clear_running": clear_running,
+            "clear_interval_sec": int(cs.get("intervalSec") or clear_interval),
+            "clear_count": int(cs.get("clearCount") or 0),
+            "clear_seconds_until_next": cs.get("secondsUntilNext"),
             **proxy_fields,
         }
 
@@ -474,7 +521,7 @@ class ExtensionPool:
             await session.send_json({"type": "system_push_config", "config": _extension_push_config()})
         except Exception:
             pass
-        from flow2api.services.system_ops import push_proxy_to_session
+        from flow2api.services.system_ops import push_proxy_to_session, sync_profile_clear_settings
         from flow2api.services.worker_settings import ensure_profile_media_on_connect
 
         try:
@@ -483,6 +530,10 @@ class ExtensionPool:
             pass
         try:
             await push_proxy_to_session(session)
+        except Exception:
+            pass
+        try:
+            await sync_profile_clear_settings(session)
         except Exception:
             pass
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})

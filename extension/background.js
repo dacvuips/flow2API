@@ -340,6 +340,57 @@ function connectToAgent() {
             metrics,
           },
         });
+      } else if (msg.method === 'clear_control') {
+        const action = String(msg.params?.action || '').toLowerCase();
+        const intervalSec = msg.params?.intervalSec;
+        try {
+          let result;
+          if (action === 'get_state') {
+            await loadClearState();
+            result = { ok: true, state: getPublicClearState() };
+          } else if (action === 'start') {
+            await chrome.storage.local.set({ f2apiClearUserStopped: false });
+            const res = await startAutoClear(
+              intervalSec || clearState.intervalSec || AUTO_CLEAR_INTERVAL_SEC,
+              null,
+            );
+            result = res.ok
+              ? { ok: true, state: getPublicClearState(), ...res }
+              : res;
+          } else if (action === 'stop') {
+            await stopAutoClear();
+            result = { ok: true, state: getPublicClearState() };
+          } else if (action === 'now') {
+            const tab = await resolveClearTargetTab(null);
+            if (!tab?.id || !isLabsGoogleTab(tab)) {
+              result = {
+                ok: false,
+                error: 'not_labs_google',
+                message: 'Clear Data chỉ áp dụng trên https://labs.google/ — mở tab Flow trước.',
+              };
+            } else {
+              await clearSiteDataAndReload(tab.id);
+              clearState.clearCount = (clearState.clearCount || 0) + 1;
+              await saveClearState();
+              broadcastClearState();
+              result = { ok: true, state: getPublicClearState() };
+            }
+          } else {
+            result = { ok: false, error: 'invalid_action' };
+          }
+          sendToAgent({
+            id: msg.id,
+            status: result.ok ? 200 : 400,
+            result,
+            error: result.ok ? undefined : (result.error || result.message),
+          });
+        } catch (e) {
+          sendToAgent({
+            id: msg.id,
+            status: 500,
+            error: e?.message || 'clear_control_failed',
+          });
+        }
       }
     } catch (e) {
       console.error('[Flow2API] Message error:', e);
