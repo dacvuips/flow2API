@@ -34,6 +34,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
     },
     "proxy_pool": [],
+    "proxy_pool_enabled": False,
+    "proxy_rotate_enabled": False,
+    "proxy_rotate_interval_min": 30,
+    "proxy_rotate_offset": 0,
+    "proxy_rotate_last_at": 0,
     "windows_autostart": True,
 }
 
@@ -55,6 +60,8 @@ def load_config() -> dict[str, Any]:
                 out.update({k: v for k, v in raw.items() if k in DEFAULT_CONFIG})
                 if isinstance(raw.get("telegram"), dict):
                     out["telegram"] = {**out["telegram"], **raw["telegram"]}
+                if "proxy_pool_enabled" not in raw:
+                    out["proxy_pool_enabled"] = bool(raw.get("proxy_pool"))
             return out
         except Exception as exc:
             logger.warning("system_config load failed: %s", exc)
@@ -64,7 +71,16 @@ def load_config() -> dict[str, Any]:
 def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     _ensure_storage()
     current = load_config()
-    for key in ("flow_url", "windows_autostart", "proxy_pool"):
+    for key in (
+        "flow_url",
+        "windows_autostart",
+        "proxy_pool",
+        "proxy_pool_enabled",
+        "proxy_rotate_enabled",
+        "proxy_rotate_interval_min",
+        "proxy_rotate_offset",
+        "proxy_rotate_last_at",
+    ):
         if key in cfg:
             current[key] = cfg[key]
     if isinstance(cfg.get("telegram"), dict):
@@ -83,6 +99,10 @@ def public_config() -> dict[str, Any]:
         "flow_url": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
         "telegram": tg,
         "proxy_pool": list(cfg.get("proxy_pool") or []),
+        "proxy_pool_enabled": is_proxy_pool_enabled(cfg),
+        "proxy_rotate_enabled": bool(cfg.get("proxy_rotate_enabled")),
+        "proxy_rotate_interval_min": max(1, int(cfg.get("proxy_rotate_interval_min") or 30)),
+        "proxy_rotate_last_at": float(cfg.get("proxy_rotate_last_at") or 0),
         "windows_autostart": bool(cfg.get("windows_autostart")),
         "autostart_installed": _startup_bat_path().is_file(),
     }
@@ -217,6 +237,11 @@ def get_windows_autostart() -> dict[str, Any]:
     }
 
 
+def is_proxy_pool_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    cfg = cfg if cfg is not None else load_config()
+    return bool(cfg.get("proxy_pool_enabled"))
+
+
 def parse_proxy_pool(text: str) -> list[str]:
     lines = []
     for line in (text or "").splitlines():
@@ -227,10 +252,72 @@ def parse_proxy_pool(text: str) -> list[str]:
 
 
 def next_proxy_for_profile(profile_index: int = 0) -> str:
-    pool = load_config().get("proxy_pool") or []
+    return _proxy_url_for_index(load_config(), profile_index)
+
+
+def _proxy_url_for_index(cfg: dict[str, Any], profile_index: int) -> str:
+    if not is_proxy_pool_enabled(cfg):
+        return ""
+    pool = cfg.get("proxy_pool") or []
     if not pool:
         return ""
-    return str(pool[profile_index % len(pool)])
+    offset = int(cfg.get("proxy_rotate_offset") or 0)
+    idx = (profile_index + offset) % len(pool)
+    return str(pool[idx])
+
+
+def proxy_rotate_interval_seconds(cfg: dict[str, Any] | None = None) -> int:
+    cfg = cfg if cfg is not None else load_config()
+    return max(60, int(cfg.get("proxy_rotate_interval_min") or 30) * 60)
+
+
+async def maybe_rotate_proxies() -> bool:
+    cfg = load_config()
+    if not is_proxy_pool_enabled(cfg) or not cfg.get("proxy_rotate_enabled"):
+        return False
+    pool = cfg.get("proxy_pool") or []
+    if len(pool) < 2:
+        return False
+    interval_s = proxy_rotate_interval_seconds(cfg)
+    now = time.time()
+    last_at = float(cfg.get("proxy_rotate_last_at") or 0)
+    if last_at <= 0:
+        save_config({"proxy_rotate_last_at": now})
+        return False
+    if now - last_at < interval_s:
+        return False
+    new_offset = int(cfg.get("proxy_rotate_offset") or 0) + 1
+    save_config({"proxy_rotate_offset": new_offset, "proxy_rotate_last_at": now})
+    await push_proxy_to_extensions()
+    logger.info(
+        "proxy rotated offset=%s interval=%sm profiles=%s",
+        new_offset,
+        int(cfg.get("proxy_rotate_interval_min") or 30),
+        len(pool),
+    )
+    return True
+
+
+async def proxy_rotate_loop() -> None:
+    while True:
+        try:
+            await maybe_rotate_proxies()
+        except Exception as exc:
+            logger.warning("proxy rotate tick failed: %s", exc)
+        await asyncio.sleep(30)
+
+
+def _profile_proxy_index(profile_id: str) -> int:
+    from flow2api.services.extension_pool import get_extension_pool
+
+    idx = 0
+    for session in get_extension_pool().list_sessions():
+        if session.profile_id.startswith("_"):
+            continue
+        if session.profile_id == profile_id:
+            return idx
+        idx += 1
+    return 0
 
 
 async def broadcast_system(payload: dict) -> None:
@@ -244,21 +331,25 @@ async def force_refresh_all() -> dict[str, Any]:
     return {"ok": True, "message": "Đã gửi lệnh F5 toàn bộ tab Flow"}
 
 
-async def push_proxy_to_extensions() -> None:
+async def push_proxy_to_session(session: Any, profile_index: int | None = None) -> None:
     cfg = load_config()
-    pool = cfg.get("proxy_pool") or []
+    idx = profile_index if profile_index is not None else _profile_proxy_index(session.profile_id)
+    proxy_url = _proxy_url_for_index(cfg, idx)
+    try:
+        await session.send_json({"type": "system_set_proxy", "proxyUrl": proxy_url})
+    except Exception as exc:
+        logger.warning("proxy push failed %s: %s", session.profile_id[:8], exc)
+
+
+async def push_proxy_to_extensions() -> None:
     idx = 0
     from flow2api.services.extension_pool import get_extension_pool
 
     for session in get_extension_pool().list_sessions():
         if session.profile_id.startswith("_"):
             continue
-        proxy_url = pool[idx % len(pool)] if pool else ""
+        await push_proxy_to_session(session, idx)
         idx += 1
-        try:
-            await session.send_json({"type": "system_set_proxy", "proxyUrl": proxy_url})
-        except Exception as exc:
-            logger.warning("proxy push failed %s: %s", session.profile_id[:8], exc)
 
 
 def _extension_push_config() -> dict[str, Any]:

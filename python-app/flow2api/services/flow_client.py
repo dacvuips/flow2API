@@ -111,6 +111,30 @@ def pick_profile_for_retry(
     )
 
 
+def apply_user_profile_assignment(
+    params: dict[str, Any],
+    profile_id: Optional[str],
+) -> dict[str, Any]:
+    """Pin task to a Chrome profile, or clear pin when profile_id is empty."""
+    out = dict(params or {})
+    pid = str(profile_id or "").strip()
+    if pid:
+        session = get_extension_pool().get(pid)
+        if not session or pid.startswith("_"):
+            raise ValueError("profile_not_found")
+        out["profile_id"] = pid
+        out["profile_assigned_by_user"] = True
+        out["profile_label"] = session.display_name()
+        if session.email:
+            out["profile_email"] = session.email
+        else:
+            out.pop("profile_email", None)
+    else:
+        for key in ("profile_id", "profile_label", "profile_email", "profile_assigned_by_user"):
+            out.pop(key, None)
+    return out
+
+
 def profile_available_for_queue(
     params: dict[str, Any],
     request_type: str | None = None,
@@ -119,6 +143,10 @@ def profile_available_for_queue(
 
     credit_required = request_requires_credit_profile(params, request_type)
     pid = params.get("profile_id")
+    if params.get("profile_assigned_by_user") and pid:
+        if not is_profile_dispatch_enabled(str(pid)):
+            return False
+        return bool(pick_profile_for_task(str(pid), credit_required=credit_required))
     if pid and not is_profile_dispatch_enabled(str(pid)):
         return bool(pick_profile_for_task(None, credit_required=credit_required))
     if pid:

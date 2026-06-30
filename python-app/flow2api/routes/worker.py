@@ -85,7 +85,7 @@ async def update_worker_settings(body: WorkerSettingsBody, _=Depends(_auth_key_i
     if body.profile_default_max_concurrent is not None:
         fields["profile_default_max_concurrent"] = body.profile_default_max_concurrent
     saved = save_worker_settings(**fields)
-    return {**saved.to_dict(), "ok": True}
+    return {**saved.to_dict(), "profiles": get_extension_pool().list_public(), "ok": True}
 
 
 @router.put("/profile-limits")

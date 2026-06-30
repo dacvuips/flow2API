@@ -25,6 +25,8 @@ from flow2api.services.video_upsample import (
     run_upsample_video,
 )
 from flow2api.short_id import new_request_id
+from flow2api.services.flow_client import apply_user_profile_assignment
+from flow2api.services.extension_pool import get_extension_pool
 from flow2api.worker.processor import get_worker
 
 router = APIRouter(prefix="/api/requests", tags=["requests"])
@@ -68,6 +70,10 @@ class UpsampleVideoRequest(BaseModel):
     profile_id: Optional[str] = None
     aspect_ratio: Optional[str] = None
     workflow_id: Optional[str] = None
+
+
+class AssignRequestProfileBody(BaseModel):
+    profile_id: Optional[str] = None
 
 
 _RETRY_DROP_KEYS = frozenset(
@@ -115,6 +121,12 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
     params = normalize_request_params(dict(body.params))
     if body.type == "unsupported":
         raise HTTPException(400, params.get("error") or "unsupported")
+    pid = str(params.get("profile_id") or "").strip()
+    if pid:
+        try:
+            params = apply_user_profile_assignment(params, pid)
+        except ValueError as exc:
+            raise HTTPException(400, "profile_not_found") from exc
     prompt = str(params.get("prompt") or "")
     model = params.get("image_model") or get_video_quality(params) or ""
     rid = new_request_id()
@@ -302,6 +314,40 @@ async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)
     )
     events.publish("request_finished", {"id": request_id, "status": "queued"})
     return {"id": request_id, "status": "queued"}
+
+
+@router.put("/{request_id}/profile")
+async def assign_request_profile(
+    request_id: str,
+    body: AssignRequestProfileBody,
+    _=Depends(_auth_key_id),
+):
+    row = activity.get_request(request_id)
+    if not row:
+        raise HTTPException(404, "not_found")
+    if row.status != "queued":
+        raise HTTPException(409, f"cannot_assign_profile (status={row.status})")
+    params = json.loads(row.params_json or "{}")
+    try:
+        params = apply_user_profile_assignment(params, body.profile_id)
+    except ValueError as exc:
+        raise HTTPException(400, "profile_not_found") from exc
+    activity.update_request(request_id, params=params)
+    append_request_log(
+        request_id,
+        "http",
+        f"PUT /api/requests/{request_id}/profile → {body.profile_id or 'auto'}",
+        level="info",
+    )
+    events.publish("queue_changed", {"id": request_id, "profile_id": body.profile_id})
+    return {
+        "id": request_id,
+        "status": row.status,
+        "profile_id": params.get("profile_id"),
+        "profile_assigned_by_user": bool(params.get("profile_assigned_by_user")),
+        "profiles": get_extension_pool().list_public(),
+        "ok": True,
+    }
 
 
 @router.get("/{request_id}")

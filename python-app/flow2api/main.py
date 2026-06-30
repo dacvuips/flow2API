@@ -156,6 +156,9 @@ async def lifespan(app: FastAPI):
     from flow2api.services.system_ops import telegram_poll_loop
 
     telegram_task = asyncio.create_task(telegram_poll_loop())
+    from flow2api.services.system_ops import proxy_rotate_loop
+
+    proxy_rotate_task = asyncio.create_task(proxy_rotate_loop())
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,
@@ -168,9 +171,10 @@ async def lifespan(app: FastAPI):
     watchdog_task.cancel()
     retention_task.cancel()
     telegram_task.cancel()
+    proxy_rotate_task.cancel()
     try:
         await asyncio.gather(
-            ws_task, worker_task, watchdog_task, retention_task, telegram_task, return_exceptions=True
+            ws_task, worker_task, watchdog_task, retention_task, telegram_task, proxy_rotate_task, return_exceptions=True
         )
     except Exception:
         pass

@@ -483,7 +483,11 @@ class WorkerController:
         credit_required = request_requires_credit_profile(params, request_type)
         existing = params.get("profile_id")
         exclude = params.get("retry_exclude_profile_id")
-        if existing:
+        if params.get("profile_assigned_by_user") and existing:
+            profile_id = pick_profile_for_task(str(existing), credit_required=credit_required)
+            if not profile_id:
+                raise RuntimeError("assigned_profile_not_available")
+        elif existing:
             profile_id = pick_profile_for_task(str(existing), credit_required=credit_required)
             if not profile_id:
                 profile_id = pick_profile_for_task(None, credit_required=credit_required)

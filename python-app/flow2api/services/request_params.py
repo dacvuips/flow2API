@@ -61,4 +61,10 @@ def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
     if video_base64s:
         out["video_base64s"] = video_base64s
 
+    if not out.get("profile_id"):
+        for key in ("profileId",):
+            if out.get(key):
+                out["profile_id"] = str(out[key]).strip()
+                break
+
     return out

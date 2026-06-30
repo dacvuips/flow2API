@@ -443,6 +443,12 @@ class ExtensionPool:
             await session.send_json({"type": "system_push_config", "config": _extension_push_config()})
         except Exception:
             pass
+        from flow2api.services.system_ops import push_proxy_to_session
+
+        try:
+            await push_proxy_to_session(session)
+        except Exception:
+            pass
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})
         append_request_log(
             None,

@@ -1,6 +1,8 @@
 """Dashboard settings: Telegram, proxy, system control."""
 from __future__ import annotations
 
+import time
+
 from typing import Any
 
 from fastapi import APIRouter
@@ -19,6 +21,15 @@ class TelegramBody(BaseModel):
 
 class ProxyBody(BaseModel):
     proxies: str = ""
+
+
+class ProxyEnabledBody(BaseModel):
+    enabled: bool
+
+
+class ProxyRotateBody(BaseModel):
+    enabled: bool | None = None
+    interval_min: int | None = None
 
 
 class AutostartBody(BaseModel):
@@ -52,8 +63,48 @@ async def test_telegram():
 async def save_proxy(body: ProxyBody):
     pool = system_ops.parse_proxy_pool(body.proxies)
     saved = system_ops.save_config({"proxy_pool": pool})
-    await system_ops.push_proxy_to_extensions()
     return {"ok": True, "count": len(pool), "proxy_pool": saved.get("proxy_pool")}
+
+
+@router.post("/proxy/enabled")
+async def set_proxy_enabled(body: ProxyEnabledBody):
+    saved = system_ops.save_config({"proxy_pool_enabled": body.enabled})
+    await system_ops.push_proxy_to_extensions()
+    state = "bật gắn proxy vào profile" if body.enabled else "tắt gắn proxy (đã gỡ khỏi Chrome)"
+    return {
+        "ok": True,
+        "proxy_pool_enabled": system_ops.is_proxy_pool_enabled(saved),
+        "message": f"Đã {state}",
+    }
+
+
+@router.post("/proxy/rotate")
+async def set_proxy_rotate(body: ProxyRotateBody):
+    cfg = system_ops.load_config()
+    patch: dict[str, Any] = {}
+    if body.enabled is not None:
+        was_enabled = bool(cfg.get("proxy_rotate_enabled"))
+        patch["proxy_rotate_enabled"] = body.enabled
+        if body.enabled and not was_enabled:
+            patch["proxy_rotate_last_at"] = time.time()
+    if body.interval_min is not None:
+        patch["proxy_rotate_interval_min"] = max(1, min(1440, int(body.interval_min)))
+    saved = system_ops.save_config(patch)
+    pub = system_ops.public_config()
+    if body.enabled:
+        msg = f"Đã bật xoay proxy mỗi {pub['proxy_rotate_interval_min']} phút"
+    elif body.enabled is False:
+        msg = "Đã tắt xoay proxy"
+    elif body.interval_min is not None:
+        msg = f"Thời gian xoay: {pub['proxy_rotate_interval_min']} phút"
+    else:
+        msg = "Đã lưu cấu hình xoay proxy"
+    return {
+        "ok": True,
+        "proxy_rotate_enabled": bool(saved.get("proxy_rotate_enabled")),
+        "proxy_rotate_interval_min": pub["proxy_rotate_interval_min"],
+        "message": msg,
+    }
 
 
 @router.get("/autostart")
