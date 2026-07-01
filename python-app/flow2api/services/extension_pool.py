@@ -32,6 +32,11 @@ class ExtensionSession:
         self.profile_label = profile_label or profile_id[:8]
         self._ws: Any = None
         self._pending: dict[str, asyncio.Future] = {}
+        # rid (public task id) -> {ws_req_id, ...} — tracks which extension
+        # WS messages currently belong to which worker task, so cancel can
+        # tell the extension exactly which fetch()es to abort. Populated /
+        # cleaned by _send.
+        self._trace_pending: dict[str, set[str]] = {}
         self.flow_key: Optional[str] = None
         self.token_captured_at: Optional[float] = None
         self.user_info: Optional[dict] = None
@@ -91,6 +96,7 @@ class ExtensionSession:
             if not fut.done():
                 fut.set_exception(ConnectionError("Extension disconnected"))
         self._pending.clear()
+        self._trace_pending.clear()
         logger.warning("Profile %s disconnected (%s)", self.profile_id[:12], self.display_name())
 
     async def send_json(self, payload: dict) -> None:
@@ -136,9 +142,15 @@ class ExtensionSession:
         if not self._ws:
             raise RuntimeError("extension_not_connected")
         req_id = str(uuid.uuid4())
+        trace_rid = self.trace_request_id
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
+        # Remember which task owns this in-flight WS request so
+        # cancel_running_tasks can ask the extension to abort exactly
+        # these fetches — without touching flow_sdk / retry logic.
+        if trace_rid:
+            self._trace_pending.setdefault(trace_rid, set()).add(req_id)
         await self._ws.send(json.dumps({"id": req_id, "method": method, "params": params}))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
@@ -146,6 +158,47 @@ class ExtensionSession:
             raise RuntimeError("extension_timeout") from exc
         finally:
             self._pending.pop(req_id, None)
+            if trace_rid:
+                pending = self._trace_pending.get(trace_rid)
+                if pending is not None:
+                    pending.discard(req_id)
+                    if not pending:
+                        self._trace_pending.pop(trace_rid, None)
+
+    def snapshot_trace_pending(self, rid: str) -> list[str]:
+        """Return WS req_ids in-flight for a task. Called synchronously by
+        cancel_running_tasks BEFORE task.cancel() so the finally-block
+        cleanup race in _send can't erase the state we need."""
+        if not rid:
+            return []
+        pending = self._trace_pending.get(rid)
+        return list(pending) if pending else []
+
+    async def send_abort(self, ws_req_id: str) -> bool:
+        """Fire-and-forget: ask the extension to abort a specific WS request.
+        Returns True if the message reached the socket, False otherwise.
+        We never wait for a response — the extension is by design not
+        acknowledging aborts."""
+        if not ws_req_id or not self._ws:
+            return False
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "method": "abort_request",
+                        "params": {"targetId": str(ws_req_id)},
+                    }
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.debug(
+                "send_abort failed profile=%s req=%s: %s",
+                self.profile_id[:8],
+                str(ws_req_id)[:8],
+                exc,
+            )
+            return False
 
     def _update_clear_state(self, payload: dict | None) -> None:
         if not isinstance(payload, dict):
@@ -773,6 +826,40 @@ class ExtensionPool:
                 if actual == 0:
                     self._schedule_pending_proxy_flush(session)
         return drift
+
+    def snapshot_trace_pending(self, rid: str) -> list[tuple[ExtensionSession, str]]:
+        """Snapshot every (session, ws_req_id) pair currently in-flight for a
+        task rid. Must be called synchronously right before task.cancel()
+        so we capture state before _send's finally-block cleanup runs."""
+        if not rid:
+            return []
+        pairs: list[tuple[ExtensionSession, str]] = []
+        for session in self._sessions.values():
+            for req_id in session.snapshot_trace_pending(rid):
+                pairs.append((session, req_id))
+        return pairs
+
+    async def abort_snapshot(
+        self, pairs: list[tuple[ExtensionSession, str]]
+    ) -> int:
+        """Deliver abort_request WS messages for a previously-snapshotted set
+        of (session, ws_req_id) pairs. Fire-and-forget: swallow send errors
+        so a dying WS never affects other sessions or worker cleanup."""
+        if not pairs:
+            return 0
+        sent = 0
+        for session, req_id in pairs:
+            try:
+                if await session.send_abort(req_id):
+                    sent += 1
+            except Exception as exc:
+                logger.debug(
+                    "abort_snapshot dispatch failed profile=%s req=%s: %s",
+                    session.profile_id[:8],
+                    str(req_id)[:8],
+                    exc,
+                )
+        return sent
 
     async def broadcast(self, payload: dict) -> None:
         for session in self._sessions.values():

@@ -106,9 +106,36 @@ class WorkerController:
         self._cancelled.add(rid)
 
     def cancel_running_tasks(self, ids: set[str] | None = None) -> None:
-        """Cancel in-flight asyncio tasks (optional subset by request id)."""
+        """Cancel in-flight asyncio tasks (optional subset by request id).
+
+        Before cancelling the asyncio task we snapshot the ws req_ids that
+        are currently in-flight on any extension for that task and fire a
+        best-effort `abort_request` message so the Chrome extension can
+        tear the underlying `fetch()` down. The snapshot has to happen
+        BEFORE ``task.cancel()`` because ``_send``'s finally-block cleanup
+        would otherwise erase the mapping we need.
+        """
         self._prune_running()
         targets = set(ids) if ids is not None else set(self._running.keys())
+        pool = get_extension_pool()
+
+        abort_snapshot: list = []
+        for rid in list(self._running.keys()):
+            if rid not in targets:
+                continue
+            abort_snapshot.extend(pool.snapshot_trace_pending(rid))
+
+        # Fire-and-forget so cancel_running_tasks stays sync and callers
+        # (including sync internal ones like _handle_running_stuck) don't
+        # have to await. If we're not inside a running loop, silently
+        # drop the abort — the asyncio-task cancel below still runs.
+        if abort_snapshot:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(pool.abort_snapshot(abort_snapshot))
+            except RuntimeError:
+                pass
+
         for rid in list(self._running.keys()):
             if rid not in targets:
                 continue

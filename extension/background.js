@@ -26,6 +26,45 @@ let metrics = {
   lastError:       null,
 };
 
+// ─── Cancel / Abort tracking ─────────────────────────────────────────
+// The agent can send { method: 'abort_request', params: { targetId } }
+// to tell us to stop a specific in-flight api_request / trpc_request /
+// raw_request that we already accepted. Fire-and-forget from the agent's
+// side — we never send a response for the abort message itself.
+//
+// abortControllers: keyed by ws message id -> AbortController for fetch()
+// abortedRequestIds: keyed by ws message id — set when abort arrived
+//   BEFORE we registered a controller (or between checkpoints), so the
+//   handler can bail out at the next gate.
+const abortControllers = new Map();
+const abortedRequestIds = new Set();
+
+function markRequestAborted(targetId) {
+  if (!targetId) return;
+  const key = String(targetId);
+  abortedRequestIds.add(key);
+  const controller = abortControllers.get(key);
+  if (controller) {
+    try { controller.abort(); } catch { /* AbortController.abort never throws in Chrome */ }
+  }
+}
+
+function isRequestAborted(id) {
+  return !!id && abortedRequestIds.has(String(id));
+}
+
+function registerAbortController(id, controller) {
+  if (!id || !controller) return;
+  abortControllers.set(String(id), controller);
+}
+
+function clearAbortTracking(id) {
+  if (!id) return;
+  const key = String(id);
+  abortControllers.delete(key);
+  abortedRequestIds.delete(key);
+}
+
 const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
 
 // Disable captcha-triggered tab reload; use timed auto-reload instead.
@@ -323,6 +362,17 @@ function connectToAgent() {
         chrome.storage.local.set({ proxyUrl: msg.proxyUrl || '' });
       } else if (msg.type === 'system_push_config') {
         applySystemPushConfig(msg.config);
+      } else if (msg.method === 'abort_request') {
+        // Agent asks us to abort a specific in-flight fetch. Never send a
+        // response back — this is fire-and-forget by design so the agent
+        // can shed work without a synchronous round-trip. If we haven't
+        // registered a controller yet (message ordering race), we still
+        // remember the id and bail at the next checkpoint in the handler.
+        const targetId =
+          msg.params?.targetId
+          || msg.params?.id
+          || msg.params?.requestId;
+        if (targetId) markRequestAborted(targetId);
       } else if (msg.method === 'api_request') {
         await handleApiRequest(msg);
       } else if (msg.method === 'trpc_request') {
@@ -491,6 +541,14 @@ async function handleApiRequest(msg) {
     return;
   }
 
+  // Agent may have canceled this task before the message reached us.
+  // Bail immediately: no captcha, no fetch, no credit burn.
+  if (isRequestAborted(id)) {
+    sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+    clearAbortTracking(id);
+    return;
+  }
+
   setState('running');
   const hasCaptcha = !!captchaAction;
   if (hasCaptcha) metrics.requestCount++;
@@ -527,6 +585,16 @@ async function handleApiRequest(msg) {
       return;
     }
 
+    // Gate #1: bail before spending a captcha solve if agent already
+    // canceled us. captcha solves are rate-limited AND single-use so
+    // skipping them here is the biggest early-exit win.
+    if (isRequestAborted(id)) {
+      sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+      updateRequestLog(id, { status: 'failed', error: 'REQUEST_CANCELED' });
+      setState('idle');
+      return;
+    }
+
     // Step 2: Solve captcha if needed
     let captchaToken = null;
     if (captchaAction) {
@@ -547,6 +615,16 @@ async function handleApiRequest(msg) {
         setState('idle');
         return;
       }
+    }
+
+    // Gate #2: last chance before the fetch actually reaches Google.
+    // Everything past this point can burn Flow credits, so this gate
+    // is the credit-saving one.
+    if (isRequestAborted(id)) {
+      sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+      updateRequestLog(id, { status: 'failed', error: 'REQUEST_CANCELED' });
+      setState('idle');
+      return;
     }
 
     // Step 2: Inject captcha token into body clone if present
@@ -575,23 +653,33 @@ async function handleApiRequest(msg) {
       }
     }
 
+    // Wire an AbortController so an abort message arriving mid-fetch
+    // (after Google has been contacted) can tear the socket down. If
+    // abort arrived between the gate above and here, propagate now
+    // instead of firing the request.
+    const controller = new AbortController();
+    registerAbortController(id, controller);
+    if (isRequestAborted(id)) controller.abort();
+
     let response = await fetch(url, {
       method:      method || 'POST',
       headers:     fetchHeaders,
       credentials: 'include',
       body:        requestBody,
+      signal:      controller.signal,
     });
 
     if (response.status === 401) {
       console.warn('[Flow2API] API_401 - refreshing token and retrying once');
       const refreshed = await ensureFreshFlowToken('api_401_retry', true);
-      if (refreshed && flowKey) {
+      if (refreshed && flowKey && !isRequestAborted(id)) {
         fetchHeaders.authorization = `Bearer ${flowKey}`;
         response = await fetch(url, {
           method:      method || 'POST',
           headers:     fetchHeaders,
           credentials: 'include',
           body:        requestBody,
+          signal:      controller.signal,
         });
       }
     }
@@ -614,9 +702,19 @@ async function handleApiRequest(msg) {
       updateRequestLog(id, { status: 'failed', httpStatus: response.status, error: `API_${response.status}` });
     }
   } catch (e) {
-    sendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
-    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message || 'API_REQUEST_FAILED'; }
-    updateRequestLog(id, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
+    // fetch throws DOMException("AbortError") when controller.abort()
+    // fires. Report a distinct 499 so the agent (or a later reviewer
+    // reading logs) can tell "user canceled" apart from "network died".
+    if (e?.name === 'AbortError' || isRequestAborted(id)) {
+      sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+      updateRequestLog(id, { status: 'failed', error: 'REQUEST_CANCELED' });
+    } else {
+      sendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message || 'API_REQUEST_FAILED'; }
+      updateRequestLog(id, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
+    }
+  } finally {
+    clearAbortTracking(id);
   }
 
   chrome.storage.local.set({ metrics });
@@ -1096,6 +1194,12 @@ async function handleTrpcRequest(msg) {
     return;
   }
 
+  if (isRequestAborted(id)) {
+    sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+    clearAbortTracking(id);
+    return;
+  }
+
   setState('running');
 
   const fetchHeaders = { ...headers };
@@ -1107,12 +1211,17 @@ async function handleTrpcRequest(msg) {
     fetchHeaders['Content-Type'] = 'application/json';
   }
 
+  const controller = new AbortController();
+  registerAbortController(id, controller);
+  if (isRequestAborted(id)) controller.abort();
+
   try {
     const resp = await fetch(url, {
       method,
       headers: fetchHeaders,
       body: hasBody ? JSON.stringify(body) : undefined,
       credentials: 'include',
+      signal: controller.signal,
     });
     const text = await resp.text();
     let data;
@@ -1131,9 +1240,14 @@ async function handleTrpcRequest(msg) {
       }
     }
   } catch (e) {
-    console.error('[Flow2API] tRPC request failed:', e);
-    sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+    if (e?.name === 'AbortError' || isRequestAborted(id)) {
+      sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+    } else {
+      console.error('[Flow2API] tRPC request failed:', e);
+      sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+    }
   } finally {
+    clearAbortTracking(id);
     setState('idle');
   }
 }
@@ -1151,7 +1265,17 @@ async function handleRawRequest(msg) {
     return;
   }
 
+  if (isRequestAborted(id)) {
+    sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+    clearAbortTracking(id);
+    return;
+  }
+
   setState('running');
+  const controller = new AbortController();
+  registerAbortController(id, controller);
+  if (isRequestAborted(id)) controller.abort();
+
   try {
     const fetchHeaders = { ...(headers || {}) };
     const authKey = Object.keys(fetchHeaders).find((k) => k.toLowerCase() === 'authorization');
@@ -1170,6 +1294,7 @@ async function handleRawRequest(msg) {
       headers: fetchHeaders,
       body,
       credentials: 'include',
+      signal: controller.signal,
     });
     const text = await resp.text();
     let data;
@@ -1180,9 +1305,14 @@ async function handleRawRequest(msg) {
     }
     sendToAgent({ id, status: resp.status, data });
   } catch (e) {
-    console.error('[Flow2API] raw request failed:', e);
-    sendToAgent({ id, status: 500, error: e.message || 'RAW_REQUEST_FAILED' });
+    if (e?.name === 'AbortError' || isRequestAborted(id)) {
+      sendToAgent({ id, status: 499, error: 'REQUEST_CANCELED' });
+    } else {
+      console.error('[Flow2API] raw request failed:', e);
+      sendToAgent({ id, status: 500, error: e.message || 'RAW_REQUEST_FAILED' });
+    }
   } finally {
+    clearAbortTracking(id);
     setState('idle');
   }
 }
