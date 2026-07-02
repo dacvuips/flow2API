@@ -161,10 +161,12 @@ UI_PREP_ONLY = os.environ.get("FLOW2API_UI_PREP_ONLY", "1").strip().lower() in (
     "on",
 )
 # Delay ngẫu nhiên giữa mỗi thao tác UI Playwright (giây).
-UI_ACTION_DELAY_MIN_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MIN_S", "2"))
+UI_ACTION_DELAY_MIN_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MIN_S", "1"))
 UI_ACTION_DELAY_MAX_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MAX_S", "5"))
 # Chờ ảnh preview trong modal thư viện trước khi bấm "Thêm vào câu lệnh".
 UI_UPLOAD_PREVIEW_TIMEOUT_S = float(os.environ.get("FLOW2API_UI_UPLOAD_PREVIEW_TIMEOUT_S", "120"))
+# Số lần tự retry upload ảnh qua Playwright khi lỗi.
+UI_UPLOAD_RETRY_MAX = int(os.environ.get("FLOW2API_UI_UPLOAD_RETRY_MAX", "3"))
 CDP_BASE_PORT = int(os.environ.get("FLOW2API_CDP_BASE_PORT", "9236"))
 # Port CDP cố định cho profile Chrome có tab Flow (Default = 9236).
 PLAYWRIGHT_FLOW_CDP_PORT = int(

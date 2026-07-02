@@ -105,8 +105,11 @@ async def _run_flow_ui_prep(
     meta = await prepare_request_on_flow_ui(
         profile_id=profile_id,
         request_id=rid,
+        request_type=req_type,
         prompt=prompt,
         image_base64s=image_base64s,
+        aspect_ratio=str(params.get("aspect_ratio") or "16:9"),
+        image_model=str(params.get("image_model") or "NANO_BANANA_PRO"),
         proxy_url=proxy_url,
     )
     append_request_log(
@@ -118,6 +121,43 @@ async def _run_flow_ui_prep(
         level="info",
     )
     return meta
+
+
+async def _resolve_ui_image_previews(client: Any, ui_meta: dict[str, Any]) -> dict[str, Any]:
+    """
+    UI submit đôi khi trả media_ids trước, URL ảnh về sau.
+    Bổ sung image_urls bằng cách gọi get_media theo media_id.
+    """
+    gen = ui_meta.get("ui_generation") if isinstance(ui_meta, dict) else None
+    if not isinstance(gen, dict):
+        return ui_meta
+
+    urls = [str(x) for x in (gen.get("image_urls") or []) if x]
+    if urls:
+        return ui_meta
+
+    media_ids = [str(x) for x in (gen.get("media_ids") or []) if x]
+    if not media_ids:
+        return ui_meta
+
+    resolved: list[str] = []
+    for mid in media_ids:
+        try:
+            resp = await client.get_media(mid)
+            remote_url, raw, mime = flow_sdk.parse_get_media_image(resp)
+            if remote_url:
+                resolved.append(str(remote_url))
+            elif raw:
+                b64 = __import__("base64").b64encode(raw).decode("ascii")
+                kind = "png" if "png" in str(mime or "").lower() else "jpeg"
+                resolved.append(f"data:image/{kind};base64,{b64}")
+        except Exception:
+            continue
+
+    if resolved:
+        gen["image_urls"] = resolved
+        ui_meta["ui_generation"] = gen
+    return ui_meta
 
 
 def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
@@ -992,6 +1032,20 @@ class WorkerController:
             from flow2api.services.playwright_flow import is_ui_prep_only
 
             if is_ui_prep_only():
+                if req_type == "gen_image":
+                    ui_meta = await _resolve_ui_image_previews(client, ui_meta)
+                # Dashboard expects output media fields at top-level result.*
+                # UI prep flow currently keeps them under result.ui_generation.
+                # Mirror them to top-level for consistent preview rendering.
+                if req_type == "gen_image" and isinstance(ui_meta, dict):
+                    gen = ui_meta.get("ui_generation")
+                    if isinstance(gen, dict):
+                        if not ui_meta.get("image_urls") and isinstance(gen.get("image_urls"), list):
+                            ui_meta["image_urls"] = [str(u) for u in gen.get("image_urls") if u]
+                        if not ui_meta.get("media_ids") and isinstance(gen.get("media_ids"), list):
+                            ui_meta["media_ids"] = [str(m) for m in gen.get("media_ids") if m]
+                        if not ui_meta.get("media_entries") and isinstance(gen.get("media_entries"), list):
+                            ui_meta["media_entries"] = [e for e in gen.get("media_entries") if e]
                 result = {
                     "ui_prep": True,
                     "project_id": project_id,

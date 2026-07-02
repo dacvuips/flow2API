@@ -16,7 +16,9 @@ from flow2api.config import (
     UI_AUTOMATION_ENABLED,
     UI_PREP_ONLY,
     UI_UPLOAD_PREVIEW_TIMEOUT_S,
+    UI_UPLOAD_RETRY_MAX,
 )
+from flow2api.services import flow_sdk
 from flow2api.services.flow_sdk import UPLOAD_IMAGE_PATH
 from flow2api.services.playwright_pool import get_playwright_pool, is_playwright_enabled
 from flow2api.services.result_media import _decode_image_bytes
@@ -43,6 +45,17 @@ _PROMPT_PLACEHOLDER = re.compile(r"bạn muốn tạo|what do you want", re.I)
 # DevTools: nút [+] prompt bar — <button aria-haspopup="dialog"><i>add_2</i><span>Tạo</span>
 _PROMPT_ADD_ICON = re.compile(r"^add_2$", re.I)
 _CREATE_BTN_NAME = re.compile(r"^tạo$", re.I)
+_MODEL_CHIP_PATTERNS = re.compile(r"nano banana|banana|imagen|pro|lite", re.I)
+_MODEL_CHIP_ROW_PATTERNS = re.compile(r"nano banana|banana", re.I)
+_UPLOAD_TEXT = re.compile(r"tải nội dung|tải tệp|upload", re.I)
+_ASPECT_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16")
+_VARIANT_COUNT_LABELS = frozenset({"1x", "x1", "x2", "x3", "x4"})
+_KNOWN_IMAGE_MODELS: dict[str, str] = {
+    "NANO_BANANA_PRO": "Nano Banana Pro",
+    "NANO_BANANA_2": "Nano Banana 2",
+    "NANO_BANANA_2_LITE": "Nano Banana 2 Lite",
+}
+_GENERATE_IMAGE_API_PATTERNS = re.compile(r"flowMedia:batchGenerateImages|batchGenerateImages", re.I)
 
 
 async def _ui_delay(step: str = "") -> float:
@@ -734,6 +747,656 @@ async def _click_add_to_prompt(page: Any) -> bool:
     return await _click_first_matching(page, _ADD_TO_PROMPT_PATTERNS)
 
 
+def _normalize_image_model_name(model: str) -> str:
+    raw = str(model or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper()
+    if upper in _KNOWN_IMAGE_MODELS:
+        return _KNOWN_IMAGE_MODELS[upper]
+    return raw.replace("_", " ").strip()
+
+
+def _normalize_aspect_ratio(value: str) -> str:
+    raw = str(value or "").strip()
+    return raw if raw in _ASPECT_RATIOS else "16:9"
+
+
+def _panel_has_aspect_toolbar_text(text: str) -> bool:
+    txt = str(text or "")
+    return all(r in txt for r in _ASPECT_RATIOS)
+
+
+def _is_media_library_panel_text(text: str) -> bool:
+    """Modal thư viện upload — không phải panel cài đặt model/tỉ lệ."""
+    txt = str(text or "")
+    if "Tìm kiếm thành phần" in txt:
+        return True
+    if "Thêm vào câu lệnh" in txt and not _panel_has_aspect_toolbar_text(txt):
+        return True
+    if _UPLOAD_TEXT.search(txt) and not _panel_has_aspect_toolbar_text(txt):
+        return True
+    return False
+
+
+async def _settings_popover_open(page: Any) -> Any | None:
+    """Popover cài đặt model + tỉ lệ (UI gộp Image+Video)."""
+    selectors = (
+        '[role="dialog"][data-state="open"]',
+        '[data-radix-popper-content-wrapper]',
+        '[role="menu"][data-state="open"]',
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = await loc.count()
+            for idx in range(count - 1, -1, -1):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    txt = (await cand.inner_text() or "").strip()
+                    if _is_media_library_panel_text(txt):
+                        continue
+                    if _panel_has_aspect_toolbar_text(txt):
+                        return cand
+                    if "Nano Banana" in txt and any(r in txt for r in _ASPECT_RATIOS):
+                        return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+async def _model_chip_button_locator(page: Any) -> Any | None:
+    """Chip model ở prompt bar (Nano Banana + 1x) — không phải nút + upload."""
+    composer = await _prompt_composer_locator(page)
+    near_y = await _prompt_bar_y_anchor(page)
+    scopes = [composer, page] if composer is not None else [page]
+    for scope in scopes:
+        if scope is None:
+            continue
+        try:
+            # Candidate rộng hơn: nhiều UI không chứa "Nano Banana" rõ ràng.
+            loc = scope.locator("button, [role='button']")
+            count = await loc.count()
+            best = None
+            best_score = -1
+            for idx in range(count):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    label = (await cand.inner_text() or "").strip()
+                    if not label:
+                        continue
+                    if _UPLOAD_TEXT.search(label):
+                        continue
+                    if _PROMPT_ADD_ICON.search(label):
+                        continue
+                    if "tác nhân" in label.lower():
+                        continue
+                    if _is_variant_count_label(label):
+                        continue
+                    box = await cand.bounding_box()
+                    if near_y is not None and box and abs(float(box.get("y") or 0) - near_y) > 220:
+                        continue
+                    score = 0
+                    if _MODEL_CHIP_PATTERNS.search(label):
+                        score += 4
+                    if any(v in label.lower() for v in ("1x", "x1")):
+                        score += 3
+                    if any(r in label for r in _ASPECT_RATIOS):
+                        score += 2
+                    # tránh nút + create có aria-haspopup dialog
+                    icon = cand.locator("i.google-symbols, i")
+                    if await icon.count() > 0:
+                        txt = (await icon.first.inner_text() or "").strip()
+                        if _PROMPT_ADD_ICON.match(txt):
+                            continue
+                    if score > best_score:
+                        best_score = score
+                        best = cand
+                except Exception:
+                    continue
+            if best is not None and best_score >= 2:
+                return best
+        except Exception:
+            continue
+
+    # Fallback 1: text "Nano Banana ..." rồi leo lên phần tử clickable gần nhất.
+    for scope in scopes:
+        if scope is None:
+            continue
+        try:
+            txt_hits = scope.get_by_text(_MODEL_CHIP_ROW_PATTERNS)
+            count = await txt_hits.count()
+            for idx in range(count):
+                node = txt_hits.nth(idx)
+                try:
+                    if not await node.is_visible():
+                        continue
+                    clickables = node.locator(
+                        "xpath=ancestor-or-self::button[1] | ancestor-or-self::*[@role='button'][1]"
+                    )
+                    if await clickables.count() > 0:
+                        cand = clickables.first
+                        label = (await cand.inner_text() or "").strip()
+                        if _UPLOAD_TEXT.search(label):
+                            continue
+                        if _PROMPT_ADD_ICON.search(label):
+                            continue
+                        return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Fallback 2: nút mũi tên bên phải hàng model (nếu chip tách làm 2 phần).
+    for scope in scopes:
+        if scope is None:
+            continue
+        try:
+            arrows = scope.locator(
+                "button:has(i.google-symbols:text-matches('arrow_forward|chevron_right|navigate_next')),"
+                " [role='button']:has(i.google-symbols:text-matches('arrow_forward|chevron_right|navigate_next'))"
+            )
+            count = await arrows.count()
+            for idx in range(count):
+                cand = arrows.nth(idx)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    box = await cand.bounding_box()
+                    if near_y is not None and box and abs(float(box.get("y") or 0) - near_y) > 260:
+                        continue
+                    return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+async def _open_image_settings_panel(page: Any) -> Any | None:
+    """Bấm chip model ở prompt bar để mở panel cài đặt (gộp Image+Video)."""
+    for attempt in range(3):
+        chip = await _model_chip_button_locator(page)
+        if chip is None:
+            logger.warning("Playwright UI: không tìm thấy chip model trên prompt bar (lần %s)", attempt + 1)
+            await asyncio.sleep(0.6)
+            continue
+        try:
+            try:
+                logger.info(
+                    "Playwright UI: model chip candidate #%s text=%r",
+                    attempt + 1,
+                    ((await chip.inner_text()) or "").strip()[:120],
+                )
+            except Exception:
+                pass
+            await chip.scroll_into_view_if_needed(timeout=5000)
+            await chip.click(timeout=10000)
+            await _ui_delay("sau mở panel model")
+            panel = await _settings_popover_open(page)
+            if panel is not None:
+                return panel
+            await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning("Playwright UI: mở panel model failed (lần %s): %s", attempt + 1, exc)
+    logger.warning("Playwright UI: không mở được panel model settings")
+    return None
+
+
+def _is_variant_count_label(text: str) -> bool:
+    """Nút số lượng 1x/x2/x3/x4 — mặc định 1x, không bấm."""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    for line in raw.splitlines():
+        if line.strip().lower() in _VARIANT_COUNT_LABELS:
+            return True
+    compact = re.sub(r"\s+", "", raw.lower())
+    return compact in _VARIANT_COUNT_LABELS
+
+
+def _label_matches(text: str, target: str) -> bool:
+    raw = str(text or "").strip()
+    want = str(target or "").strip()
+    if not raw or not want:
+        return False
+    if raw == want:
+        return True
+    for line in raw.splitlines():
+        if line.strip() == want:
+            return True
+    compact = re.sub(r"\s+", " ", raw)
+    return compact == want or compact.endswith(f" {want}") or compact.endswith(want)
+
+
+async def _click_exact_label(scope: Any, label: str) -> bool:
+    """Click phần tử có text khớp chính xác (tránh Nano Banana 2 vs Lite)."""
+    target = str(label or "").strip()
+    if not target:
+        return False
+    try:
+        loc = scope.locator(
+            "button, [role='button'], [role='menuitem'], [role='option'], [role='radio'], [role='tab'], div, span"
+        )
+        count = await loc.count()
+        for idx in range(count):
+            cand = loc.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "").strip()
+                if _is_variant_count_label(txt):
+                    continue
+                if not _label_matches(txt, target):
+                    continue
+                tag = (await cand.evaluate("el => el.tagName") or "").upper()
+                if tag in ("DIV", "SPAN"):
+                    btn = cand.locator(
+                        "xpath=ancestor-or-self::button[1] | ancestor-or-self::*[@role='button'][1] | ancestor-or-self::*[@role='radio'][1]"
+                    )
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=10000)
+                    else:
+                        await cand.click(timeout=10000)
+                else:
+                    await cand.click(timeout=10000)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+async def _ensure_media_settings_ready(panel: Any) -> bool:
+    """
+    UI mặc định gộp Upload Image + Video — không còn tab Hình ảnh / Video riêng.
+    Chỉ bấm tab Hình ảnh nếu gặp UI cũ (có tab nhưng chưa thấy hàng aspect ratio).
+    """
+    if await _aspect_ratio_toolbar_locator(panel) is not None:
+        logger.info("Playwright UI: panel gộp Image+Video — bỏ qua tab riêng")
+        return True
+
+    # UI cũ: còn tab Hình ảnh / Video
+    legacy_image = re.compile(r"^hình ảnh$|^image$", re.I)
+    try:
+        tabs = panel.get_by_role("tab", name=legacy_image)
+        if await tabs.count() > 0:
+            await tabs.first.click(timeout=10000)
+            await _ui_delay("sau chọn tab Hình ảnh (UI cũ)")
+            return True
+    except Exception:
+        pass
+    if await _click_exact_label(panel, "Hình ảnh"):
+        await _ui_delay("sau chọn tab Hình ảnh (UI cũ)")
+        return True
+
+    logger.warning("Playwright UI: chưa thấy toolbar aspect ratio trong panel settings")
+    return False
+
+
+def _button_matches_single_ratio(text: str, target: str) -> bool:
+    """Nút aspect ratio chỉ chứa đúng 1 label (vd. 9:16), không phải x2/x3/x4."""
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    if any(_is_variant_count_label(ln) for ln in lines):
+        return False
+    found = [r for r in _ASPECT_RATIOS if any(ln == r for ln in lines)]
+    return target in found and len(found) == 1
+
+
+async def _aspect_ratio_toolbar_locator(panel: Any) -> Any | None:
+    """Hàng 5 nút aspect ratio — không gồm hàng 1x/x2/x3/x4."""
+    try:
+        radiogroup = panel.get_by_role("radiogroup")
+        if await radiogroup.count() > 0:
+            best = None
+            best_score = -1
+            for idx in range(await radiogroup.count()):
+                cand = radiogroup.nth(idx)
+                try:
+                    txt = (await cand.inner_text() or "")
+                    if not all(r in txt for r in _ASPECT_RATIOS):
+                        continue
+                    # Ưu tiên nhóm chỉ có ratio, không có x2/x3/x4
+                    score = 10
+                    if _is_variant_count_label(txt):
+                        score = 1
+                    if score > best_score:
+                        best_score = score
+                        best = cand
+                except Exception:
+                    continue
+            if best is not None:
+                return best
+    except Exception:
+        pass
+
+    try:
+        loc = panel.locator(
+            "xpath=.//*[.//*[normalize-space(text())='16:9']"
+            " and .//*[normalize-space(text())='4:3']"
+            " and .//*[normalize-space(text())='1:1']"
+            " and .//*[normalize-space(text())='3:4']"
+            " and .//*[normalize-space(text())='9:16']"
+            " and not(.//*[normalize-space(text())='x2'])]"
+        )
+        count = await loc.count()
+        best = None
+        best_area = float("inf")
+        for idx in range(count):
+            cand = loc.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                box = await cand.bounding_box()
+                if not box:
+                    continue
+                area = float(box.get("width") or 0) * float(box.get("height") or 0)
+                if 0 < area < best_area:
+                    best_area = area
+                    best = cand
+            except Exception:
+                continue
+        if best is not None:
+            return best
+    except Exception:
+        pass
+
+    # Fallback: hàng ratio kể cả khi nằm chung panel với x2/x3/x4
+    try:
+        loc = panel.locator(
+            "xpath=.//*[.//*[normalize-space(text())='16:9']"
+            " and .//*[normalize-space(text())='4:3']"
+            " and .//*[normalize-space(text())='1:1']"
+            " and .//*[normalize-space(text())='3:4']"
+            " and .//*[normalize-space(text())='9:16']]"
+        )
+        count = await loc.count()
+        best = None
+        best_area = float("inf")
+        for idx in range(count):
+            cand = loc.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "")
+                if "x2" in txt or "x3" in txt or "x4" in txt:
+                    if not all(r in txt for r in _ASPECT_RATIOS):
+                        continue
+                box = await cand.bounding_box()
+                if not box:
+                    continue
+                area = float(box.get("width") or 0) * float(box.get("height") or 0)
+                if 0 < area < best_area:
+                    best_area = area
+                    best = cand
+            except Exception:
+                continue
+        if best is not None:
+            return best
+    except Exception:
+        pass
+    return None
+
+
+async def _select_aspect_ratio(panel: Any, aspect_ratio: str) -> bool:
+    target = _normalize_aspect_ratio(aspect_ratio)
+    toolbar = await _aspect_ratio_toolbar_locator(panel)
+    if toolbar is None:
+        logger.warning("Playwright UI: không tìm thấy hàng aspect ratio")
+        return False
+
+    logger.info("Playwright UI: chọn aspect ratio %s trong toolbar", target)
+
+    # Ưu tiên role=radio trong radiogroup (bỏ qua 1x/x2/x3/x4)
+    try:
+        radio = toolbar.get_by_role("radio", name=re.compile(rf"^{re.escape(target)}$"))
+        count = await radio.count()
+        for idx in range(count):
+            cand = radio.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "").strip()
+                if _is_variant_count_label(txt):
+                    continue
+                await cand.click(timeout=10000)
+                await _ui_delay(f"sau chọn tỉ lệ {target}")
+                logger.info("Playwright UI: đã chọn aspect ratio %s (radio)", target)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Nút từng ô — inner_text chỉ có đúng 1 ratio, không phải x2/x3/x4
+    try:
+        buttons = toolbar.locator("button, [role='button'], [role='radio']")
+        count = await buttons.count()
+        for idx in range(count):
+            btn = buttons.nth(idx)
+            try:
+                if not await btn.is_visible():
+                    continue
+                txt = (await btn.inner_text() or "").strip()
+                if _is_variant_count_label(txt):
+                    continue
+                if not _button_matches_single_ratio(txt, target):
+                    continue
+                await btn.click(timeout=10000)
+                await _ui_delay(f"sau chọn tỉ lệ {target}")
+                logger.info("Playwright UI: đã chọn aspect ratio %s (button)", target)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Fallback: text đúng trong toolbar → click ancestor button
+    try:
+        hits = toolbar.get_by_text(target, exact=True)
+        count = await hits.count()
+        for idx in range(count):
+            node = hits.nth(idx)
+            try:
+                if not await node.is_visible():
+                    continue
+                btn = node.locator(
+                    "xpath=ancestor-or-self::button[1] | ancestor-or-self::*[@role='button'][1] | ancestor-or-self::*[@role='radio'][1]"
+                )
+                if await btn.count() == 0:
+                    continue
+                pick = btn.first
+                txt = (await pick.inner_text() or "").strip()
+                if _is_variant_count_label(txt):
+                    continue
+                if not _button_matches_single_ratio(txt, target):
+                    continue
+                await pick.click(timeout=10000)
+                await _ui_delay(f"sau chọn tỉ lệ {target}")
+                logger.info("Playwright UI: đã chọn aspect ratio %s (text ancestor)", target)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    logger.warning("Playwright UI: không chọn được aspect ratio=%s", target)
+    return False
+
+
+async def _open_model_dropdown_in_panel(panel: Any) -> bool:
+    """Bấm hàng chọn model (Nano Banana ...) trong panel settings."""
+    try:
+        loc = panel.locator("button, [role='button']").filter(has_text=_MODEL_CHIP_PATTERNS)
+        count = await loc.count()
+        for idx in range(count):
+            cand = loc.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "").strip()
+                if _UPLOAD_TEXT.search(txt):
+                    continue
+                await cand.click(timeout=10000)
+                await _ui_delay("sau mở danh sách model image")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+async def _model_dropdown_scope(page: Any) -> Any | None:
+    """Menu dropdown model sau bấm Nano Banana trong panel."""
+    selectors = (
+        '[role="menu"][data-state="open"]',
+        '[role="listbox"][data-state="open"]',
+        '[data-radix-popper-content-wrapper]',
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = await loc.count()
+            for idx in range(count - 1, -1, -1):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    txt = (await cand.inner_text() or "").strip()
+                    if "Nano Banana" in txt and _UPLOAD_TEXT.search(txt) is None:
+                        return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return page
+
+
+async def _select_image_model(page: Any, panel: Any, image_model: str) -> bool:
+    target = _normalize_image_model_name(image_model)
+    if not target:
+        return False
+
+    if not await _open_model_dropdown_in_panel(panel):
+        logger.warning("Playwright UI: không mở được dropdown model")
+        return False
+
+    menu = await _model_dropdown_scope(page)
+    if menu is None:
+        return False
+
+    if await _click_exact_label(menu, target):
+        await _ui_delay(f"sau chọn model {target}")
+        logger.info("Playwright UI: đã chọn model %s", target)
+        return True
+
+    logger.warning("Playwright UI: không chọn được model image=%s", target)
+    return False
+
+
+async def _dismiss_settings_panel(page: Any) -> bool:
+    """Click ra ngoài để đóng panel model trước khi upload."""
+    if await _settings_popover_open(page) is None:
+        return True
+
+    prompt = await _prompt_input_locator(page)
+    if prompt is not None:
+        try:
+            await prompt.click(timeout=5000)
+            await _ui_delay("sau click ra ngoài đóng panel model")
+        except Exception:
+            pass
+
+    if await _settings_popover_open(page) is not None:
+        try:
+            await page.keyboard.press("Escape")
+            await _ui_delay("sau Escape đóng panel model")
+        except Exception:
+            pass
+
+    closed = await _settings_popover_open(page) is None
+    if not closed:
+        logger.warning("Playwright UI: panel model vẫn còn mở sau dismiss")
+    return closed
+
+
+async def _chip_shows_model(page: Any, image_model: str) -> bool:
+    target = _normalize_image_model_name(image_model)
+    chip = await _model_chip_button_locator(page)
+    if chip is None or not target:
+        return False
+    try:
+        txt = (await chip.inner_text() or "").strip()
+        return target.lower() in txt.lower()
+    except Exception:
+        return False
+
+
+async def configure_image_generation_ui(
+    page: Any,
+    *,
+    aspect_ratio: str,
+    image_model: str,
+) -> dict[str, Any]:
+    """
+    Nhánh image — UI gộp Image+Video:
+    1) chip model  2) aspect ratio  3) chọn model
+    4) click ra ngoài đóng panel  →  sau đó mới upload (nếu có ảnh).
+    """
+    target_ratio = _normalize_aspect_ratio(aspect_ratio)
+    target_model = _normalize_image_model_name(image_model)
+
+    panel = await _open_image_settings_panel(page)
+    if panel is None:
+        return {
+            "configured": False,
+            "aspect_ratio_selected": False,
+            "image_model_selected": False,
+            "panel_dismissed": False,
+            "unified_media_ui": True,
+            "aspect_ratio": target_ratio,
+            "image_model": target_model,
+        }
+
+    media_ready = await _ensure_media_settings_ready(panel)
+    logger.info("Playwright UI: giữ mặc định 1x — bỏ qua x2/x3/x4")
+    ratio_ok = await _select_aspect_ratio(panel, target_ratio) if media_ready else False
+    model_ok = await _select_image_model(page, panel, target_model)
+    dismissed = await _dismiss_settings_panel(page)
+    chip_ok = await _chip_shows_model(page, target_model) if model_ok else False
+
+    configured = media_ready and ratio_ok and model_ok and dismissed
+    if not configured:
+        logger.warning(
+            "Playwright UI: image settings chưa đủ media=%s ratio=%s model=%s dismissed=%s chip=%s",
+            media_ready,
+            ratio_ok,
+            model_ok,
+            dismissed,
+            chip_ok,
+        )
+
+    return {
+        "configured": configured,
+        "unified_media_ui": True,
+        "media_panel_ready": media_ready,
+        "aspect_ratio_selected": ratio_ok,
+        "image_model_selected": model_ok,
+        "panel_dismissed": dismissed,
+        "chip_verified": chip_ok,
+        "aspect_ratio": target_ratio,
+        "image_model": target_model,
+    }
+
+
 async def upload_image_via_ui(
     page: Any,
     *,
@@ -743,59 +1406,83 @@ async def upload_image_via_ui(
     Chỉ gọi khi request có ảnh (image_base64s).
     UI flow: [+] → 'Tải nội dung nghe nhìn lên' → chọn file → 'Thêm vào câu lệnh'
     """
-    if not await _open_image_upload_menu(page):
-        raise RuntimeError(
-            f"upload_menu_not_open url={(page.url or '')[:120]}"
-        )
-    await _ui_delay("trước bấm upload / chọn file")
+    if await _settings_popover_open(page) is not None:
+        await _dismiss_settings_panel(page)
 
-    response_matcher = _upload_image_response_matcher
-    uploaded = False
-    resp = None
+    attempts = max(1, int(UI_UPLOAD_RETRY_MAX or 1))
+    last_error: Exception | None = None
 
-    # Cách 1: file chooser sau khi bấm item upload
-    try:
-        async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
-            async with page.expect_file_chooser(timeout=45_000) as fc_info:
-                if not await _click_upload_menu_item(page):
-                    raise RuntimeError("upload_button_not_found")
-                chooser = await fc_info.value
-                await chooser.set_files(str(image_path))
-                await _ui_delay("sau chọn file (file chooser)")
-            resp = await resp_info.value
-        uploaded = True
-    except Exception as exc:
-        logger.warning("Playwright UI: file chooser upload failed: %s — thử input[type=file]", exc)
+    for attempt in range(1, attempts + 1):
+        try:
+            if not await _open_image_upload_menu(page):
+                raise RuntimeError(f"upload_menu_not_open url={(page.url or '')[:120]}")
+            await _ui_delay(f"trước bấm upload / chọn file (lần {attempt}/{attempts})")
 
-    # Cách 2: input file ẩn (một số bản Flow không bật file chooser CDP)
-    if not uploaded:
-        await _open_image_upload_menu(page)
-        async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
-            if not await _set_files_via_hidden_input(page, image_path):
-                if not await _click_upload_menu_item(page):
-                    raise RuntimeError("upload_button_not_found")
-                await _ui_delay("chờ input file sau click upload")
-                if not await _set_files_via_hidden_input(page, image_path):
-                    raise RuntimeError("file_chooser_timeout")
-            resp = await resp_info.value
+            response_matcher = _upload_image_response_matcher
+            uploaded = False
+            resp = None
 
-    status = resp.status
-    body: Any = None
-    try:
-        body = await resp.json()
-    except Exception:
-        body = await resp.text()
-    if status >= 400:
-        raise RuntimeError(f"upload_image_http_{status}: {body}")
+            # Cách 1: file chooser sau khi bấm item upload
+            try:
+                async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+                    async with page.expect_file_chooser(timeout=45_000) as fc_info:
+                        if not await _click_upload_menu_item(page):
+                            raise RuntimeError("upload_button_not_found")
+                        chooser = await fc_info.value
+                        await chooser.set_files(str(image_path))
+                        await _ui_delay("sau chọn file (file chooser)")
+                    resp = await resp_info.value
+                uploaded = True
+            except Exception as exc:
+                logger.warning(
+                    "Playwright UI: file chooser upload failed: %s — thử input[type=file]",
+                    exc,
+                )
 
-    if not await _wait_for_upload_preview(page, filename=image_path.name):
-        raise RuntimeError("upload_preview_not_ready")
+            # Cách 2: input file ẩn (một số bản Flow không bật file chooser CDP)
+            if not uploaded:
+                await _open_image_upload_menu(page)
+                async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+                    if not await _set_files_via_hidden_input(page, image_path):
+                        if not await _click_upload_menu_item(page):
+                            raise RuntimeError("upload_button_not_found")
+                        await _ui_delay("chờ input file sau click upload")
+                        if not await _set_files_via_hidden_input(page, image_path):
+                            raise RuntimeError("file_chooser_timeout")
+                    resp = await resp_info.value
 
-    added = await _click_add_to_prompt(page)
-    if not added:
-        logger.warning("add_to_prompt button not found — ảnh có thể đã được gắn tự động")
+            status = int(resp.status or 0)
+            body: Any = None
+            try:
+                body = await resp.json()
+            except Exception:
+                body = await resp.text()
+            if status >= 400:
+                raise RuntimeError(f"upload_image_http_{status}: {body}")
 
-    return {"status": status, "data": body}
+            if not await _wait_for_upload_preview(page, filename=image_path.name):
+                raise RuntimeError("upload_preview_not_ready")
+
+            added = await _click_add_to_prompt(page)
+            if not added:
+                logger.warning("add_to_prompt button not found — ảnh có thể đã được gắn tự động")
+
+            if attempt > 1:
+                logger.info("Playwright UI: upload ảnh thành công sau %s lần thử", attempt)
+            return {"status": status, "data": body, "attempt": attempt}
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            logger.warning(
+                "Playwright UI: upload lỗi lần %s/%s (%s) — sẽ thử lại",
+                attempt,
+                attempts,
+                exc,
+            )
+            await _ui_delay("chờ trước khi retry upload")
+
+    raise RuntimeError(f"upload_retry_exhausted({attempts}): {last_error}")
 
 
 async def fill_prompt(page: Any, prompt: str) -> None:
@@ -847,12 +1534,112 @@ async def fill_prompt(page: Any, prompt: str) -> None:
     await _ui_delay("sau điền prompt (keyboard)")
 
 
+def _is_image_generate_response(resp: Any) -> bool:
+    try:
+        url = str(resp.url or "")
+    except Exception:
+        return False
+    return bool(_GENERATE_IMAGE_API_PATTERNS.search(url))
+
+
+async def _submit_arrow_button(page: Any) -> Any | None:
+    """Nút gửi ở bên phải prompt bar (mũi tên tròn)."""
+    composer = await _prompt_composer_locator(page)
+    scopes = [composer, page] if composer is not None else [page]
+    icon_re = re.compile(r"arrow_forward|send|north_east|arrow_upward|chevron_right", re.I)
+    for scope in scopes:
+        if scope is None:
+            continue
+        try:
+            loc = scope.locator(
+                "button:has(i.google-symbols), [role='button']:has(i.google-symbols)"
+            )
+            count = await loc.count()
+            for idx in range(count - 1, -1, -1):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible():
+                        continue
+                    if not await cand.is_enabled():
+                        continue
+                    icon = cand.locator("i.google-symbols, i")
+                    if await icon.count() == 0:
+                        continue
+                    txt = (await icon.first.inner_text() or "").strip()
+                    if not icon_re.search(txt):
+                        continue
+                    return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+async def _submit_prompt_and_wait_image(page: Any, *, timeout_s: int = 300) -> dict[str, Any]:
+    """
+    Bấm mũi tên gửi và chờ network response ảnh (batchGenerateImages).
+    Trả urls/media_ids giống luồng flow_sdk.gen_image hiện tại.
+    """
+    submit = await _submit_arrow_button(page)
+    if submit is None:
+        raise RuntimeError("submit_arrow_not_found")
+
+    timeout_ms = max(30_000, int(timeout_s * 1000))
+    try:
+        async with page.expect_response(_is_image_generate_response, timeout=timeout_ms) as resp_info:
+            await submit.scroll_into_view_if_needed(timeout=5000)
+            await submit.click(timeout=10000)
+            await _ui_delay("sau bấm mũi tên gửi")
+        resp = await resp_info.value
+    except Exception as exc:
+        raise RuntimeError(f"image_submit_wait_response_failed: {exc}") from exc
+
+    status = int(resp.status or 0)
+    payload: Any
+    try:
+        payload = await resp.json()
+    except Exception:
+        payload = {"raw_text": (await resp.text())[:4000]}
+
+    if status >= 400:
+        raise RuntimeError(f"image_submit_http_{status}: {payload}")
+
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data.get("data")
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+
+    image_urls = flow_sdk.extract_image_urls(data)
+    media_ids = flow_sdk.extract_image_media_ids(data)
+    media_entries = flow_sdk.build_image_media_entries(data)
+
+    logger.info(
+        "Playwright UI: submit image done status=%s urls=%s media_ids=%s",
+        status,
+        len(image_urls),
+        len(media_ids),
+    )
+    return {
+        "submitted": True,
+        "status": status,
+        "image_urls": image_urls,
+        "media_ids": media_ids,
+        "media_entries": media_entries,
+        "raw": data,
+    }
+
+
 async def prepare_request_on_flow_ui(
     *,
     profile_id: str,
     request_id: str,
+    request_type: str,
     prompt: str,
     image_base64s: list[str] | None = None,
+    aspect_ratio: str = "16:9",
+    image_model: str = "",
     proxy_url: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -897,7 +1684,24 @@ async def prepare_request_on_flow_ui(
 
     temp_files: list[Path] = []
     upload_meta: dict[str, Any] | None = None
+    image_settings_meta: dict[str, Any] | None = None
+    ui_generation_meta: dict[str, Any] | None = None
     try:
+        if str(request_type or "").strip().lower() == "gen_image":
+            image_settings_meta = await configure_image_generation_ui(
+                page,
+                aspect_ratio=aspect_ratio,
+                image_model=image_model,
+            )
+            if not image_settings_meta.get("configured"):
+                raise RuntimeError(
+                    "image_settings_not_configured "
+                    f"ratio={image_settings_meta.get('aspect_ratio_selected')} "
+                    f"model={image_settings_meta.get('image_model_selected')} "
+                    f"dismissed={image_settings_meta.get('panel_dismissed')}"
+                )
+            await _ui_delay("sau cấu hình model/tỉ lệ — chuẩn bị upload")
+
         imgs = [x for x in (image_base64s or []) if x]
         if imgs:
             path = _base64_to_temp_file(imgs[0], prefix=f"ui_{request_id[:8]}_")
@@ -907,6 +1711,8 @@ async def prepare_request_on_flow_ui(
             logger.info("Playwright UI: không có ảnh — chỉ điền prompt (không bấm [+])")
 
         await fill_prompt(page, prompt)
+        if str(request_type or "").strip().lower() == "gen_image" and is_ui_prep_only():
+            ui_generation_meta = await _submit_prompt_and_wait_image(page)
 
         return {
             "ui_prep": True,
@@ -916,6 +1722,9 @@ async def prepare_request_on_flow_ui(
             "prompt_filled": bool(str(prompt or "").strip()),
             "image_uploaded": bool(imgs),
             "upload": upload_meta,
+            "image_settings": image_settings_meta,
+            "ui_generated": bool(ui_generation_meta and ui_generation_meta.get("submitted")),
+            "ui_generation": ui_generation_meta,
             "page_url": page.url,
             "prep_only": is_ui_prep_only(),
             "proxy": proxy_info.get("proxy_display") or proxy_info.get("proxy") or "",
