@@ -56,6 +56,9 @@ _KNOWN_IMAGE_MODELS: dict[str, str] = {
     "NANO_BANANA_2_LITE": "Nano Banana 2 Lite",
 }
 _GENERATE_IMAGE_API_PATTERNS = re.compile(r"flowMedia:batchGenerateImages|batchGenerateImages", re.I)
+_ERROR_RETRY_PATTERNS = re.compile(r"thử lại|retry|try again", re.I)
+_ERROR_RETRY_ICON_PATTERNS = re.compile(r"refresh|replay|autorenew|restart_alt", re.I)
+_ERROR_RETRY_MAX_CLICKS = 3
 
 
 async def _ui_delay(step: str = "") -> float:
@@ -1409,80 +1412,82 @@ async def upload_image_via_ui(
     if await _settings_popover_open(page) is not None:
         await _dismiss_settings_panel(page)
 
-    attempts = max(1, int(UI_UPLOAD_RETRY_MAX or 1))
-    last_error: Exception | None = None
+    max_retry_clicks = min(_ERROR_RETRY_MAX_CLICKS, max(1, int(UI_UPLOAD_RETRY_MAX or 1)))
+    response_matcher = _upload_image_response_matcher
 
-    for attempt in range(1, attempts + 1):
+    async def _finalize_upload_response(resp: Any, *, phase: str) -> dict[str, Any]:
+        status, body = await _extract_response_payload(resp)
+        if status >= 400:
+            raise RuntimeError(f"upload_image_http_{status}: {body}")
+        if not await _wait_for_upload_preview(page, filename=image_path.name):
+            raise RuntimeError("upload_preview_not_ready")
+        added = await _click_add_to_prompt(page)
+        if not added:
+            logger.warning("add_to_prompt button not found — ảnh có thể đã được gắn tự động")
+        return {"status": status, "data": body, "phase": phase}
+
+    try:
+        if not await _open_image_upload_menu(page):
+            raise RuntimeError(f"upload_menu_not_open url={(page.url or '')[:120]}")
+        await _ui_delay("trước bấm upload / chọn file")
+        uploaded = False
+        resp = None
+
+        # Cách 1: file chooser sau khi bấm item upload
         try:
-            if not await _open_image_upload_menu(page):
-                raise RuntimeError(f"upload_menu_not_open url={(page.url or '')[:120]}")
-            await _ui_delay(f"trước bấm upload / chọn file (lần {attempt}/{attempts})")
+            async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+                async with page.expect_file_chooser(timeout=45_000) as fc_info:
+                    if not await _click_upload_menu_item(page):
+                        raise RuntimeError("upload_button_not_found")
+                    chooser = await fc_info.value
+                    await chooser.set_files(str(image_path))
+                    await _ui_delay("sau chọn file (file chooser)")
+                resp = await resp_info.value
+            uploaded = True
+        except Exception as exc:
+            logger.warning("Playwright UI: file chooser upload failed: %s — thử input[type=file]", exc)
 
-            response_matcher = _upload_image_response_matcher
-            uploaded = False
-            resp = None
-
-            # Cách 1: file chooser sau khi bấm item upload
-            try:
-                async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
-                    async with page.expect_file_chooser(timeout=45_000) as fc_info:
-                        if not await _click_upload_menu_item(page):
-                            raise RuntimeError("upload_button_not_found")
-                        chooser = await fc_info.value
-                        await chooser.set_files(str(image_path))
-                        await _ui_delay("sau chọn file (file chooser)")
-                    resp = await resp_info.value
-                uploaded = True
-            except Exception as exc:
-                logger.warning(
-                    "Playwright UI: file chooser upload failed: %s — thử input[type=file]",
-                    exc,
-                )
-
-            # Cách 2: input file ẩn (một số bản Flow không bật file chooser CDP)
-            if not uploaded:
-                await _open_image_upload_menu(page)
-                async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+        # Cách 2: input file ẩn (một số bản Flow không bật file chooser CDP)
+        if not uploaded:
+            await _open_image_upload_menu(page)
+            async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+                if not await _set_files_via_hidden_input(page, image_path):
+                    if not await _click_upload_menu_item(page):
+                        raise RuntimeError("upload_button_not_found")
+                    await _ui_delay("chờ input file sau click upload")
                     if not await _set_files_via_hidden_input(page, image_path):
-                        if not await _click_upload_menu_item(page):
-                            raise RuntimeError("upload_button_not_found")
-                        await _ui_delay("chờ input file sau click upload")
-                        if not await _set_files_via_hidden_input(page, image_path):
-                            raise RuntimeError("file_chooser_timeout")
-                    resp = await resp_info.value
+                        raise RuntimeError("file_chooser_timeout")
+                resp = await resp_info.value
+        return await _finalize_upload_response(resp, phase="initial_upload")
+    except Exception as first_error:
+        last_error: Exception = first_error
+        logger.warning("Playwright UI: upload lỗi ban đầu: %s", first_error)
 
-            status = int(resp.status or 0)
-            body: Any = None
-            try:
-                body = await resp.json()
-            except Exception:
-                body = await resp.text()
-            if status >= 400:
-                raise RuntimeError(f"upload_image_http_{status}: {body}")
-
-            if not await _wait_for_upload_preview(page, filename=image_path.name):
-                raise RuntimeError("upload_preview_not_ready")
-
-            added = await _click_add_to_prompt(page)
-            if not added:
-                logger.warning("add_to_prompt button not found — ảnh có thể đã được gắn tự động")
-
-            if attempt > 1:
-                logger.info("Playwright UI: upload ảnh thành công sau %s lần thử", attempt)
-            return {"status": status, "data": body, "attempt": attempt}
+    for retry_idx in range(1, max_retry_clicks + 1):
+        try:
+            async with page.expect_response(response_matcher, timeout=120_000) as resp_info:
+                clicked = await _click_error_retry_after_delay(
+                    page,
+                    reason="upload",
+                    retry_index=retry_idx,
+                    retry_max=max_retry_clicks,
+                )
+                if not clicked:
+                    raise RuntimeError("upload_retry_button_not_found")
+            resp = await resp_info.value
+            result = await _finalize_upload_response(resp, phase=f"retry_button_{retry_idx}")
+            result["retry_clicks"] = retry_idx
+            return result
         except Exception as exc:
             last_error = exc
-            if attempt >= attempts:
-                break
             logger.warning(
-                "Playwright UI: upload lỗi lần %s/%s (%s) — sẽ thử lại",
-                attempt,
-                attempts,
+                "Playwright UI: upload retry button thất bại (%s/%s): %s",
+                retry_idx,
+                max_retry_clicks,
                 exc,
             )
-            await _ui_delay("chờ trước khi retry upload")
 
-    raise RuntimeError(f"upload_retry_exhausted({attempts}): {last_error}")
+    raise RuntimeError(f"upload_retry_button_exhausted({max_retry_clicks}): {last_error}")
 
 
 async def fill_prompt(page: Any, prompt: str) -> None:
@@ -1576,6 +1581,86 @@ async def _submit_arrow_button(page: Any) -> Any | None:
     return None
 
 
+async def _error_retry_button(page: Any) -> Any | None:
+    """Nút Retry hiển thị tại vị trí lỗi trên UI."""
+    scopes: list[Any] = []
+    try:
+        dialog = page.locator('[role="dialog"]:visible')
+        if await dialog.count() > 0:
+            scopes.append(dialog.last)
+    except Exception:
+        pass
+    scopes.append(page)
+
+    for scope in scopes:
+        try:
+            by_text = scope.get_by_role("button", name=_ERROR_RETRY_PATTERNS)
+            if await by_text.count() > 0:
+                cand = by_text.first
+                if await cand.is_visible() and await cand.is_enabled():
+                    return cand
+        except Exception:
+            pass
+        try:
+            loc = scope.locator("button, [role='button']")
+            count = await loc.count()
+            for idx in range(count):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible() or not await cand.is_enabled():
+                        continue
+                    txt = ((await cand.inner_text()) or "").strip()
+                    aria = ((await cand.get_attribute("aria-label")) or "").strip()
+                    if _ERROR_RETRY_PATTERNS.search(f"{txt} {aria}"):
+                        return cand
+                    icon = cand.locator("i.google-symbols, i")
+                    if await icon.count() > 0:
+                        icon_txt = ((await icon.first.inner_text()) or "").strip()
+                        if _ERROR_RETRY_ICON_PATTERNS.search(icon_txt):
+                            return cand
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+async def _click_error_retry_after_delay(
+    page: Any,
+    *,
+    reason: str,
+    retry_index: int,
+    retry_max: int = _ERROR_RETRY_MAX_CLICKS,
+) -> bool:
+    """Chờ 3-5s rồi bấm Retry tại vị trí lỗi."""
+    btn = await _error_retry_button(page)
+    if btn is None:
+        logger.warning("Playwright UI: không thấy nút Retry (%s)", reason)
+        return False
+    sec = random.uniform(3.0, 5.0)
+    logger.warning(
+        "Playwright UI: lỗi %s — chờ %.1fs rồi bấm Retry (%s/%s)",
+        reason,
+        sec,
+        retry_index,
+        retry_max,
+    )
+    await asyncio.sleep(sec)
+    await btn.scroll_into_view_if_needed(timeout=5000)
+    await btn.click(timeout=10_000)
+    return True
+
+
+async def _extract_response_payload(resp: Any) -> tuple[int, Any]:
+    status = int(resp.status or 0)
+    body: Any = None
+    try:
+        body = await resp.json()
+    except Exception:
+        body = await resp.text()
+    return status, body
+
+
 async def _submit_prompt_and_wait_image(page: Any, *, timeout_s: int = 300) -> dict[str, Any]:
     """
     Bấm mũi tên gửi và chờ network response ảnh (batchGenerateImages).
@@ -1586,49 +1671,84 @@ async def _submit_prompt_and_wait_image(page: Any, *, timeout_s: int = 300) -> d
         raise RuntimeError("submit_arrow_not_found")
 
     timeout_ms = max(30_000, int(timeout_s * 1000))
-    try:
+    max_retry_clicks = _ERROR_RETRY_MAX_CLICKS
+
+    def _normalize_submit_payload(payload: Any) -> dict[str, Any]:
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data.get("data")
+        if not isinstance(data, dict):
+            data = payload if isinstance(payload, dict) else {}
+        image_urls = flow_sdk.extract_image_urls(data)
+        media_ids = flow_sdk.extract_image_media_ids(data)
+        media_entries = flow_sdk.build_image_media_entries(data)
+        return {
+            "submitted": True,
+            "image_urls": image_urls,
+            "media_ids": media_ids,
+            "media_entries": media_entries,
+            "raw": data,
+        }
+
+    async def _wait_submit_response_after_click(*, source: str) -> dict[str, Any]:
         async with page.expect_response(_is_image_generate_response, timeout=timeout_ms) as resp_info:
-            await submit.scroll_into_view_if_needed(timeout=5000)
-            await submit.click(timeout=10000)
-            await _ui_delay("sau bấm mũi tên gửi")
+            if source == "submit_arrow":
+                await submit.scroll_into_view_if_needed(timeout=5000)
+                await submit.click(timeout=10000)
+                await _ui_delay("sau bấm mũi tên gửi")
+            else:
+                clicked = await _click_error_retry_after_delay(
+                    page,
+                    reason="batchGenerateImages",
+                    retry_index=int(source.rsplit("_", 1)[-1]),
+                    retry_max=max_retry_clicks,
+                )
+                if not clicked:
+                    raise RuntimeError("generate_retry_button_not_found")
         resp = await resp_info.value
-    except Exception as exc:
-        raise RuntimeError(f"image_submit_wait_response_failed: {exc}") from exc
+        status, payload = await _extract_response_payload(resp)
+        if status >= 400:
+            raise RuntimeError(f"image_submit_http_{status}: {payload}")
+        out = _normalize_submit_payload(payload)
+        out["status"] = status
+        out["source"] = source
+        return out
 
-    status = int(resp.status or 0)
-    payload: Any
     try:
-        payload = await resp.json()
-    except Exception:
-        payload = {"raw_text": (await resp.text())[:4000]}
+        out = await _wait_submit_response_after_click(source="submit_arrow")
+        logger.info(
+            "Playwright UI: submit image done status=%s urls=%s media_ids=%s",
+            out.get("status"),
+            len(out.get("image_urls") or []),
+            len(out.get("media_ids") or []),
+        )
+        return out
+    except Exception as first_error:
+        last_error: Exception = first_error
+        logger.warning("Playwright UI: batchGenerateImages lỗi lần đầu: %s", first_error)
 
-    if status >= 400:
-        raise RuntimeError(f"image_submit_http_{status}: {payload}")
+    for retry_idx in range(1, max_retry_clicks + 1):
+        try:
+            out = await _wait_submit_response_after_click(source=f"retry_{retry_idx}")
+            out["retry_clicks"] = retry_idx
+            logger.info(
+                "Playwright UI: submit image thành công sau retry %s status=%s urls=%s media_ids=%s",
+                retry_idx,
+                out.get("status"),
+                len(out.get("image_urls") or []),
+                len(out.get("media_ids") or []),
+            )
+            return out
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Playwright UI: retry batchGenerateImages thất bại (%s/%s): %s",
+                retry_idx,
+                max_retry_clicks,
+                exc,
+            )
 
-    data = payload.get("data") if isinstance(payload, dict) else payload
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        data = data.get("data")
-    if not isinstance(data, dict):
-        data = payload if isinstance(payload, dict) else {}
-
-    image_urls = flow_sdk.extract_image_urls(data)
-    media_ids = flow_sdk.extract_image_media_ids(data)
-    media_entries = flow_sdk.build_image_media_entries(data)
-
-    logger.info(
-        "Playwright UI: submit image done status=%s urls=%s media_ids=%s",
-        status,
-        len(image_urls),
-        len(media_ids),
-    )
-    return {
-        "submitted": True,
-        "status": status,
-        "image_urls": image_urls,
-        "media_ids": media_ids,
-        "media_entries": media_entries,
-        "raw": data,
-    }
+    raise RuntimeError(f"image_submit_retry_button_exhausted({max_retry_clicks}): {last_error}")
 
 
 async def prepare_request_on_flow_ui(
