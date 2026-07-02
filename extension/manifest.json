@@ -1,7 +1,7 @@
 {
     "manifest_version":  3,
     "name":  "Flow2API Bridge",
-    "version":  "0.0.20",
+    "version":  "0.0.21",
     "description":  "Local bridge that proxies Flow2API agent requests to authenticated labs.google sessions.",
     "permissions":  [
                         "storage",
@@ -11,8 +11,7 @@
                         "webRequestAuthProvider",
                         "proxy",
                         "scripting",
-                        "declarativeNetRequest",
-                        "browsingData"
+                        "declarativeNetRequest"
                     ],
     "host_permissions":  [
                              "https://aisandbox-pa.googleapis.com/*",

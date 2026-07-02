@@ -36,6 +36,16 @@ class AutostartBody(BaseModel):
     enabled: bool
 
 
+class PlaywrightBody(BaseModel):
+    flow_chrome_profile: str = ""
+    flow_cdp_port: int | None = None
+    flow_email: str = ""
+
+
+class LaunchFlowBody(BaseModel):
+    flow_email: str = ""
+
+
 @router.get("/config")
 async def get_config():
     return system_ops.public_config()
@@ -142,9 +152,58 @@ async def system_force_refresh():
     return await system_ops.force_refresh_all()
 
 
+@router.get("/playwright/map")
+async def playwright_map():
+    return {
+        "profiles": system_ops.list_playwright_profile_map(),
+        "extension_profiles": system_ops.list_playwright_extension_map(),
+        "flow_email": system_ops.get_playwright_flow_email(),
+        "flow_chrome_profile": system_ops.get_playwright_flow_chrome_profile(),
+        "flow_cdp_port": system_ops.get_playwright_flow_cdp_port(),
+    }
+
+
+@router.post("/playwright")
+async def save_playwright(body: PlaywrightBody):
+    try:
+        saved = system_ops.save_playwright_settings(
+            flow_chrome_profile=body.flow_chrome_profile,
+            flow_cdp_port=body.flow_cdp_port,
+            flow_email=body.flow_email,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("invalid_chrome_profile:"):
+            raise HTTPException(400, f"Chrome profile không hợp lệ: {msg.split(':', 1)[-1]}")
+        if msg.startswith("invalid_chrome_email:"):
+            raise HTTPException(
+                400,
+                f"Không tìm thấy Chrome profile cho email: {msg.split(':', 1)[-1]}",
+            )
+        raise HTTPException(400, msg)
+    pub = system_ops.public_config()
+    return {
+        "ok": True,
+        "message": (
+            f"Đã lưu {pub.get('playwright_flow_email') or pub.get('playwright_flow_chrome_profile')} "
+            f"@ CDP port {pub.get('playwright_flow_cdp_port')}"
+        ),
+        "playwright_flow_email": pub.get("playwright_flow_email"),
+        "playwright_flow_chrome_profile": pub.get("playwright_flow_chrome_profile"),
+        "playwright_flow_cdp_port": pub.get("playwright_flow_cdp_port"),
+        "playwright_profile_map": pub.get("playwright_profile_map"),
+    }
+
+
 @router.post("/system/launch-profiles")
 async def system_launch_profiles():
     return system_ops.launch_all_profiles()
+
+
+@router.post("/system/launch-flow-profile")
+async def system_launch_flow_profile(body: LaunchFlowBody | None = None):
+    email = str((body.flow_email if body else "") or "").strip()
+    return system_ops.launch_flow_chrome_profile(flow_email=email)
 
 
 @router.post("/system/close-chrome")

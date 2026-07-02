@@ -62,6 +62,64 @@ def _task_prompt(row: Any, params: dict[str, Any]) -> str:
     return str(params.get("prompt") or getattr(row, "prompt", "") or "")
 
 
+_UI_AUTOMATION_TYPES = frozenset(
+    {
+        "gen_image",
+        "gen_text_video",
+        "gen_image_video",
+        "gen_video",
+        "gen_video_start_end",
+        "gen_multi_image_video",
+    }
+)
+
+
+async def _run_flow_ui_prep(
+    rid: str,
+    profile_id: str,
+    req_type: str,
+    row: Any,
+    params: dict[str, Any],
+) -> dict[str, Any] | None:
+    from flow2api.config import PLAYWRIGHT_ENABLED, UI_AUTOMATION_ENABLED
+    from flow2api.services.playwright_flow import (
+        is_ui_automation_enabled,
+        prepare_request_on_flow_ui,
+    )
+
+    if not is_ui_automation_enabled():
+        logger.info(
+            "Playwright UI skipped rid=%s (PLAYWRIGHT=%s UI_AUTOMATION=%s) — dung run-playwright.bat",
+            rid[:8],
+            PLAYWRIGHT_ENABLED,
+            UI_AUTOMATION_ENABLED,
+        )
+        return None
+    if req_type not in _UI_AUTOMATION_TYPES:
+        return None
+
+    prompt = _task_prompt(row, params)
+    image_base64s = params.get("image_base64s") or []
+    proxy_url = str(params.get("proxy_url") or params.get("proxy") or "").strip() or None
+    append_request_log(rid, "worker", "Playwright UI: upload ảnh + điền prompt…", level="info")
+    meta = await prepare_request_on_flow_ui(
+        profile_id=profile_id,
+        request_id=rid,
+        prompt=prompt,
+        image_base64s=image_base64s,
+        proxy_url=proxy_url,
+    )
+    append_request_log(
+        rid,
+        "worker",
+        "Playwright UI xong "
+        f"(ảnh={meta.get('image_uploaded')} prompt={meta.get('prompt_filled')} "
+        f"proxy={meta.get('proxy') or 'direct'})",
+        level="info",
+    )
+    return meta
+
+
 def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
     """frame = startImage[/endImage]; component = referenceImages."""
     explicit = str(params.get("video_mode") or "").strip().lower()
@@ -928,6 +986,21 @@ class WorkerController:
 
         project_id = await self._ensure_project(profile_id)
         append_request_log(rid, "worker", f"Project ready: {project_id[:12]}…", level="info")
+
+        ui_meta = await _run_flow_ui_prep(rid, profile_id, req_type, row, params)
+        if ui_meta:
+            from flow2api.services.playwright_flow import is_ui_prep_only
+
+            if is_ui_prep_only():
+                result = {
+                    "ui_prep": True,
+                    "project_id": project_id,
+                    "profile_id": profile_id,
+                    **ui_meta,
+                }
+                activity.update_request(rid, status="done", result=result, error=None)
+                events.publish("request_finished", {"id": rid, "status": "done"})
+                return
 
         if req_type == "gen_image":
             raw = await flow_sdk.gen_image(

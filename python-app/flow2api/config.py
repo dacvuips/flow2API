@@ -140,6 +140,66 @@ PUBLIC_BASE_URL = get_public_base_url()
 # How long generated outputs stay on disk (default 6 hours).
 MEDIA_STORE_TTL_S = int(os.environ.get("FLOW2API_MEDIA_STORE_TTL_S", str(6 * 3600)))
 
+# Playwright UI automation (CDP attach to Chrome profiles launched with --remote-debugging-port)
+PLAYWRIGHT_ENABLED = os.environ.get("FLOW2API_PLAYWRIGHT_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+UI_AUTOMATION_ENABLED = os.environ.get("FLOW2API_UI_AUTOMATION", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Giai đoạn thử: chỉ upload ảnh + điền prompt, chưa bấm Generate (API gen cũng bị bỏ qua).
+UI_PREP_ONLY = os.environ.get("FLOW2API_UI_PREP_ONLY", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Delay ngẫu nhiên giữa mỗi thao tác UI Playwright (giây).
+UI_ACTION_DELAY_MIN_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MIN_S", "2"))
+UI_ACTION_DELAY_MAX_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MAX_S", "5"))
+# Chờ ảnh preview trong modal thư viện trước khi bấm "Thêm vào câu lệnh".
+UI_UPLOAD_PREVIEW_TIMEOUT_S = float(os.environ.get("FLOW2API_UI_UPLOAD_PREVIEW_TIMEOUT_S", "120"))
+CDP_BASE_PORT = int(os.environ.get("FLOW2API_CDP_BASE_PORT", "9236"))
+# Port CDP cố định cho profile Chrome có tab Flow (Default = 9236).
+PLAYWRIGHT_FLOW_CDP_PORT = int(
+    os.environ.get("FLOW2API_PLAYWRIGHT_FLOW_CDP_PORT", str(CDP_BASE_PORT))
+)
+# Profile Chrome mở Flow / Playwright — mở đầu tiên với PLAYWRIGHT_FLOW_CDP_PORT.
+FLOW_CHROME_PROFILE = os.environ.get("FLOW2API_FLOW_CHROME_PROFILE", "Default").strip()
+CDP_CONNECT_TIMEOUT_S = float(os.environ.get("FLOW2API_CDP_CONNECT_TIMEOUT_S", "15"))
+CDP_PROBE_RETRIES = int(os.environ.get("FLOW2API_CDP_PROBE_RETRIES", "10"))
+# Tự mở lại Chrome với CDP khi job Playwright không thấy port (sẽ đóng Chrome cũ trước).
+CDP_AUTO_LAUNCH = os.environ.get("FLOW2API_CDP_AUTO_LAUNCH", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+CDP_AUTO_LAUNCH_WAIT_S = int(os.environ.get("FLOW2API_CDP_AUTO_LAUNCH_WAIT_S", "120"))
+# Host kiểm tra CDP — thử localhost trước (Windows đôi khi localhost ≠ 127.0.0.1 do IPv6).
+CDP_PROBE_HOSTS = tuple(
+    h.strip()
+    for h in os.environ.get("FLOW2API_CDP_PROBE_HOSTS", "localhost,127.0.0.1").split(",")
+    if h.strip()
+) or ("localhost", "127.0.0.1")
+# Chrome 136+ không cho CDP trên User Data mặc định — dùng thư mục riêng (bản sao profile).
+CDP_USER_DATA_DIR = Path(
+    os.environ.get("FLOW2API_CDP_USER_DATA_DIR", str(STORAGE_DIR / "chrome-cdp-user-data"))
+)
+# Mở Chrome CDP thu nhỏ (taskbar) — Playwright vẫn điều khiển qua CDP, không cần cửa sổ DevTools.
+CHROME_CDP_START_MINIMIZED = os.environ.get("FLOW2API_CHROME_START_MINIMIZED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 VIDEOS_DIR = STORAGE_DIR / "videos"
 INPUTS_DIR = STORAGE_DIR / "inputs"
 OUTPUTS_DIR = STORAGE_DIR / "outputs"

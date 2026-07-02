@@ -171,6 +171,58 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:
         logger.warning("profile media bootstrap failed: %s", exc)
+    from flow2api.config import PLAYWRIGHT_ENABLED, UI_AUTOMATION_ENABLED, UI_PREP_ONLY
+    from flow2api.services.system_ops import (
+        ensure_flow_launch_script,
+        get_playwright_flow_cdp_port,
+        get_playwright_flow_chrome_profile,
+    )
+
+    if PLAYWRIGHT_ENABLED:
+        flow_profile = get_playwright_flow_chrome_profile()
+        flow_cdp = get_playwright_flow_cdp_port()
+        logger.info(
+            "Playwright ON — UI_AUTOMATION=%s UI_PREP_ONLY=%s FLOW=%s @ %s",
+            UI_AUTOMATION_ENABLED,
+            UI_PREP_ONLY,
+            flow_profile,
+            flow_cdp,
+        )
+        if not UI_AUTOMATION_ENABLED:
+            logger.warning(
+                "Playwright enabled but FLOW2API_UI_AUTOMATION=0 — job se KHONG thao tac UI"
+            )
+        try:
+            bat = ensure_flow_launch_script()
+            logger.info("Chrome Flow profile script (CDP): %s", bat)
+        except Exception as exc:
+            logger.warning("ensure_flow_launch_script failed: %s", exc)
+        try:
+            from flow2api.services.playwright_pool import list_active_cdp_ports
+
+            active = await list_active_cdp_ports()
+            if active:
+                logger.info(
+                    "CDP ports dang mo: %s — Playwright UI dung port %s (Flow)",
+                    ", ".join(str(p) for p in active),
+                    flow_cdp,
+                )
+                if flow_cdp not in active:
+                    logger.warning(
+                        "Port Flow %s chua mo — mo profile «%s» tu dashboard hoac launch-chrome-cdp.bat",
+                        flow_cdp,
+                        flow_profile,
+                    )
+            else:
+                logger.warning(
+                    "Chua co CDP port nao — dashboard: Mở profile Flow, hoac chay launch-chrome-cdp.bat"
+                )
+        except Exception as exc:
+            logger.warning("CDP scan failed: %s", exc)
+    else:
+        logger.info(
+            "Playwright OFF — dat FLOW2API_PLAYWRIGHT_ENABLED=1 (hoac chay run-playwright.bat)"
+        )
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,
@@ -184,6 +236,12 @@ async def lifespan(app: FastAPI):
     retention_task.cancel()
     telegram_task.cancel()
     proxy_rotate_task.cancel()
+    try:
+        from flow2api.services.playwright_pool import shutdown_playwright_pool
+
+        await shutdown_playwright_pool()
+    except Exception as exc:
+        logger.warning("playwright shutdown failed: %s", exc)
     try:
         await asyncio.gather(
             ws_task, worker_task, watchdog_task, retention_task, telegram_task, proxy_rotate_task, return_exceptions=True

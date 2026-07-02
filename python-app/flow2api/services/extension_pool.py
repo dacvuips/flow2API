@@ -597,6 +597,13 @@ class ExtensionPool:
             level="info",
             data={"profile_id": pid},
         )
+        try:
+            from flow2api.services.playwright_pool import get_playwright_pool, is_playwright_enabled
+
+            if is_playwright_enabled():
+                await get_playwright_pool().on_profile_connected(pid)
+        except Exception as exc:
+            logger.warning("playwright profile connect failed %s: %s", pid[:12], exc)
         return session
 
     async def unregister_ws(self, ws: Any) -> None:
@@ -616,6 +623,16 @@ class ExtensionPool:
                     level="warn",
                     data={"profile_id": pid},
                 )
+                try:
+                    from flow2api.services.playwright_pool import (
+                        get_playwright_pool,
+                        is_playwright_enabled,
+                    )
+
+                    if is_playwright_enabled():
+                        await get_playwright_pool().on_profile_disconnected(pid)
+                except Exception as exc:
+                    logger.warning("playwright profile disconnect failed %s: %s", pid[:12], exc)
 
     async def handle_ws_message(self, ws: Any, data: dict) -> Optional[ExtensionSession]:
         pid = self._ws_to_profile.get(id(ws))

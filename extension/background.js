@@ -67,20 +67,10 @@ function clearAbortTracking(id) {
 
 const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
 
-// Disable captcha-triggered tab reload; use timed auto-reload instead.
+// Disable captcha-triggered tab reload.
 const CAPTCHA_RELOAD_EVERY_N_SOLVES = 0;
 const _captchaSolvesByTab = new Map();
 let _captchaChain = Promise.resolve();
-
-const FLOW_RELOAD_ALARM = 'f2api-flow-auto-reload';
-const FLOW_RELOAD_ALLOWED = [10, 15, 20];
-const DEFAULT_FLOW_RELOAD_STATE = {
-  enabled: true,
-  intervalSec: 10,
-  lastReloadAt: 0,
-  nextReloadAt: 0,
-};
-let flowReloadState = { ...DEFAULT_FLOW_RELOAD_STATE };
 
 // Cached Flow projectId (in-memory) — informational / popup only.
 let _cachedProjectId = null;
@@ -93,12 +83,6 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   });
   if (onFlow) {
     _captchaSolvesByTab.set(tabId, 0);
-    chrome.storage.local.get(['f2apiClearUserStopped']).then((data) => {
-      if (data.f2apiClearUserStopped) return;
-      loadClearState().then(() => {
-        if (!clearState.running) ensureAutoClearStarted().catch(() => {});
-      });
-    });
   }
 });
 
@@ -140,12 +124,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'reconnect') connectToAgent();
   if (alarm.name === 'keepAlive') keepAlive();
   if (alarm.name === 'flowWatchdog') runFlowWatchdog();
-  if (alarm.name === CLEAR_ALARM) {
-    loadClearState().then(() => performClearTick());
-  }
-  if (alarm.name === FLOW_RELOAD_ALARM) {
-    performFlowReloadTick();
-  }
 });
 
 async function getOrCreateProfileId() {
@@ -171,6 +149,7 @@ async function init() {
   chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [9001] }).catch(() => {});
   connectToAgent();
   try {
+    await sleep(2500);
     const flowTabs = await chrome.tabs.query({ url: flowUrls });
     if (!flowTabs.length) {
       const url = data.flowUrl || FLOW_URL;
@@ -183,14 +162,10 @@ async function init() {
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
   ensureFreshFlowToken('startup');
-  await chrome.storage.local.set({ f2apiClearUserStopped: false });
   const prefs = await chrome.storage.local.get(['autoClickCreateFlow']);
   if (prefs.autoClickCreateFlow === undefined) {
     await chrome.storage.local.set({ autoClickCreateFlow: true });
   }
-  await initClearFromStorage();
-  await ensureAutoClearStarted();
-  await initFlowReloadFromStorage();
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Token Capture Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -391,56 +366,15 @@ function connectToAgent() {
           },
         });
       } else if (msg.method === 'clear_control') {
-        const action = String(msg.params?.action || '').toLowerCase();
-        const intervalSec = msg.params?.intervalSec;
-        try {
-          let result;
-          if (action === 'get_state') {
-            await loadClearState();
-            result = { ok: true, state: getPublicClearState() };
-          } else if (action === 'start') {
-            await chrome.storage.local.set({ f2apiClearUserStopped: false });
-            const res = await startAutoClear(
-              intervalSec || clearState.intervalSec || AUTO_CLEAR_INTERVAL_SEC,
-              null,
-            );
-            result = res.ok
-              ? { ok: true, state: getPublicClearState(), ...res }
-              : res;
-          } else if (action === 'stop') {
-            await stopAutoClear();
-            result = { ok: true, state: getPublicClearState() };
-          } else if (action === 'now') {
-            const tab = await resolveClearTargetTab(null);
-            if (!tab?.id || !isLabsGoogleTab(tab)) {
-              result = {
-                ok: false,
-                error: 'not_labs_google',
-                message: 'Clear Data chỉ áp dụng trên https://labs.google/ — mở tab Flow trước.',
-              };
-            } else {
-              await clearSiteDataAndReload(tab.id);
-              clearState.clearCount = (clearState.clearCount || 0) + 1;
-              await saveClearState();
-              broadcastClearState();
-              result = { ok: true, state: getPublicClearState() };
-            }
-          } else {
-            result = { ok: false, error: 'invalid_action' };
-          }
-          sendToAgent({
-            id: msg.id,
-            status: result.ok ? 200 : 400,
-            result,
-            error: result.ok ? undefined : (result.error || result.message),
-          });
-        } catch (e) {
-          sendToAgent({
-            id: msg.id,
-            status: 500,
-            error: e?.message || 'clear_control_failed',
-          });
-        }
+        sendToAgent({
+          id: msg.id,
+          status: 410,
+          result: {
+            ok: false,
+            error: 'feature_removed',
+            message: 'Clear Data da bo trong extension.',
+          },
+        });
       }
     } catch (e) {
       console.error('[Flow2API] Message error:', e);
@@ -772,98 +706,6 @@ function applyProxyConfig(proxyUrl) {
       ['blocking'],
     );
   }
-}
-
-async function refreshAllFlowTabs() {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*', 'https://labs.google/fx', 'https://labs.google/fx/*'],
-  });
-  for (const tab of tabs) {
-    if (tab.id != null) {
-      try { await chrome.tabs.reload(tab.id); } catch { /* ignore */ }
-    }
-  }
-}
-
-function clampFlowReloadSec(sec) {
-  const n = Number(sec) || DEFAULT_FLOW_RELOAD_STATE.intervalSec;
-  return FLOW_RELOAD_ALLOWED.includes(n) ? n : DEFAULT_FLOW_RELOAD_STATE.intervalSec;
-}
-
-async function loadFlowReloadState() {
-  const data = await chrome.storage.local.get('f2apiFlowReload');
-  const raw = data.f2apiFlowReload || {};
-  flowReloadState = {
-    enabled: raw.enabled !== false,
-    intervalSec: clampFlowReloadSec(raw.intervalSec),
-    lastReloadAt: Number(raw.lastReloadAt || 0),
-    nextReloadAt: Number(raw.nextReloadAt || 0),
-  };
-}
-
-async function saveFlowReloadState() {
-  await chrome.storage.local.set({ f2apiFlowReload: flowReloadState });
-}
-
-function getPublicFlowReloadState() {
-  let secondsUntilNext = null;
-  if (flowReloadState.enabled && flowReloadState.nextReloadAt > 0) {
-    secondsUntilNext = Math.max(0, Math.ceil((flowReloadState.nextReloadAt - Date.now()) / 1000));
-  }
-  return {
-    enabled: !!flowReloadState.enabled,
-    intervalSec: flowReloadState.intervalSec,
-    lastReloadAt: flowReloadState.lastReloadAt,
-    nextReloadAt: flowReloadState.nextReloadAt,
-    secondsUntilNext,
-  };
-}
-
-function broadcastFlowReloadState() {
-  chrome.runtime.sendMessage({
-    type: 'FLOW_RELOAD_STATE_UPDATE',
-    state: getPublicFlowReloadState(),
-  }).catch(() => {});
-}
-
-async function scheduleFlowReloadAlarm() {
-  await alarmClear(FLOW_RELOAD_ALARM);
-  if (!flowReloadState.enabled) return;
-  const delayInMinutes = Math.max(0.0167, flowReloadState.intervalSec / 60);
-  await alarmCreate(FLOW_RELOAD_ALARM, { delayInMinutes });
-  flowReloadState.nextReloadAt = Date.now() + flowReloadState.intervalSec * 1000;
-}
-
-async function applyFlowReloadSettings({ enabled, intervalSec } = {}) {
-  if (enabled !== undefined) flowReloadState.enabled = enabled !== false;
-  if (intervalSec !== undefined) flowReloadState.intervalSec = clampFlowReloadSec(intervalSec);
-  await scheduleFlowReloadAlarm();
-  await saveFlowReloadState();
-  broadcastFlowReloadState();
-  return getPublicFlowReloadState();
-}
-
-async function performFlowReloadTick() {
-  if (!flowReloadState.enabled) return;
-  try {
-    await refreshAllFlowTabs();
-    flowReloadState.lastReloadAt = Date.now();
-  } catch (e) {
-    console.warn('[Flow2API] auto flow reload failed:', e?.message || e);
-  } finally {
-    await scheduleFlowReloadAlarm();
-    await saveFlowReloadState();
-    broadcastFlowReloadState();
-  }
-}
-
-async function initFlowReloadFromStorage() {
-  await loadFlowReloadState();
-  // Per requirement: always default to ON when extension starts.
-  flowReloadState.enabled = true;
-  await scheduleFlowReloadAlarm();
-  await saveFlowReloadState();
-  broadcastFlowReloadState();
 }
 
 async function applySystemPushConfig(config) {
@@ -1329,350 +1171,6 @@ function broadcastStatus() {
   chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
 }
 
-// ─── Auto Clear Site Data (current tab) ───────────────────────────────────────
-
-const CLEAR_ALARM = 'f2api-auto-clear';
-const AUTO_CLEAR_INTERVAL_SEC = 300;
-const CLEAR_DATA_ORIGIN = 'https://labs.google';
-
-const DEFAULT_CLEAR_STATE = {
-  running: false,
-  intervalSec: AUTO_CLEAR_INTERVAL_SEC,
-  tabId: null,
-  origin: null,
-  clearCount: 0,
-  nextRunAt: null,
-};
-
-let clearState = { ...DEFAULT_CLEAR_STATE };
-let _autoClearBootstrapping = false;
-
-const BROWSING_DATA_REMOVE_OPTS = {
-  cache: true,
-  cacheStorage: true,
-  cookies: true,
-  fileSystems: true,
-  indexedDB: true,
-  localStorage: true,
-  serviceWorkers: true,
-  webSQL: true,
-};
-
-function clampClearSec(sec) {
-  return Math.max(1, Math.min(3600, Math.round(Number(sec) || AUTO_CLEAR_INTERVAL_SEC)));
-}
-
-function canReloadTab(tab) {
-  if (!tab?.id) return false;
-  const url = tab.url || '';
-  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
-}
-
-function getOriginFromUrl(url) {
-  return new URL(url).origin;
-}
-
-function isLabsGoogleUrl(url) {
-  try {
-    return new URL(String(url || '')).hostname === 'labs.google';
-  } catch {
-    return false;
-  }
-}
-
-function isLabsGoogleTab(tab) {
-  return !!tab && isLabsGoogleUrl(tab.url);
-}
-
-async function resolveClearTargetTab(tabId) {
-  if (tabId) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (isLabsGoogleTab(tab) && canReloadTab(tab)) return tab;
-    } catch {
-      /* fall through */
-    }
-  }
-  return findFlowTabForClear();
-}
-
-function browsingDataRemove(origins, options) {
-  return new Promise((resolve, reject) => {
-    chrome.browsingData.remove({ origins }, options, () => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve();
-      }
-    });
-  });
-}
-
-async function getActiveTab() {
-  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (tabs[0]?.id) return tabs[0];
-  tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs[0] || null;
-}
-
-async function resolveTargetTab(tabId) {
-  if (tabId) {
-    try {
-      return await chrome.tabs.get(tabId);
-    } catch {
-      return null;
-    }
-  }
-  return getActiveTab();
-}
-
-async function findFlowTabForClear() {
-  const tabs = await chrome.tabs.query({ url: flowUrls });
-  return (
-    tabs.find((t) => !t.discarded && canReloadTab(t))
-    || tabs.find((t) => canReloadTab(t))
-    || null
-  );
-}
-
-async function ensureAutoClearStarted() {
-  if (_autoClearBootstrapping) return;
-  const prefs = await chrome.storage.local.get('f2apiClearUserStopped');
-  if (prefs.f2apiClearUserStopped) return;
-  _autoClearBootstrapping = true;
-  try {
-    await loadClearState();
-    if (clearState.running && clearState.tabId) {
-      try {
-        const tab = await chrome.tabs.get(clearState.tabId);
-        if (canReloadTab(tab) && isLabsGoogleTab(tab)) {
-          clearState.intervalSec = AUTO_CLEAR_INTERVAL_SEC;
-          await scheduleClearAlarm();
-          await saveClearState();
-          broadcastClearState();
-          return;
-        }
-      } catch {
-        /* tab closed — start again below */
-      }
-    }
-
-    let tab = await findFlowTabForClear();
-    if (!tab?.id) {
-      try {
-        await openFlowTabResilient(false);
-        await sleep(2500);
-        tab = await findFlowTabForClear();
-      } catch (e) {
-        console.warn('[Flow2API] Auto clear: cannot open Flow tab:', e?.message || e);
-        return;
-      }
-    }
-    if (!tab?.id || !canReloadTab(tab)) return;
-
-    const res = await startAutoClear(AUTO_CLEAR_INTERVAL_SEC, tab.id);
-    if (res.ok) {
-      console.log(
-        '[Flow2API] Auto clear started: every %ss on %s',
-        AUTO_CLEAR_INTERVAL_SEC,
-        clearState.origin || tab.url,
-      );
-    } else {
-      console.warn('[Flow2API] Auto clear start failed:', res.error || res.message || res);
-    }
-  } finally {
-    _autoClearBootstrapping = false;
-  }
-}
-
-async function loadClearState() {
-  const data = await chrome.storage.local.get('f2apiClear');
-  if (data.f2apiClear) {
-    clearState = { ...DEFAULT_CLEAR_STATE, ...data.f2apiClear };
-  }
-}
-
-async function saveClearState() {
-  await chrome.storage.local.set({ f2apiClear: clearState });
-}
-
-function getPublicClearState() {
-  let secondsUntilNext = null;
-  if (clearState.running && clearState.nextRunAt) {
-    secondsUntilNext = Math.max(0, Math.ceil((clearState.nextRunAt - Date.now()) / 1000));
-  }
-  return {
-    running: clearState.running,
-    intervalSec: clearState.intervalSec,
-    clearCount: clearState.clearCount,
-    tabId: clearState.tabId,
-    origin: clearState.origin,
-    cachedProjectId: _cachedProjectId,
-    secondsUntilNext,
-  };
-}
-
-function broadcastClearState() {
-  chrome.runtime.sendMessage({
-    type: 'CLEAR_STATE_UPDATE',
-    state: getPublicClearState(),
-  }).catch(() => {});
-}
-
-function alarmClear(name) {
-  return new Promise((resolve) => chrome.alarms.clear(name, () => resolve()));
-}
-
-function alarmGet(name) {
-  return new Promise((resolve) => chrome.alarms.get(name, (a) => resolve(a)));
-}
-
-function alarmCreate(name, info) {
-  return new Promise((resolve, reject) => {
-    chrome.alarms.create(name, info, () => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve();
-      }
-    });
-  });
-}
-
-async function scheduleClearAlarm() {
-  await alarmClear(CLEAR_ALARM);
-  if (!clearState.running || !clearState.tabId) return;
-
-  const delayMin = Math.max(0.0167, clearState.intervalSec / 60);
-  await alarmCreate(CLEAR_ALARM, { delayInMinutes: delayMin });
-  clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
-}
-
-async function sanitizeClearState() {
-  await loadClearState();
-  if (!clearState.running) return;
-
-  if (!clearState.tabId) {
-    await stopAutoClear();
-    return;
-  }
-
-  try {
-    const tab = await chrome.tabs.get(clearState.tabId);
-    if (!canReloadTab(tab) || !isLabsGoogleTab(tab)) {
-      await stopAutoClear();
-      return;
-    }
-    clearState.origin = CLEAR_DATA_ORIGIN;
-  } catch {
-    await stopAutoClear();
-    return;
-  }
-
-  const alarm = await alarmGet(CLEAR_ALARM);
-  if (!alarm) {
-    clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
-    await scheduleClearAlarm();
-    await saveClearState();
-  }
-}
-
-async function clearSiteDataAndReload(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!canReloadTab(tab)) throw new Error('invalid_tab');
-  if (!isLabsGoogleUrl(tab.url)) throw new Error('not_labs_google');
-
-  await browsingDataRemove([CLEAR_DATA_ORIGIN], BROWSING_DATA_REMOVE_OPTS);
-  await chrome.tabs.reload(tabId);
-  return CLEAR_DATA_ORIGIN;
-}
-
-async function performClearTick() {
-  if (!clearState.running || !clearState.tabId) return;
-
-  try {
-    clearState.origin = await clearSiteDataAndReload(clearState.tabId);
-    clearState.clearCount += 1;
-    await scheduleClearAlarm();
-    await saveClearState();
-    broadcastClearState();
-  } catch {
-    await stopAutoClear();
-  }
-}
-
-async function stopAutoClear() {
-  clearState.running = false;
-  clearState.nextRunAt = null;
-  await alarmClear(CLEAR_ALARM);
-  await saveClearState();
-  await chrome.storage.local.set({ f2apiClearUserStopped: true });
-  broadcastClearState();
-}
-
-async function startAutoClear(intervalSec, tabId) {
-  let tab = await resolveClearTargetTab(tabId);
-  if (!tab?.id) {
-    try {
-      await openFlowTabResilient(false);
-      await sleep(2500);
-      tab = await findFlowTabForClear();
-    } catch {
-      tab = null;
-    }
-  }
-  if (!tab?.id || !canReloadTab(tab) || !isLabsGoogleTab(tab)) {
-    return {
-      ok: false,
-      error: 'not_labs_google',
-      message: 'Clear Data chỉ áp dụng trên https://labs.google/ — mở tab Flow trước.',
-      url: tab?.url || '',
-    };
-  }
-
-  clearState.intervalSec = clampClearSec(intervalSec);
-  clearState.tabId = tab.id;
-  clearState.origin = CLEAR_DATA_ORIGIN;
-  clearState.running = true;
-
-  try {
-    await clearSiteDataAndReload(clearState.tabId);
-    clearState.clearCount = (clearState.clearCount || 0) + 1;
-    await scheduleClearAlarm();
-    await saveClearState();
-    broadcastClearState();
-    return { ok: true, tabId: tab.id, origin: clearState.origin };
-  } catch (err) {
-    clearState.running = false;
-    clearState.nextRunAt = null;
-    clearState.tabId = null;
-    clearState.origin = null;
-    await alarmClear(CLEAR_ALARM);
-    await saveClearState();
-    broadcastClearState();
-    return { ok: false, error: 'start_failed', message: String(err?.message || err) };
-  }
-}
-
-async function initClearFromStorage() {
-  await sanitizeClearState();
-  if (clearState.running && clearState.tabId) {
-    try {
-      if (!clearState.nextRunAt || clearState.nextRunAt < Date.now()) {
-        clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
-      }
-      await scheduleClearAlarm();
-      broadcastClearState();
-    } catch {
-      await stopAutoClear();
-    }
-  }
-}
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (clearState.tabId === tabId) stopAutoClear();
-});
-
 // ─── Popup Message Handlers ───────────────────────────────────────────────────Ă¢â€â‚¬
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
@@ -1795,63 +1293,6 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     const enabled = msg.enabled !== false;
     chrome.storage.local.set({ autoClickCreateFlow: enabled }).then(() => {
       reply({ ok: true, enabled });
-    });
-    return true;
-  }
-
-  if (msg.type === 'GET_CLEAR_STATE') {
-    loadClearState().then(() => reply(getPublicClearState()));
-    return true;
-  }
-
-  if (msg.type === 'GET_FLOW_RELOAD_STATE') {
-    loadFlowReloadState().then(() => reply(getPublicFlowReloadState()));
-    return true;
-  }
-
-  if (msg.type === 'SET_FLOW_RELOAD_INTERVAL') {
-    applyFlowReloadSettings({ intervalSec: msg.intervalSec }).then((state) => {
-      reply({ ok: true, state });
-    });
-    return true;
-  }
-
-  if (msg.type === 'TOGGLE_FLOW_RELOAD') {
-    applyFlowReloadSettings({ enabled: msg.enabled !== false }).then((state) => {
-      reply({ ok: true, state });
-    });
-    return true;
-  }
-
-  if (msg.type === 'SET_CLEAR_INTERVAL') {
-    clearState.intervalSec = clampClearSec(msg.intervalSec);
-    if (clearState.running) {
-      clearState.nextRunAt = Date.now() + clearState.intervalSec * 1000;
-      scheduleClearAlarm();
-    }
-    saveClearState().then(() => reply({ ok: true }));
-    return true;
-  }
-
-  if (msg.type === 'START_AUTO_CLEAR') {
-    chrome.storage.local.set({ f2apiClearUserStopped: false }).then(() => {
-      startAutoClear(msg.intervalSec, msg.tabId)
-        .then((res) => reply(res))
-        .catch((e) => reply({ ok: false, error: 'start_failed', message: e?.message || String(e) }));
-    });
-    return true;
-  }
-
-  if (msg.type === 'STOP_AUTO_CLEAR') {
-    stopAutoClear().then(() => reply({ ok: true }));
-    return true;
-  }
-
-  if (msg.type === 'RESET_CLEAR_COUNT') {
-    clearState.clearCount = 0;
-    saveClearState().then(() => {
-      broadcastClearState();
-      reply({ ok: true });
     });
     return true;
   }
