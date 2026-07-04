@@ -315,7 +315,7 @@ async def clear_profile_now(
     events.publish("profile_clear_changed", {"profile_id": profile_id, "manual": True})
     return {
         "ok": True,
-        "message": "Đã clear labs.google và reload tab Flow",
+        "message": "Đã xóa cookies labs.google + google.com trên tab Flow project",
         "clear_result": result,
         "profiles": pool.list_public(),
     }

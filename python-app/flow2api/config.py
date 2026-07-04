@@ -53,7 +53,7 @@ TASK_TIMEOUT_ERROR_MSG = (
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))
 DEFAULT_PROFILE_CLEAR_INTERVAL_S = int(
-    os.environ.get("FLOW2API_PROFILE_CLEAR_INTERVAL_S", "300")
+    os.environ.get("FLOW2API_PROFILE_CLEAR_INTERVAL_S", "5")
 )
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))

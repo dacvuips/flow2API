@@ -2,10 +2,8 @@
 
 const $ = (id) => document.getElementById(id);
 
-let selectedClearSec = 300;
+let selectedClearSec = 5;
 let clearCountdownTimer = null;
-let flowReloadState = null;
-let flowReloadTicker = null;
 
 function send(type, payload = {}, timeoutMs = 10000) {
   return new Promise((resolve) => {
@@ -38,43 +36,6 @@ function formatTokenAge(ms) {
 function formatIntervalLabel(sec) {
   if (sec >= 60 && sec % 60 === 0) return `${sec / 60}p`;
   return `${sec}s`;
-}
-
-function renderFlowReloadPresets(sec) {
-  document.querySelectorAll('[data-flow-reload-sec]').forEach((btn) => {
-    btn.classList.toggle('active', parseInt(btn.dataset.flowReloadSec, 10) === Number(sec));
-  });
-}
-
-function renderFlowReloadState(state) {
-  flowReloadState = state || flowReloadState;
-  const cur = flowReloadState || {};
-  const enabled = cur.enabled !== false;
-  const intervalSec = Number(cur.intervalSec || 10);
-  const nextEl = $('flow-reload-next');
-  const toggle = $('flow-reload-enabled');
-  if (toggle) toggle.checked = enabled;
-  renderFlowReloadPresets(intervalSec);
-  if (nextEl) {
-    if (!enabled) nextEl.textContent = 'đã tắt';
-    else if (cur.secondsUntilNext == null) nextEl.textContent = '—';
-    else nextEl.textContent = `${cur.secondsUntilNext}s`;
-  }
-}
-
-async function refreshFlowReloadState() {
-  const res = await send('GET_FLOW_RELOAD_STATE');
-  if (res) renderFlowReloadState(res);
-}
-
-function startFlowReloadTicker() {
-  if (flowReloadTicker) clearInterval(flowReloadTicker);
-  flowReloadTicker = setInterval(() => {
-    if (!flowReloadState || flowReloadState.enabled === false) return;
-    if (flowReloadState.secondsUntilNext == null) return;
-    flowReloadState.secondsUntilNext = Math.max(0, Number(flowReloadState.secondsUntilNext) - 1);
-    renderFlowReloadState(flowReloadState);
-  }, 1000);
 }
 
 function setConnection(status) {
@@ -187,7 +148,7 @@ function renderClear(cs) {
   selectedClearSec = cs.intervalSec ?? selectedClearSec;
 
   setText('clear-count', cs.clearCount ?? 0);
-  setText('clear-interval-label', formatIntervalLabel(cs.intervalSec ?? 300));
+  setText('clear-interval-label', formatIntervalLabel(cs.intervalSec ?? 5));
 
   const running = !!cs.running;
   const dot = $('clear-status-dot');
@@ -239,20 +200,33 @@ async function refreshClearState() {
   const hint = $('clear-hint');
   if (!hint) return;
   try {
-    if (tab?.url && isLabsGoogleUrl(tab.url)) {
-      hint.innerHTML = 'Chỉ xóa dữ liệu <strong>https://labs.google/</strong> (cookies, cache, storage…) rồi reload tab Flow.';
+    if (tab?.url && isFlowProjectUrl(tab.url)) {
+      hint.innerHTML = `Chỉ xóa <strong>Cookies</strong> của <strong>labs.google</strong> và <strong>google.com</strong> mỗi <strong>${selectedClearSec}s</strong> (chỉ khi tab đang ở trang project).`;
       hint.className = 'hint ok';
+    } else if (tab?.url && isLabsGoogleUrl(tab.url)) {
+      hint.innerHTML = 'Tab Flow chưa vào project — mở URL có <strong>/project/</strong> (vd. <code>…/flow/project/…</code>) để auto clear chạy.';
+      hint.className = 'hint';
     } else if (tab?.url && (tab.url.startsWith('http://') || tab.url.startsWith('https://'))) {
       const host = new URL(tab.url).hostname;
-      hint.innerHTML = `Tab hiện tại (<strong>${host}</strong>) không phải labs.google — auto clear sẽ dùng tab Flow trên <strong>labs.google</strong>.`;
+      hint.innerHTML = `Tab hiện tại (<strong>${host}</strong>) không phải Flow project — mở project trên <strong>labs.google</strong>.`;
       hint.className = 'hint';
     } else {
-      hint.textContent = 'Mở tab https://labs.google/fx/tools/flow (hoặc để extension tự mở).';
+      hint.textContent = 'Mở tab Flow project (đường dẫn có /project/) trên labs.google.';
       hint.className = 'hint err';
     }
   } catch {
-    hint.textContent = 'Mở tab https://labs.google/fx/tools/flow (hoặc để extension tự mở).';
+    hint.textContent = 'Mở tab Flow project (đường dẫn có /project/) trên labs.google.';
     hint.className = 'hint err';
+  }
+}
+
+function isFlowProjectUrl(url) {
+  try {
+    const u = new URL(String(url || ''));
+    if (u.hostname !== 'labs.google') return false;
+    return u.pathname.includes('/project/');
+  } catch {
+    return false;
   }
 }
 
@@ -313,7 +287,7 @@ $('btn-clear-start').addEventListener('click', async () => {
     if (!res.ok) {
       const urlHint = tab?.url ? `\n\nTab: ${tab.url}` : '';
       const msg = res.message ? `\n\n${res.message}` : '';
-      alert(`Không bắt đầu được.\nCần tab trên https://labs.google/${urlHint}${msg}`);
+      alert(`Không bắt đầu được.\nCần tab Flow project (đường dẫn có /project/).${urlHint}${msg}`);
       return;
     }
     started = true;
@@ -342,7 +316,6 @@ $('btn-clear-reset').addEventListener('click', async () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'STATUS_PUSH' || message.type === 'REQUEST_LOG_UPDATE') fetchStatus();
   if (message.type === 'CLEAR_STATE_UPDATE') renderClear(message.state);
-  if (message.type === 'FLOW_RELOAD_STATE_UPDATE') renderFlowReloadState(message.state);
 });
 
 chrome.storage.local.get('f2apiActiveTab').then((data) => {
@@ -375,21 +348,6 @@ $('auto-click-create')?.addEventListener('change', async (e) => {
   await send('SET_AUTO_CLICK_CREATE', { enabled: e.target.checked });
 });
 
-$('flow-reload-enabled')?.addEventListener('change', async (e) => {
-  const res = await send('TOGGLE_FLOW_RELOAD', { enabled: e.target.checked });
-  if (res?.state) renderFlowReloadState(res.state);
-  else refreshFlowReloadState();
-});
-
-document.querySelectorAll('[data-flow-reload-sec]').forEach((btn) => {
-  btn.addEventListener('click', async () => {
-    const sec = parseInt(btn.dataset.flowReloadSec, 10);
-    const res = await send('SET_FLOW_RELOAD_INTERVAL', { intervalSec: sec });
-    if (res?.state) renderFlowReloadState(res.state);
-    else refreshFlowReloadState();
-  });
-});
-
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.autoClickLastStatus) {
     renderAutoClickStatus(changes.autoClickLastStatus.newValue);
@@ -398,8 +356,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 fetchStatus();
 loadAutoClickSetting();
-refreshFlowReloadState();
-startFlowReloadTicker();
 setInterval(fetchStatus, 1500);
 resetClearStartButton(false);
 refreshClearState();

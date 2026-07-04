@@ -69,7 +69,7 @@ class WorkerSettings:
             for pid, val in self.profile_clear_interval.items():
                 if not pid or str(pid).startswith("_"):
                     continue
-                clear_interval[str(pid)] = max(1, min(3600, int(val or 300)))
+                clear_interval[str(pid)] = max(1, min(3600, int(val or 5)))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -403,7 +403,7 @@ def all_known_profile_ids() -> list[str]:
 
 
 def seed_profile_media_alternating(profile_ids: list[str] | None = None) -> WorkerSettings:
-    """Xen kẽ Image / Video theo thứ tự profile (0=Image, 1=Video, …)."""
+    """Gán tất cả profile vào cả Image lẫn Video."""
     pids = sorted(
         {
             str(p).strip()
@@ -413,36 +413,25 @@ def seed_profile_media_alternating(profile_ids: list[str] | None = None) -> Work
     )
     if not pids:
         return get_worker_settings()
-    image_allowed: list[str] = []
-    video_allowed: list[str] = []
-    for idx, pid in enumerate(pids):
-        if idx % 2 == 0:
-            image_allowed.append(pid)
-        else:
-            video_allowed.append(pid)
     return save_worker_settings(
-        profile_image_allowed=image_allowed,
-        profile_video_allowed=video_allowed,
+        profile_image_allowed=list(pids),
+        profile_video_allowed=list(pids),
     )
 
 
 def ensure_profile_media_on_connect(profile_id: str) -> WorkerSettings:
-    """Profile mới kết nối: gán xen kẽ Image/Video, không đổi profile cũ."""
+    """Profile mới kết nối: bật cả Image và Video, không đổi profile cũ."""
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
         return get_worker_settings()
     settings = get_worker_settings()
-    if pid in settings.profile_image_allowed or pid in settings.profile_video_allowed:
+    if pid in settings.profile_image_allowed and pid in settings.profile_video_allowed:
         return settings
-    assigned = sorted(
-        set(settings.profile_image_allowed) | set(settings.profile_video_allowed)
-    )
-    idx = len(assigned)
     image_ids = list(settings.profile_image_allowed)
     video_ids = list(settings.profile_video_allowed)
-    if idx % 2 == 0:
+    if pid not in image_ids:
         image_ids.append(pid)
-    else:
+    if pid not in video_ids:
         video_ids.append(pid)
     return save_worker_settings(
         profile_image_allowed=sorted(set(image_ids)),
