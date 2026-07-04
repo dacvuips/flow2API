@@ -1249,7 +1249,7 @@ function broadcastStatus() {
 
 const CLEAR_ALARM = 'f2api-auto-clear';
 const AUTO_CLEAR_INTERVAL_SEC = 5;
-const CLEAR_DATA_ORIGINS = ['https://labs.google', 'https://www.google.com'];
+const CLEAR_DATA_ORIGINS = ['https://labs.google'];
 
 const DEFAULT_CLEAR_STATE = {
   running: false,

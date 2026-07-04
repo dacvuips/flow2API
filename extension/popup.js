@@ -201,7 +201,7 @@ async function refreshClearState() {
   if (!hint) return;
   try {
     if (tab?.url && isFlowProjectUrl(tab.url)) {
-      hint.innerHTML = `Chỉ xóa <strong>Cookies</strong> của <strong>labs.google</strong> và <strong>google.com</strong> mỗi <strong>${selectedClearSec}s</strong> (chỉ khi tab đang ở trang project).`;
+      hint.innerHTML = `Chỉ xóa <strong>Cookies</strong> của <strong>labs.google</strong> mỗi <strong>${selectedClearSec}s</strong> (chỉ khi tab đang ở trang project).`;
       hint.className = 'hint ok';
     } else if (tab?.url && isLabsGoogleUrl(tab.url)) {
       hint.innerHTML = 'Tab Flow chưa vào project — mở URL có <strong>/project/</strong> (vd. <code>…/flow/project/…</code>) để auto clear chạy.';
