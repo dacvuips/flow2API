@@ -25,6 +25,24 @@ def get_video_quality(params: dict[str, Any], default: str = "") -> str:
     return default
 
 
+def resolve_variant_count(params: dict[str, Any] | None, default: int = 1) -> int:
+    """Số variant 1–4; không truyền / null / 0 → mặc định 1."""
+    p = params or {}
+    raw = p.get("variant_count")
+    if raw is None:
+        for key in ("variantCount",):
+            if p.get(key) is not None:
+                raw = p.get(key)
+                break
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = int(default)
+    if n < 1:
+        return 1
+    return max(1, min(4, n))
+
+
 def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
     out = dict(params or {})
 
@@ -66,5 +84,7 @@ def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
             if out.get(key):
                 out["profile_id"] = str(out[key]).strip()
                 break
+
+    out["variant_count"] = resolve_variant_count(out)
 
     return out

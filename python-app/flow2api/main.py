@@ -87,6 +87,17 @@ class _SuppressNoisyAccessLog(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_SuppressNoisyAccessLog())
 
+
+class _SuppressInvalidHttpProbe(logging.Filter):
+    """Port 1994 là HTTP thuần — probe HTTPS/TLS gây 'Invalid HTTP request received'."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Invalid HTTP request received" not in (record.getMessage() or "")
+
+
+for _uv_log in ("uvicorn.error", "uvicorn"):
+    logging.getLogger(_uv_log).addFilter(_SuppressInvalidHttpProbe())
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,6 +170,9 @@ async def lifespan(app: FastAPI):
     from flow2api.services.system_ops import proxy_rotate_loop
 
     proxy_rotate_task = asyncio.create_task(proxy_rotate_loop())
+    from flow2api.services.profile_403_cache import bootstrap_403_cache_timers
+
+    await bootstrap_403_cache_timers()
     try:
         from flow2api.services.worker_settings import bootstrap_profile_media_on_startup
 

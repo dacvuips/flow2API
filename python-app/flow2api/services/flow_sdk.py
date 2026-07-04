@@ -709,15 +709,50 @@ async def gen_image(
 
 def _iter_generated_images(data: dict) -> list[dict]:
     out: list[dict] = []
-    for entry in data.get("media") or []:
+    seen: set[str] = set()
+
+    def add_entry(entry: dict) -> None:
         if not isinstance(entry, dict):
+            return
+        key = str(
+            entry.get("mediaId")
+            or entry.get("name")
+            or entry.get("fifeUrl")
+            or entry.get("imageUri")
+            or entry.get("url")
+            or ""
+        ).strip()
+        if not key:
+            key = f"idx:{len(out)}"
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(entry)
+
+    def walk_media(entries: Any) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            gen = (entry.get("image") or {}).get("generatedImage")
+            if isinstance(gen, dict):
+                add_entry(gen)
+                continue
+            if entry.get("fifeUrl") or entry.get("url") or entry.get("mediaId") or entry.get("name"):
+                add_entry(entry)
+
+    if not isinstance(data, dict):
+        return out
+
+    walk_media(data.get("media"))
+    for block in data.get("responses") or []:
+        if not isinstance(block, dict):
             continue
-        gen = (entry.get("image") or {}).get("generatedImage")
-        if isinstance(gen, dict):
-            out.append(gen)
-            continue
-        if entry.get("fifeUrl") or entry.get("url"):
-            out.append(entry)
+        walk_media(block.get("media"))
+        inner = block.get("result") or block.get("data")
+        if isinstance(inner, dict):
+            walk_media(inner.get("media"))
     return out
 
 
@@ -1459,6 +1494,50 @@ def is_http_404_failure(
             if isinstance(err, dict) and int(err.get("code") or 0) == 404:
                 return True
             if str(err.get("status") or "").upper() == "NOT_FOUND":
+                return True
+    return False
+
+
+def is_http_403_failure(
+    exc: Exception | None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """HTTP 403 / CAPTCHA_FAILED from extension, API, or Playwright UI submit."""
+    def _text_is_403(text: str) -> bool:
+        t = str(text or "").strip().upper()
+        if not t:
+            return False
+        if (
+            "HTTP_403" in t
+            or "SUBMIT_HTTP_403" in t
+            or "CAPTCHA_FAILED" in t
+            or "RECAPTCHA EVALUATION FAILED" in t
+        ):
+            return True
+        if "PERMISSION_DENIED" in t and ("403" in t or "RECAPTCHA" in t):
+            return True
+        if "'CODE': 403" in t or '"CODE": 403' in t or "'CODE':403" in t:
+            return True
+        return False
+
+    if _text_is_403(msg):
+        return True
+    chain: list[Any] = [exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None)]
+    for item in chain:
+        if item is not None and _text_is_403(str(item)):
+            return True
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and get_media_http_status(raw) == 403:
+            return True
+    for entry in api_trace or []:
+        if int(entry.get("http_status") or 0) == 403:
+            return True
+        data = entry.get("data")
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict) and int(err.get("code") or 0) == 403:
                 return True
     return False
 

@@ -458,6 +458,9 @@ class ExtensionSession:
         clear_interval = get_profile_clear_interval_sec(self.profile_id)
         cs = self.clear_state if isinstance(self.clear_state, dict) else {}
         clear_running = bool(cs.get("running"))
+        from flow2api.services.profile_403_cache import profile_403_cache_public
+
+        cache403 = profile_403_cache_public(self.profile_id)
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -486,6 +489,7 @@ class ExtensionSession:
             "clear_interval_sec": int(cs.get("intervalSec") or clear_interval),
             "clear_count": int(cs.get("clearCount") or 0),
             "clear_seconds_until_next": cs.get("secondsUntilNext"),
+            **cache403,
             **proxy_fields,
         }
 

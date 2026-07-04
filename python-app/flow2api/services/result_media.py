@@ -342,7 +342,27 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     for u in local_files:
         add(u, default_kind, local=True)
     if local_files:
-        return items[:1]
+        return items[:4]
+
+    gen = result.get("ui_generation")
+    if isinstance(gen, dict):
+        gen_image_urls = gen.get("image_urls") or []
+        gen_media_ids = gen.get("media_ids") or []
+        for i, u in enumerate(gen_image_urls):
+            mid = str(gen_media_ids[i] if i < len(gen_media_ids) else "").strip()
+            add(str(u), "image", mid)
+        for u in gen.get("video_urls") or []:
+            add(str(u), "video")
+        for entry in gen.get("media_entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            mid = str(entry.get("media_id") or entry.get("mediaId") or "").strip()
+            kind_raw = str(entry.get("kind") or entry.get("mediaType") or default_kind).lower()
+            kind = "video" if "video" in kind_raw else "image"
+            if entry.get("url"):
+                add(str(entry["url"]), kind, mid)
+            elif mid:
+                add(f"/media/{mid}", kind, mid)
 
     image_urls = result.get("image_urls") or []
     media_ids = result.get("media_ids") or []
@@ -380,7 +400,7 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
                 else:
                     add(f"/media/{mid_s}", default_kind, mid_s)
 
-    return items[:1]
+    return items[:4]
 
 
 def _decode_image_bytes(b64: str) -> tuple[bytes, str] | None:

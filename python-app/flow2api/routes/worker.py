@@ -14,6 +14,7 @@ from flow2api.services.worker_settings import (
     save_profile_limit,
     save_worker_settings,
     set_profile_clear_settings,
+    set_profile_403_cache_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
     set_profile_media_allowed,
@@ -59,6 +60,11 @@ class ProfileMediaBody(BaseModel):
 class ProfileClearBody(BaseModel):
     enabled: bool = True
     interval_sec: int | None = Field(None, ge=1, le=3600)
+
+
+class Profile403CacheBody(BaseModel):
+    enabled: bool = True
+    minutes: int | None = Field(None, ge=1, le=1440)
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -137,6 +143,9 @@ async def update_profile_dispatch(
     body: ProfileDispatchBody,
     _=Depends(_auth_key_id),
 ):
+    from flow2api.services import system_ops
+    from flow2api.services.profile_403_cache import cancel_403_cache_pause
+
     pool = get_extension_pool()
     if not pool.get(profile_id):
         raise HTTPException(404, "profile_not_found")
@@ -144,8 +153,10 @@ async def update_profile_dispatch(
         saved = set_profile_dispatch_enabled(profile_id, body.enabled)
     except ValueError as exc:
         raise HTTPException(400, "invalid_profile_id") from exc
-    from flow2api.services import system_ops
-
+    if body.enabled:
+        await cancel_403_cache_pause(profile_id, re_enable_dispatch=False)
+    else:
+        await cancel_403_cache_pause(profile_id, re_enable_dispatch=False)
     await system_ops.push_proxy_to_extensions()
     events.publish(
         "profile_dispatch_changed",
@@ -318,5 +329,43 @@ async def clear_profile_now(
         "message": "Đã clear labs.google và reload tab Flow",
         "clear_result": result,
         "profiles": pool.list_public(),
+    }
+
+
+@router.put("/profiles/{profile_id}/403-cache")
+async def update_profile_403_cache(
+    profile_id: str,
+    body: Profile403CacheBody,
+    _=Depends(_auth_key_id),
+):
+    from flow2api.services.profile_403_cache import cancel_403_cache_pause
+
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    try:
+        saved = set_profile_403_cache_settings(
+            profile_id,
+            enabled=body.enabled,
+            minutes=body.minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
+    if not body.enabled:
+        await cancel_403_cache_pause(profile_id, re_enable_dispatch=True)
+    events.publish(
+        "profile_403_cache_changed",
+        {
+            "profile_id": profile_id,
+            "enabled": body.enabled,
+            "minutes": body.minutes,
+        },
+    )
+    state = "bật" if body.enabled else "tắt"
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
+        "message": f"Đã {state} Cache 403 cho profile",
+        "ok": True,
     }
 

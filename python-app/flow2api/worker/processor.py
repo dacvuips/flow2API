@@ -38,9 +38,14 @@ from flow2api.services.flow_sdk import (
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
-from flow2api.services.request_params import get_video_quality, normalize_request_params
+from flow2api.services.request_params import (
+    get_video_quality,
+    normalize_request_params,
+    resolve_variant_count,
+)
 from flow2api.services.result_media import prepare_params_for_worker_requeue
 from flow2api.services.stored_media import persist_task_result
+from flow2api.services.profile_403_cache import maybe_trigger_403_cache_pause
 from flow2api.services.flow_client import (
     apply_retry_profile_rotation,
     bind_task_profile,
@@ -73,6 +78,69 @@ _UI_AUTOMATION_TYPES = frozenset(
     }
 )
 
+_UI_VIDEO_POLL_TYPES = frozenset(
+    {
+        "gen_text_video",
+        "gen_image_video",
+        "gen_video",
+        "gen_video_start_end",
+        "gen_multi_image_video",
+    }
+)
+
+
+def _ui_video_submit_raw(ui_meta: dict[str, Any], *, project_id: str = "") -> dict[str, Any]:
+    """Chuẩn hóa response submit UI → shape poll video (flow_sdk)."""
+    gen = ui_meta.get("ui_generation") if isinstance(ui_meta, dict) else None
+    if not isinstance(gen, dict):
+        return {}
+    raw = gen.get("raw")
+    if isinstance(raw, dict) and raw:
+        out = dict(raw)
+    else:
+        media_ids = [str(m) for m in (gen.get("media_ids") or []) if m]
+        if not media_ids:
+            return {}
+        out = {
+            "media": [{"name": mid, "mediaId": mid} for mid in media_ids],
+            "operations": [],
+        }
+    pid = str(project_id or ui_meta.get("project_id") or "").strip()
+    if pid and not out.get("projectId"):
+        out["projectId"] = pid
+    return out
+
+
+def _extract_image_b64_field(value: Any) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("image", "base64", "data", "bytes", "imageBase64", "image_base64"):
+            raw = value.get(key)
+            if raw and str(raw).strip():
+                return str(raw).strip()
+    return None
+
+
+def _resolve_ui_image_base64s(rid: str, params: dict[str, Any]) -> list[str]:
+    """Ảnh cho Playwright UI: image_base64s, startImage/endImage, hoặc file trong storage."""
+    from flow2api.services.result_media import _restore_input_images
+
+    restored = _restore_input_images(dict(params or {}), rid)
+    imgs = [str(x) for x in (restored.get("image_base64s") or restored.get("imageBase64s") or []) if x]
+    if imgs:
+        return imgs
+    start = _extract_image_b64_field(restored.get("startImage") or restored.get("start_image"))
+    end = _extract_image_b64_field(restored.get("endImage") or restored.get("end_image"))
+    out: list[str] = []
+    if start:
+        out.append(start)
+    if end:
+        out.append(end)
+    return out
+
 
 async def _run_flow_ui_prep(
     rid: str,
@@ -80,6 +148,8 @@ async def _run_flow_ui_prep(
     req_type: str,
     row: Any,
     params: dict[str, Any],
+    *,
+    project_id: str,
 ) -> dict[str, Any] | None:
     from flow2api.config import PLAYWRIGHT_ENABLED, UI_AUTOMATION_ENABLED
     from flow2api.services.playwright_flow import (
@@ -99,19 +169,37 @@ async def _run_flow_ui_prep(
         return None
 
     prompt = _task_prompt(row, params)
-    image_base64s = params.get("image_base64s") or []
+    video_mode = _resolve_video_mode(req_type, params)
     proxy_url = str(params.get("proxy_url") or params.get("proxy") or "").strip() or None
-    append_request_log(rid, "worker", "Playwright UI: upload ảnh + điền prompt…", level="info")
-    meta = await prepare_request_on_flow_ui(
-        profile_id=profile_id,
-        request_id=rid,
-        request_type=req_type,
-        prompt=prompt,
-        image_base64s=image_base64s,
-        aspect_ratio=str(params.get("aspect_ratio") or "16:9"),
-        image_model=str(params.get("image_model") or "NANO_BANANA_PRO"),
-        proxy_url=proxy_url,
+    image_base64s = _resolve_ui_image_base64s(rid, params)
+    append_request_log(
+        rid,
+        "worker",
+        f"Playwright UI: upload ảnh qua UI ({len(image_base64s)}) + điền prompt…",
+        level="info",
     )
+    try:
+        meta = await prepare_request_on_flow_ui(
+            profile_id=profile_id,
+            request_id=rid,
+            request_type=req_type,
+            prompt=prompt,
+            project_id=project_id,
+            image_base64s=image_base64s,
+            aspect_ratio=str(params.get("aspect_ratio") or "16:9"),
+            image_model=str(params.get("image_model") or "NANO_BANANA_PRO"),
+            video_quality=str(params.get("video_quality") or "lite_relaxed"),
+            video_mode=video_mode,
+            video_duration_s=params.get("video_duration_s") or params.get("video_duration") or 8,
+            variant_count=resolve_variant_count(params),
+            proxy_url=proxy_url,
+        )
+    except Exception as exc:
+        from flow2api.services.profile_403_cache import notify_403_cache_pause_if_needed
+
+        msg = flow_sdk.format_api_error(exc)
+        await notify_403_cache_pause_if_needed(profile_id, exc, msg, None)
+        raise
     append_request_log(
         rid,
         "worker",
@@ -126,51 +214,130 @@ async def _run_flow_ui_prep(
 async def _resolve_ui_image_previews(client: Any, ui_meta: dict[str, Any]) -> dict[str, Any]:
     """
     UI submit đôi khi trả media_ids trước, URL ảnh về sau.
-    Bổ sung image_urls bằng cách gọi get_media theo media_id.
+    Bổ sung image_urls cho mọi media_id (variant x2–x4).
     """
     gen = ui_meta.get("ui_generation") if isinstance(ui_meta, dict) else None
     if not isinstance(gen, dict):
         return ui_meta
 
-    urls = [str(x) for x in (gen.get("image_urls") or []) if x]
-    if urls:
-        return ui_meta
+    existing_urls = [str(x) for x in (gen.get("image_urls") or []) if str(x).strip()]
+    media_ids = [str(x) for x in (gen.get("media_ids") or []) if str(x).strip()]
 
-    media_ids = [str(x) for x in (gen.get("media_ids") or []) if x]
-    if not media_ids:
-        return ui_meta
-
-    resolved: list[str] = []
-    for mid in media_ids:
-        try:
-            resp = await client.get_media(mid)
-            remote_url, raw, mime = flow_sdk.parse_get_media_image(resp)
-            if remote_url:
-                resolved.append(str(remote_url))
-            elif raw:
-                b64 = __import__("base64").b64encode(raw).decode("ascii")
-                kind = "png" if "png" in str(mime or "").lower() else "jpeg"
-                resolved.append(f"data:image/{kind};base64,{b64}")
-        except Exception:
-            continue
+    resolved: list[str] = list(existing_urls)
+    if media_ids:
+        aligned: list[str] = []
+        for i, mid in enumerate(media_ids):
+            url = existing_urls[i] if i < len(existing_urls) else ""
+            if not url:
+                try:
+                    resp = await client.get_media(mid)
+                    remote_url, raw, mime = flow_sdk.parse_get_media_image(resp)
+                    if remote_url:
+                        url = str(remote_url)
+                    elif raw:
+                        b64 = __import__("base64").b64encode(raw).decode("ascii")
+                        kind = "png" if "png" in str(mime or "").lower() else "jpeg"
+                        url = f"data:image/{kind};base64,{b64}"
+                except Exception:
+                    url = ""
+            if url:
+                aligned.append(url)
+        if len(aligned) > len(resolved):
+            resolved = aligned
 
     if resolved:
         gen["image_urls"] = resolved
+        entries = []
+        for i, url in enumerate(resolved):
+            mid = media_ids[i] if i < len(media_ids) else ""
+            entries.append({"url": url, "media_id": mid, "kind": "image"})
+        if entries:
+            gen["media_entries"] = entries
         ui_meta["ui_generation"] = gen
     return ui_meta
 
 
+def _flatten_ui_generation_meta(ui_meta: dict[str, Any]) -> dict[str, Any]:
+    """Đưa image_urls / media_ids / video_urls từ ui_generation lên top-level result."""
+    if not isinstance(ui_meta, dict):
+        return ui_meta
+    gen = ui_meta.get("ui_generation")
+    if not isinstance(gen, dict):
+        return ui_meta
+
+    def _merge_list(key: str) -> None:
+        top = [str(x) for x in (ui_meta.get(key) or []) if str(x).strip()]
+        extra = [str(x) for x in (gen.get(key) or []) if str(x).strip()]
+        seen: set[str] = set()
+        merged: list[str] = []
+        for val in top + extra:
+            if val in seen:
+                continue
+            seen.add(val)
+            merged.append(val)
+        if merged:
+            ui_meta[key] = merged
+
+    _merge_list("image_urls")
+    _merge_list("media_ids")
+    _merge_list("video_urls")
+
+    entries: list[dict[str, Any]] = []
+    seen_mid: set[str] = set()
+    for src in (ui_meta.get("media_entries"), gen.get("media_entries")):
+        if not isinstance(src, list):
+            continue
+        for e in src:
+            if not isinstance(e, dict):
+                continue
+            mid = str(e.get("media_id") or e.get("mediaId") or "").strip()
+            if mid and mid in seen_mid:
+                continue
+            if mid:
+                seen_mid.add(mid)
+            entries.append(e)
+    if entries:
+        ui_meta["media_entries"] = entries
+
+    vc = gen.get("variant_count") or ui_meta.get("variant_count")
+    if vc:
+        try:
+            ui_meta["variant_count"] = max(1, min(4, int(vc)))
+        except (TypeError, ValueError):
+            pass
+    return ui_meta
+
+
 def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
-    """frame = startImage[/endImage]; component = referenceImages."""
-    explicit = str(params.get("video_mode") or "").strip().lower()
+    """frame = startImage[/endImage] / Khung hình; component = referenceImages / Thành phần."""
+    explicit = str(
+        params.get("video_mode") or params.get("videoMode") or ""
+    ).strip().lower()
     if explicit in ("frame", "component"):
         return explicit
+    if any(
+        params.get(k)
+        for k in (
+            "startImage",
+            "start_image",
+            "start_media_id",
+            "startMediaId",
+            "endImage",
+            "end_image",
+            "end_media_id",
+            "endMediaId",
+        )
+    ):
+        return "frame"
     legacy = {
         "gen_video": "frame",
         "gen_video_start_end": "frame",
         "gen_multi_image_video": "component",
     }
     if req_type == "gen_image_video":
+        imgs = params.get("image_base64s") or params.get("imageBase64s") or []
+        if len(imgs) >= 2:
+            return "frame"
         raise RuntimeError("missing_video_mode")
     return legacy.get(req_type, "")
 
@@ -254,7 +421,7 @@ class WorkerController:
             self._running.pop(rid, None)
 
     def _handle_running_stuck(self, rid: str) -> None:
-        """Fail running task when it exceeds TASK_RUNNING_TIMEOUT_S (default 5m)."""
+        """Fail running task when it exceeds TASK_RUNNING_TIMEOUT_S (default 30m)."""
         row = activity.get_request(rid)
         if not row or row.status != "running":
             return
@@ -291,7 +458,7 @@ class WorkerController:
         limit_s: int | None = None,
         orphans_only: bool = False,
     ) -> list[str]:
-        active_limit = max(60, int(TASK_RUNNING_TIMEOUT_S or 300))
+        active_limit = max(60, int(TASK_RUNNING_TIMEOUT_S or 1800))
         orphan_limit = max(60, int(limit_s or active_limit))
         handled: list[str] = []
         if not orphans_only:
@@ -740,13 +907,29 @@ class WorkerController:
             cur = activity.get_request(rid)
             if cur and (
                 cur.status.startswith("failed:")
-                or cur.error in (TASK_TIMEOUT_ERROR, TASK_TIMEOUT_ERROR_MSG, "canceled")
+                or cur.error in (
+                    TASK_TIMEOUT_ERROR,
+                    TASK_TIMEOUT_ERROR_MSG,
+                    "task_timeout_5m",
+                    "canceled",
+                )
             ):
                 return
             api_trace = end_api_trace(rid)
             msg = format_api_error(exc).strip() or "unknown_error"
             cur = activity.get_request(rid)
             retry_params = json.loads(cur.params_json or "{}") if cur else {}
+            maybe_trigger_403_cache_pause(
+                str(
+                    retry_params.get("profile_id")
+                    or retry_params.get("retry_exclude_profile_id")
+                    or profile_id
+                    or ""
+                ),
+                exc,
+                msg,
+                api_trace,
+            )
             recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
             if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
                 delay_s = flow_sdk.recaptcha_retry_delay(recaptcha_retry)
@@ -1027,30 +1210,70 @@ class WorkerController:
         project_id = await self._ensure_project(profile_id)
         append_request_log(rid, "worker", f"Project ready: {project_id[:12]}…", level="info")
 
-        ui_meta = await _run_flow_ui_prep(rid, profile_id, req_type, row, params)
+        ui_meta = await _run_flow_ui_prep(
+            rid, profile_id, req_type, row, params, project_id=project_id
+        )
         if ui_meta:
             from flow2api.services.playwright_flow import is_ui_prep_only
 
             if is_ui_prep_only():
                 if req_type == "gen_image":
                     ui_meta = await _resolve_ui_image_previews(client, ui_meta)
-                # Dashboard expects output media fields at top-level result.*
-                # UI prep flow currently keeps them under result.ui_generation.
-                # Mirror them to top-level for consistent preview rendering.
-                if req_type == "gen_image" and isinstance(ui_meta, dict):
-                    gen = ui_meta.get("ui_generation")
-                    if isinstance(gen, dict):
-                        if not ui_meta.get("image_urls") and isinstance(gen.get("image_urls"), list):
-                            ui_meta["image_urls"] = [str(u) for u in gen.get("image_urls") if u]
-                        if not ui_meta.get("media_ids") and isinstance(gen.get("media_ids"), list):
-                            ui_meta["media_ids"] = [str(m) for m in gen.get("media_ids") if m]
-                        if not ui_meta.get("media_entries") and isinstance(gen.get("media_entries"), list):
-                            ui_meta["media_entries"] = [e for e in gen.get("media_entries") if e]
+                    if isinstance(ui_meta, dict):
+                        ui_meta = _flatten_ui_generation_meta(ui_meta)
+                        gen = ui_meta.get("ui_generation")
+                        if isinstance(gen, dict):
+                            if not ui_meta.get("image_urls") and isinstance(gen.get("image_urls"), list):
+                                ui_meta["image_urls"] = [str(u) for u in gen.get("image_urls") if u]
+                            if not ui_meta.get("media_ids") and isinstance(gen.get("media_ids"), list):
+                                ui_meta["media_ids"] = [str(m) for m in gen.get("media_ids") if m]
+                            if not ui_meta.get("media_entries") and isinstance(gen.get("media_entries"), list):
+                                ui_meta["media_entries"] = [e for e in gen.get("media_entries") if e]
+                    result = {
+                        "ui_prep": True,
+                        "project_id": project_id,
+                        "profile_id": profile_id,
+                        **ui_meta,
+                    }
+                    activity.update_request(rid, status="done", result=result, error=None)
+                    events.publish("request_finished", {"id": rid, "status": "done"})
+                    return
+
+                if req_type in _UI_VIDEO_POLL_TYPES:
+                    if isinstance(ui_meta, dict):
+                        ui_meta = _flatten_ui_generation_meta(ui_meta)
+                    submit_raw = _ui_video_submit_raw(
+                        ui_meta if isinstance(ui_meta, dict) else {},
+                        project_id=project_id,
+                    )
+                    if not submit_raw:
+                        raise RuntimeError("ui_video_submit_missing_raw")
+                    append_request_log(
+                        rid,
+                        "worker",
+                        "Playwright UI đã submit — poll video đến khi có URL…",
+                        level="info",
+                    )
+                    activity.update_request(
+                        rid,
+                        status="running",
+                        result={
+                            "ui_prep": True,
+                            "ui_submitted": True,
+                            "project_id": project_id,
+                            "profile_id": profile_id,
+                            **(ui_meta if isinstance(ui_meta, dict) else {}),
+                        },
+                    )
+                    events.publish("queue_changed", {"id": rid})
+                    await self._poll_video(rid, submit_raw, project_id)
+                    return
+
                 result = {
                     "ui_prep": True,
                     "project_id": project_id,
                     "profile_id": profile_id,
-                    **ui_meta,
+                    **(ui_meta if isinstance(ui_meta, dict) else {}),
                 }
                 activity.update_request(rid, status="done", result=result, error=None)
                 events.publish("request_finished", {"id": rid, "status": "done"})
@@ -1063,7 +1286,7 @@ class WorkerController:
                 prompt=_task_prompt(row, params),
                 aspect_ratio=params.get("aspect_ratio", "16:9"),
                 image_model=params.get("image_model", "NANO_BANANA_PRO"),
-                variant_count=int(params.get("variant_count") or 1),
+                variant_count=resolve_variant_count(params),
                 image_base64s=params.get("image_base64s"),
                 image_input_types=params.get("image_input_types"),
             )
@@ -1302,6 +1525,38 @@ class WorkerController:
             )
         await self._poll_video(rid, raw, project_id)
 
+    async def _try_ui_video_error_retry(
+        self, rid: str, *, project_id: str, variant_count: int = 1
+    ) -> dict[str, Any] | None:
+        """Poll thất bại — không bấm Retry UI; cần upload lại / request mới."""
+        try:
+            from flow2api.services.playwright_flow import is_ui_prep_only
+            from flow2api.services.playwright_pool import is_playwright_enabled
+        except ImportError:
+            return None
+        if not is_ui_prep_only() or not is_playwright_enabled():
+            return None
+        append_request_log(
+            rid,
+            "worker",
+            "Video lỗi trên lưới — không bấm Retry (upload lại hoặc request mới)",
+            level="warning",
+        )
+        return None
+
+    async def _try_ui_grid_variant_retry_after_poll(
+        self,
+        rid: str,
+        *,
+        profile_id: str,
+        project_id: str,
+        variant_count: int,
+        existing_urls: list[str],
+        existing_media: list[str],
+    ) -> tuple[list[str], list[str]] | None:
+        """Không bấm Retry trên lưới sau poll — giữ kết quả partial."""
+        return None
+
     async def _poll_video(self, rid: str, submit_raw: dict, project_id: str) -> None:
         client = get_flow_client()
         operations = flow_sdk.extract_video_operations(submit_raw)
@@ -1333,13 +1588,30 @@ class WorkerController:
             done_params = (
                 json.loads(row_done.params_json or "{}") if row_done else {}
             )
+            variant_count = resolve_variant_count(done_params)
+            profile_id = str(done_params.get("profile_id") or "").strip()
+            if len(urls) < variant_count and profile_id:
+                more = await self._try_ui_grid_variant_retry_after_poll(
+                    rid,
+                    profile_id=profile_id,
+                    project_id=poll_project_id,
+                    variant_count=variant_count,
+                    existing_urls=urls,
+                    existing_media=media,
+                )
+                if more:
+                    urls, media = more
             result = {
                 "video_urls": urls,
                 "media_ids": media,
                 "project_id": poll_project_id,
-                "profile_id": done_params.get("profile_id"),
+                "profile_id": profile_id or done_params.get("profile_id"),
+                "variant_count": variant_count,
                 **extra,
             }
+            if len(urls) < variant_count:
+                result["partial"] = True
+                result["output_count"] = len(urls)
             if source_workflow_id:
                 result["workflow_id"] = source_workflow_id
             if row_done:
@@ -1381,6 +1653,12 @@ class WorkerController:
             except RuntimeError as exc:
                 msg = str(exc)
                 if msg == "video_generation_failed" or is_prominent_people_filter_failure(exc, msg, None):
+                    new_raw = await self._try_ui_video_error_retry(
+                        rid, project_id=poll_project_id
+                    )
+                    if new_raw:
+                        await self._poll_video(rid, new_raw, project_id)
+                        return
                     raise
                 if workflow_ops:
                     urls, media = await flow_sdk.poll_workflow_videos(
@@ -1476,6 +1754,12 @@ class WorkerController:
                             return
                     except GetMedia404Error:
                         raise
+                new_raw = await self._try_ui_video_error_retry(
+                    rid, project_id=poll_project_id
+                )
+                if new_raw:
+                    await self._poll_video(rid, new_raw, project_id)
+                    return
                 raise RuntimeError("video_generation_failed")
             if summary and all(s.get("done") for s in summary):
                 urls, media = flow_sdk._urls_from_operations(current_ops)

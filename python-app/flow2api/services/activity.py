@@ -360,7 +360,12 @@ def record_to_public(
     }
     if show_preview:
         payload["preview_items"] = preview_items
-        payload["output_count"] = len(preview_items)
+        payload["output_count"] = max(
+            len(preview_items),
+            len(result.get("image_urls") or []) if isinstance(result.get("image_urls"), list) else 0,
+            len(result.get("video_urls") or []) if isinstance(result.get("video_urls"), list) else 0,
+            len(result.get("media_ids") or []) if isinstance(result.get("media_ids"), list) else 0,
+        )
         payload["input_preview_items"] = input_preview_items
         payload["input_count"] = len(input_preview_items)
     return payload

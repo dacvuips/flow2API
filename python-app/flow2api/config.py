@@ -32,8 +32,10 @@ ADMIN_PASSWORD = os.environ.get("FLOW2API_ADMIN_PASSWORD", "admin")
 ADMIN_SESSION_COOKIE = "flow2api_admin_session"
 
 POLL_INTERVAL_S = float(os.environ.get("FLOW2API_POLL_INTERVAL", "2.5"))
-IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
-VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
+# ~30 phút với POLL_INTERVAL_S mặc định 2.5s
+_DEFAULT_POLL_MAX = max(90, int(1800 / max(0.5, POLL_INTERVAL_S)))
+IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", str(_DEFAULT_POLL_MAX)))
+VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", str(_DEFAULT_POLL_MAX)))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "10"))
 HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
@@ -45,15 +47,25 @@ WORKER_TASK_STAGGER_S = float(os.environ.get("FLOW2API_TASK_STAGGER_S", "0"))
 ACTIVITY_LIST_LIMIT = int(os.environ.get("FLOW2API_ACTIVITY_LIST_LIMIT", "100"))
 ACTIVITY_META_LIMIT = int(os.environ.get("FLOW2API_ACTIVITY_META_LIMIT", "10000"))
 ACTIVITY_PAGE_SIZE = int(os.environ.get("FLOW2API_ACTIVITY_PAGE_SIZE", "20"))
-TASK_RUNNING_TIMEOUT_S = int(os.environ.get("FLOW2API_TASK_RUNNING_TIMEOUT_S", "300"))
-TASK_TIMEOUT_ERROR = "task_timeout_5m"
+TASK_RUNNING_TIMEOUT_S = int(os.environ.get("FLOW2API_TASK_RUNNING_TIMEOUT_S", "1800"))
+TASK_TIMEOUT_ERROR = "task_timeout_30m"
 TASK_TIMEOUT_ERROR_MSG = (
-    "Timeout: quá 5 phút không hoàn thành, job đã kết thúc."
+    "Timeout: quá 30 phút không hoàn thành, job đã kết thúc."
+)
+# Chờ response generate sau khi bấm submit trên UI Playwright (giây).
+UI_GENERATION_SUBMIT_TIMEOUT_S = int(
+    os.environ.get(
+        "FLOW2API_UI_GENERATION_SUBMIT_TIMEOUT_S",
+        str(TASK_RUNNING_TIMEOUT_S),
+    )
 )
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))
 DEFAULT_PROFILE_CLEAR_INTERVAL_S = int(
     os.environ.get("FLOW2API_PROFILE_CLEAR_INTERVAL_S", "300")
+)
+DEFAULT_PROFILE_403_CACHE_MINUTES = int(
+    os.environ.get("FLOW2API_PROFILE_403_CACHE_MINUTES", "30")
 )
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
@@ -161,12 +173,26 @@ UI_PREP_ONLY = os.environ.get("FLOW2API_UI_PREP_ONLY", "1").strip().lower() in (
     "on",
 )
 # Delay ngẫu nhiên giữa mỗi thao tác UI Playwright (giây).
-UI_ACTION_DELAY_MIN_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MIN_S", "1"))
-UI_ACTION_DELAY_MAX_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MAX_S", "5"))
+UI_ACTION_DELAY_MIN_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MIN_S", "0"))
+UI_ACTION_DELAY_MAX_S = float(os.environ.get("FLOW2API_UI_ACTION_DELAY_MAX_S", "1.5"))
+# Giả lập chuột di chuyển nhẹ trước khi click (giống người dùng).
+UI_MOUSE_NUDGE_ENABLED = os.environ.get("FLOW2API_UI_MOUSE_NUDGE", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+UI_MOUSE_NUDGE_PX = float(os.environ.get("FLOW2API_UI_MOUSE_NUDGE_PX", "10"))
 # Chờ ảnh preview trong modal thư viện trước khi bấm "Thêm vào câu lệnh".
 UI_UPLOAD_PREVIEW_TIMEOUT_S = float(os.environ.get("FLOW2API_UI_UPLOAD_PREVIEW_TIMEOUT_S", "120"))
 # Số lần tự retry upload ảnh qua Playwright khi lỗi.
 UI_UPLOAD_RETRY_MAX = int(os.environ.get("FLOW2API_UI_UPLOAD_RETRY_MAX", "3"))
+# Sau khi bấm Retry trên UI lỗi upload — chờ trước khi thử lại (giây).
+UI_UPLOAD_ERROR_RETRY_WAIT_S = float(
+    os.environ.get("FLOW2API_UI_UPLOAD_ERROR_RETRY_WAIT_S", "30")
+)
+# Số vòng retry nút Refresh trên thẻ 「Không thành công」 (variant x2–x4).
+UI_GRID_VARIANT_RETRY_MAX = int(os.environ.get("FLOW2API_UI_GRID_VARIANT_RETRY_MAX", "3"))
 CDP_BASE_PORT = int(os.environ.get("FLOW2API_CDP_BASE_PORT", "9236"))
 # Port CDP cố định cho profile Chrome có tab Flow (Default = 9236).
 PLAYWRIGHT_FLOW_CDP_PORT = int(

@@ -28,6 +28,9 @@ class WorkerSettings:
     profile_video_allowed: list[str] = field(default_factory=list)
     profile_clear_disabled: list[str] = field(default_factory=list)
     profile_clear_interval: dict[str, int] = field(default_factory=dict)
+    profile_403_cache_enabled: list[str] = field(default_factory=list)
+    profile_403_cache_minutes: dict[str, int] = field(default_factory=dict)
+    profile_403_pause_until: dict[str, float] = field(default_factory=dict)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -70,6 +73,26 @@ class WorkerSettings:
                 if not pid or str(pid).startswith("_"):
                     continue
                 clear_interval[str(pid)] = max(1, min(3600, int(val or 300)))
+        cache_enabled: list[str] = []
+        if isinstance(self.profile_403_cache_enabled, list):
+            for pid in self.profile_403_cache_enabled:
+                if pid and not str(pid).startswith("_"):
+                    cache_enabled.append(str(pid))
+        cache_minutes: dict[str, int] = {}
+        if isinstance(self.profile_403_cache_minutes, dict):
+            for pid, val in self.profile_403_cache_minutes.items():
+                if not pid or str(pid).startswith("_"):
+                    continue
+                cache_minutes[str(pid)] = max(1, min(1440, int(val or 30)))
+        pause_until: dict[str, float] = {}
+        if isinstance(self.profile_403_pause_until, dict):
+            for pid, val in self.profile_403_pause_until.items():
+                if not pid or str(pid).startswith("_"):
+                    continue
+                try:
+                    pause_until[str(pid)] = float(val)
+                except (TypeError, ValueError):
+                    continue
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -81,6 +104,9 @@ class WorkerSettings:
             profile_video_allowed=sorted(set(video_allowed)),
             profile_clear_disabled=sorted(set(clear_disabled)),
             profile_clear_interval=clear_interval,
+            profile_403_cache_enabled=sorted(set(cache_enabled)),
+            profile_403_cache_minutes=cache_minutes,
+            profile_403_pause_until=pause_until,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,6 +122,9 @@ class WorkerSettings:
             "profile_video_allowed": list(n.profile_video_allowed),
             "profile_clear_disabled": list(n.profile_clear_disabled),
             "profile_clear_interval": dict(n.profile_clear_interval),
+            "profile_403_cache_enabled": list(n.profile_403_cache_enabled),
+            "profile_403_cache_minutes": dict(n.profile_403_cache_minutes),
+            "profile_403_pause_until": dict(n.profile_403_pause_until),
         }
 
 
@@ -147,6 +176,15 @@ def _load_file() -> WorkerSettings | None:
     clear_interval = raw.get("profile_clear_interval") or {}
     if not isinstance(clear_interval, dict):
         clear_interval = {}
+    cache_enabled = raw.get("profile_403_cache_enabled") or []
+    if not isinstance(cache_enabled, list):
+        cache_enabled = []
+    cache_minutes = raw.get("profile_403_cache_minutes") or {}
+    if not isinstance(cache_minutes, dict):
+        cache_minutes = {}
+    pause_until = raw.get("profile_403_pause_until") or {}
+    if not isinstance(pause_until, dict):
+        pause_until = {}
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
@@ -158,6 +196,9 @@ def _load_file() -> WorkerSettings | None:
         profile_video_allowed=[str(x) for x in video_allowed],
         profile_clear_disabled=[str(x) for x in clear_disabled],
         profile_clear_interval={str(k): int(v) for k, v in clear_interval.items()},
+        profile_403_cache_enabled=[str(x) for x in cache_enabled],
+        profile_403_cache_minutes={str(k): int(v) for k, v in cache_minutes.items()},
+        profile_403_pause_until={str(k): float(v) for k, v in pause_until.items()},
     ).normalized()
 
 
@@ -240,6 +281,84 @@ def set_profile_clear_settings(
     return save_worker_settings(
         profile_clear_disabled=disabled,
         profile_clear_interval=intervals,
+    )
+
+
+def is_profile_403_cache_enabled(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_403_cache_enabled
+
+
+def get_profile_403_cache_minutes(profile_id: str) -> int:
+    from flow2api.config import DEFAULT_PROFILE_403_CACHE_MINUTES
+
+    pid = str(profile_id or "").strip()
+    settings = get_worker_settings()
+    if pid in settings.profile_403_cache_minutes:
+        return max(1, min(1440, int(settings.profile_403_cache_minutes[pid])))
+    return max(1, min(1440, int(DEFAULT_PROFILE_403_CACHE_MINUTES)))
+
+
+def get_profile_403_pause_until(profile_id: str) -> float | None:
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None
+    val = get_worker_settings().profile_403_pause_until.get(pid)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def all_profile_403_pause_until() -> dict[str, float]:
+    return dict(get_worker_settings().profile_403_pause_until)
+
+
+def set_profile_403_pause_until(profile_id: str, until: float | None) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    merged = {str(k): float(v) for k, v in all_profile_403_pause_until().items()}
+    if until is None:
+        merged.pop(pid, None)
+    else:
+        merged[pid] = float(until)
+    return save_worker_settings(profile_403_pause_until=merged)
+
+
+def clear_profile_403_pause(profile_id: str) -> WorkerSettings:
+    return set_profile_403_pause_until(profile_id, None)
+
+
+def set_profile_403_cache_settings(
+    profile_id: str,
+    *,
+    enabled: bool | None = None,
+    minutes: int | None = None,
+) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    enabled_ids = [x for x in current.profile_403_cache_enabled if x != pid]
+    if enabled is True:
+        enabled_ids.append(pid)
+    elif enabled is None and pid in current.profile_403_cache_enabled:
+        enabled_ids.append(pid)
+    intervals = dict(current.profile_403_cache_minutes)
+    if minutes is not None:
+        intervals[pid] = max(1, min(1440, int(minutes)))
+    elif enabled is True and pid not in intervals:
+        from flow2api.config import DEFAULT_PROFILE_403_CACHE_MINUTES
+
+        intervals[pid] = max(1, min(1440, int(DEFAULT_PROFILE_403_CACHE_MINUTES)))
+    return save_worker_settings(
+        profile_403_cache_enabled=sorted(set(enabled_ids)),
+        profile_403_cache_minutes=intervals,
     )
 
 
@@ -332,6 +451,34 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                 else:
                     merged_clear[str(pid)] = int(val)
             data["profile_clear_interval"] = merged_clear
+        if "profile_403_cache_enabled" in fields:
+            raw_cache = fields["profile_403_cache_enabled"]
+            if isinstance(raw_cache, list):
+                data["profile_403_cache_enabled"] = [
+                    str(x)
+                    for x in raw_cache
+                    if x and not str(x).startswith("_")
+                ]
+        if "profile_403_cache_minutes" in fields and isinstance(
+            fields["profile_403_cache_minutes"], dict
+        ):
+            merged_min = dict(data.get("profile_403_cache_minutes") or {})
+            for pid, val in fields["profile_403_cache_minutes"].items():
+                if val is None:
+                    merged_min.pop(str(pid), None)
+                else:
+                    merged_min[str(pid)] = int(val)
+            data["profile_403_cache_minutes"] = merged_min
+        if "profile_403_pause_until" in fields and isinstance(
+            fields["profile_403_pause_until"], dict
+        ):
+            merged_pause = dict(data.get("profile_403_pause_until") or {})
+            for pid, val in fields["profile_403_pause_until"].items():
+                if val is None:
+                    merged_pause.pop(str(pid), None)
+                else:
+                    merged_pause[str(pid)] = float(val)
+            data["profile_403_pause_until"] = merged_pause
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)
 
@@ -389,6 +536,9 @@ def all_known_profile_ids() -> list[str]:
     ids.update(settings.profile_dispatch_disabled)
     ids.update(settings.profile_clear_disabled)
     ids.update(settings.profile_clear_interval.keys())
+    ids.update(settings.profile_403_cache_enabled)
+    ids.update(settings.profile_403_cache_minutes.keys())
+    ids.update(settings.profile_403_pause_until.keys())
     ids.update(settings.profile_credit_allowed)
     try:
         from flow2api.services.extension_pool import get_extension_pool
