@@ -855,14 +855,26 @@ async function captureTokenFromFlowTab() {
     }
   }
 
-  const target = tabs.find((tab) => !tab.discarded) || tabs[0];
-  if (!target?.id) return false;
+  let target = tabs.find((tab) => tab?.id && !tab.discarded) || null;
+  if (!target?.id) {
+    if (_openingFlowTab) return !!flowKey;
+    _openingFlowTab = true;
+    try {
+      console.log('[Flow2API] Only discarded Flow tabs — opening a fresh background tab for token capture');
+      await openFlowTabResilient(false);
+      await sleep(3000);
+      const fresh = await chrome.tabs.query({ url: flowUrls });
+      target = fresh.find((tab) => tab?.id && !tab.discarded) || null;
+    } catch (e) {
+      console.error('[Flow2API] Failed to open Flow tab for token:', e);
+      return false;
+    } finally {
+      _openingFlowTab = false;
+    }
+  }
+  if (!target?.id) return !!flowKey;
 
   try {
-    if (target.discarded) {
-      await chrome.tabs.reload(target.id);
-      await sleep(2500);
-    }
     // Trigger real aisandbox-pa traffic so webRequest sees a fresh Authorization header.
     await chrome.scripting.executeScript({
       target: { tabId: target.id },
@@ -931,26 +943,6 @@ function runCaptchaExclusive(fn) {
   return run;
 }
 
-/** grecaptcha.enterprise session is effectively one-shot per page load on Flow. */
-async function prepareFlowTabForCaptcha(tabId) {
-  if (CAPTCHA_RELOAD_EVERY_N_SOLVES <= 0) return;
-  const prev = _captchaSolvesByTab.get(tabId) || 0;
-  if (prev >= CAPTCHA_RELOAD_EVERY_N_SOLVES) {
-    console.log(
-      '[Flow2API] Refreshing Flow tab to reset reCAPTCHA session (solve #%s, reload every %s)',
-      prev + 1,
-      CAPTCHA_RELOAD_EVERY_N_SOLVES,
-    );
-    try {
-      await chrome.tabs.reload(tabId);
-      await sleep(4500);
-      _captchaSolvesByTab.set(tabId, 0);
-    } catch (e) {
-      console.warn('[Flow2API] Flow tab reload before captcha failed:', e?.message || e);
-    }
-  }
-}
-
 function noteCaptchaSolveOnTab(tabId) {
   _captchaSolvesByTab.set(tabId, (_captchaSolvesByTab.get(tabId) || 0) + 1);
 }
@@ -969,11 +961,6 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
       msg.includes('Could not establish connection');
     if (!shouldInject) throw error;
 
-    // Inject content script and retry. Both the inject + re-send can
-    // throw "No current window" / "No tab with id" if the tab dies in
-    // between (Chrome aggressively discards background tabs). Surface
-    // those verbatim so solveCaptcha's loop can move to the next
-    // candidate instead of bubbling a confusing message to the user.
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content.js'],
@@ -987,27 +974,17 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
   }
 }
 
-/** Try to wake a discarded Flow tab so `sendMessage` can reach it.
- *  Chrome auto-discards backgrounded tabs to save memory; the tab still
- *  shows up in `chrome.tabs.query` but cross-context calls fail with
- *  "No current window" / "No tab with id". A reload re-hydrates it. */
-async function reviveTabIfNeeded(tab) {
-  if (!tab?.discarded) return tab;
-  try {
-    await chrome.tabs.reload(tab.id);
-    await sleep(2500);
-    const fresh = await chrome.tabs.get(tab.id);
-    return fresh;
-  } catch {
-    return null;
-  }
+/** Skip discarded tabs — never reload the user's open Flow/project page. */
+function usableFlowTab(tab) {
+  if (!tab?.id || tab.discarded) return null;
+  return tab;
 }
 
 async function solveCaptcha(requestId, captchaAction) {
   return runCaptchaExclusive(async () => {
   const tabs = await chrome.tabs.query({ url: flowUrls });
 
-  // No Flow tab at all Ă¢â‚¬â€ spawn one (handles "no Chrome window" via the
+  // No Flow tab at all — spawn one (handles "no Chrome window" via the
   // resilient helper).
   if (!tabs.length) {
     try {
@@ -1018,16 +995,13 @@ async function solveCaptcha(requestId, captchaAction) {
     }
   }
 
-  // Try each Flow tab in turn — gracefully skip dead/discarded ones
-  // instead of bubbling "No current window" up to the user. Re-query
-  // because we might have just spawned a new one above.
+  // Try each live Flow tab — skip discarded tabs instead of reloading them.
   const candidates = await chrome.tabs.query({ url: flowUrls });
   const errors = [];
   for (const tab of candidates) {
-    const live = await reviveTabIfNeeded(tab);
+    const live = usableFlowTab(tab);
     if (!live) continue;
     try {
-      await prepareFlowTabForCaptcha(live.id);
       const resp = await Promise.race([
         requestCaptchaFromTab(live.id, requestId, captchaAction),
         new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
@@ -1040,8 +1014,6 @@ async function solveCaptcha(requestId, captchaAction) {
     } catch (e) {
       const msg = e?.message || '';
       errors.push(msg);
-      // Tab evaporated mid-call (window closed, tab discarded again,
-      // or page navigated away). Move on to the next candidate.
       if (
         msg.includes('No current window') ||
         msg.includes('No tab with id') ||
@@ -1053,16 +1025,13 @@ async function solveCaptcha(requestId, captchaAction) {
     }
   }
 
-  // All candidates failed Ă¢â‚¬â€ last-ditch: spawn a fresh Flow tab and try
-  // it once. This handles the case where every existing Flow tab was
-  // in a closed window we couldn't recover from.
+  // All live candidates failed — open a fresh background Flow tab and try once.
   try {
     await openFlowTabResilient(false);
     await sleep(3000);
     const fresh = await chrome.tabs.query({ url: flowUrls });
-    const target = fresh.find((t) => !t.discarded) || fresh[0];
+    const target = fresh.find((t) => t?.id && !t.discarded) || null;
     if (!target) return { error: 'NO_FLOW_TAB' };
-    await prepareFlowTabForCaptcha(target.id);
     const resp = await Promise.race([
       requestCaptchaFromTab(target.id, requestId, captchaAction),
       new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
