@@ -1928,6 +1928,43 @@ def _enrich_video_operations(data: dict, ops: list[dict]) -> list[dict]:
     return enriched
 
 
+def _extend_video_ops_from_media_list(
+    synthesized: list[dict],
+    media_list: list[dict],
+    data: dict,
+) -> list[dict]:
+    """Một workflow có thể sinh nhiều tile — bổ sung op theo media[]."""
+    if not media_list or len(media_list) <= len(synthesized):
+        return synthesized
+    seen = {str(o.get("_primary_media_id") or "").strip() for o in synthesized}
+    default_project = str(data.get("projectId") or "").strip()
+    for wf in data.get("workflows") or []:
+        if isinstance(wf, dict) and wf.get("projectId"):
+            default_project = str(wf["projectId"])
+            break
+    out = list(synthesized)
+    for entry in media_list:
+        if not isinstance(entry, dict):
+            continue
+        mid = str(entry.get("name") or entry.get("mediaId") or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(
+            {
+                "operation": {
+                    "name": mid,
+                    "metadata": {"video": {"mediaId": mid}},
+                },
+                "status": "MEDIA_GENERATION_STATUS_PENDING",
+                "_workflow_mode": True,
+                "_primary_media_id": mid,
+                "_project_id": entry.get("projectId") or default_project,
+            }
+        )
+    return out
+
+
 def extract_video_operations(data: dict) -> list[dict]:
     """Parse submit response: classic operations[] or Low Priority workflows/media."""
     if not isinstance(data, dict):
@@ -1983,8 +2020,16 @@ def extract_video_operations(data: dict) -> list[dict]:
         )
 
     if synthesized:
-        logger.info("workflow-schema video submit: %d item(s)", len(synthesized))
-        return synthesized
+        extended = _extend_video_ops_from_media_list(synthesized, media_list, data)
+        if len(extended) > len(synthesized):
+            logger.info(
+                "workflow-schema video submit: %d→%d item(s) (media[])",
+                len(synthesized),
+                len(extended),
+            )
+        else:
+            logger.info("workflow-schema video submit: %d item(s)", len(synthesized))
+        return extended
 
     for entry in media_list:
         mid = entry.get("name") or entry.get("mediaId")
@@ -2502,6 +2547,52 @@ async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | 
     return _save_encoded_video(media_id, encoded) if encoded else None
 
 
+def ordered_media_poll_outputs(
+    completed: dict[str, str],
+    pending: list[str],
+) -> tuple[list[str], list[str]]:
+    """Giữ thứ tự pending — dùng khi trả partial trong lúc poll."""
+    urls: list[str] = []
+    mids: list[str] = []
+    for mid in pending:
+        if mid not in completed:
+            continue
+        url = str(completed.get(mid) or "").strip()
+        if not url:
+            url = f"/media/{mid}"
+        urls.append(url)
+        mids.append(mid)
+    return urls, mids
+
+
+def harvest_poll_media_ids(poll: dict, known: list[str]) -> list[str]:
+    """Lấy media_id mới từ response poll — Flow có thể trả nhiều hơn request gửi."""
+    seen = {str(m).strip() for m in (known or []) if str(m).strip()}
+    out: list[str] = []
+    if not isinstance(poll, dict):
+        return out
+    for entry in poll.get("media") or []:
+        if not isinstance(entry, dict):
+            continue
+        mid = str(entry.get("name") or entry.get("mediaId") or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    for entry in poll.get("operations") or []:
+        if not isinstance(entry, dict):
+            continue
+        op = entry.get("operation") or entry
+        video_meta = (op.get("metadata") or {}).get("video") or {}
+        mid = str(
+            video_meta.get("mediaId") or video_meta.get("name") or op.get("name") or ""
+        ).strip()
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+    return out
+
+
 async def poll_video_by_media(
     client: FlowClient,
     project_id: str,
@@ -2559,6 +2650,16 @@ async def poll_video_by_media(
         done_map, all_done, any_failed = parse_media_poll_result(poll)
         completed.update(done_map)
 
+        extra_ids = harvest_poll_media_ids(poll, pending)
+        if extra_ids:
+            pending.extend(extra_ids)
+            logger.info(
+                "media poll round %s: +%s media_id(s) → %s total",
+                round_idx + 1,
+                len(extra_ids),
+                len(pending),
+            )
+
         if interleave_get_media:
             for mid in list(remaining):
                 if _media_url_is_resolved(completed.get(mid, ""), mid):
@@ -2614,14 +2715,17 @@ async def poll_video_by_media(
             )
         if all_done or (completed and len(completed) >= len(pending)):
             if await _resolve_all_media_urls(client, completed, pending):
-                return list(completed.values()), list(completed.keys())
+                return ordered_media_poll_outputs(completed, pending)
 
         if round_idx % 10 == 9:
             logger.info("media poll round %s/%s done=%s", round_idx + 1, max_rounds, len(completed))
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    if completed and await _resolve_all_media_urls(client, completed, pending):
-        return list(completed.values()), list(completed.keys())
+    if completed:
+        await _resolve_all_media_urls(client, completed, pending)
+        urls, mids = ordered_media_poll_outputs(completed, pending)
+        if urls:
+            return urls, mids
     raise FlowApiError(
         "timeout_waiting_video",
         step="video_poll_media",

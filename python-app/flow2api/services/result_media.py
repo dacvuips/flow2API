@@ -220,7 +220,11 @@ def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
         rewrite_result_public_urls,
     )
 
-    out = normalize_publisher_urls(rewrite_result_public_urls(dict(result)))
+    out = align_variant_output_urls(
+        normalize_publisher_urls(rewrite_result_public_urls(dict(result))),
+        "",
+        fill_missing=True,
+    )
     for key in ("local_files", "Local", "raw"):
         out.pop(key, None)
 
@@ -301,6 +305,83 @@ def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
     return True
 
 
+def _resolved_output_count(result: dict[str, Any], task_type: str = "") -> int:
+    """Chỉ đếm URL thật — không đếm media_id chưa có file."""
+    is_video = "video" in str(task_type or "").lower()
+    if is_video:
+        return len([u for u in (result.get("video_urls") or []) if str(u).strip()])
+    return len([u for u in (result.get("image_urls") or []) if str(u).strip()])
+
+
+def align_variant_output_urls(
+    result: dict[str, Any],
+    task_type: str = "",
+    *,
+    fill_missing: bool = True,
+) -> dict[str, Any]:
+    """
+    Cân bằng image_urls / video_urls với media_ids.
+    fill_missing=False khi task đang chạy — không tạo URL placeholder (tránh UI tưởng đủ x4).
+    fill_missing=True khi done / API response — bổ sung public URL cho media_id còn thiếu.
+    """
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    media_ids = [str(m).strip() for m in (out.get("media_ids") or []) if str(m).strip()]
+    if not media_ids:
+        return out
+
+    from flow2api.services.stored_media import public_media_url
+
+    is_video = "video" in str(task_type or "").lower()
+    url_key = "video_urls" if is_video else "image_urls"
+    urls = [str(u).strip() for u in (out.get(url_key) or []) if str(u).strip()]
+
+    if fill_missing and len(urls) < len(media_ids):
+        merged = list(urls)
+        for mid in media_ids[len(urls) :]:
+            merged.append(public_media_url(mid))
+        out[url_key] = merged
+        urls = merged
+        if is_video and merged and not str(out.get("Link") or "").strip():
+            out["Link"] = merged[0]
+
+    entries = out.get("media_entries")
+    if not isinstance(entries, list):
+        entries = []
+    seen_mids = {
+        str(e.get("media_id") or e.get("mediaId") or "").strip()
+        for e in entries
+        if isinstance(e, dict)
+    }
+    kind = "video" if is_video else "image"
+    for i, mid in enumerate(media_ids):
+        if mid in seen_mids:
+            continue
+        url = urls[i] if i < len(urls) else ""
+        if not url and fill_missing:
+            url = public_media_url(mid)
+        if not url:
+            continue
+        entries.append({"url": str(url), "media_id": mid, "kind": kind})
+        seen_mids.add(mid)
+    if entries:
+        out["media_entries"] = entries
+
+    ready = _resolved_output_count(out, task_type)
+    vc = out.get("variant_count")
+    try:
+        vc_n = int(vc) if vc is not None else 0
+    except (TypeError, ValueError):
+        vc_n = 0
+    out_count = ready if not fill_missing else max(ready, len(media_ids), len(urls), vc_n)
+    if out_count > 1:
+        out["output_count"] = min(4, out_count)
+    elif ready > 0:
+        out["output_count"] = ready
+    return out
+
+
 def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[str, str]]:
     """Lightweight media previews for task list (URLs only, no base64)."""
     if not isinstance(result, dict):
@@ -336,8 +417,43 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             item["local"] = "1"
         elif mid and u.startswith(("http://", "https://")):
             item["media_id"] = mid
+        elif mid:
+            item["media_id"] = mid
         items.append(item)
 
+    def add_image_outputs(image_urls: list[Any], media_ids: list[Any]) -> None:
+        urls = [str(u).strip() for u in (image_urls or []) if str(u).strip()]
+        ids = [str(m).strip() for m in (media_ids or []) if str(m).strip()]
+        for i, u in enumerate(urls):
+            mid = ids[i] if i < len(ids) else ""
+            add(u, "image", mid)
+        for i, mid in enumerate(ids):
+            if i < len(urls):
+                continue
+            add(f"/media/{mid}", "image", mid)
+
+    def add_video_outputs(
+        video_urls: list[Any],
+        media_ids: list[Any],
+        *,
+        fill_orphans: bool = False,
+    ) -> None:
+        from flow2api.services.stored_media import public_media_url
+
+        urls = [str(u).strip() for u in (video_urls or []) if str(u).strip()]
+        ids = [str(m).strip() for m in (media_ids or []) if str(m).strip()]
+        for i, u in enumerate(urls):
+            mid = ids[i] if i < len(ids) else ""
+            add(u, "video", mid)
+        if not fill_orphans:
+            return
+        for i, mid in enumerate(ids):
+            if i < len(urls):
+                continue
+            if _local_video_exists(mid):
+                add(public_media_url(mid), "video", mid)
+
+    fill_orphans = not bool(result.get("partial"))
     local_files = [str(u) for u in (result.get("local_files") or []) if str(u or "").strip()]
     for u in local_files:
         add(u, default_kind, local=True)
@@ -346,13 +462,14 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
 
     gen = result.get("ui_generation")
     if isinstance(gen, dict):
-        gen_image_urls = gen.get("image_urls") or []
-        gen_media_ids = gen.get("media_ids") or []
-        for i, u in enumerate(gen_image_urls):
-            mid = str(gen_media_ids[i] if i < len(gen_media_ids) else "").strip()
-            add(str(u), "image", mid)
-        for u in gen.get("video_urls") or []:
-            add(str(u), "video")
+        if is_video:
+            add_video_outputs(
+                gen.get("video_urls") or [], gen.get("media_ids") or [], fill_orphans=fill_orphans
+            )
+        else:
+            add_image_outputs(gen.get("image_urls") or [], gen.get("media_ids") or [])
+            for u in gen.get("video_urls") or []:
+                add(str(u), "video")
         for entry in gen.get("media_entries") or []:
             if not isinstance(entry, dict):
                 continue
@@ -364,13 +481,14 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             elif mid:
                 add(f"/media/{mid}", kind, mid)
 
-    image_urls = result.get("image_urls") or []
-    media_ids = result.get("media_ids") or []
-    for i, u in enumerate(image_urls):
-        mid = str(media_ids[i] if i < len(media_ids) else "").strip()
-        add(str(u), "image", mid)
-    for u in result.get("video_urls") or []:
-        add(str(u), "video")
+    if is_video:
+        add_video_outputs(
+            result.get("video_urls") or [], result.get("media_ids") or [], fill_orphans=fill_orphans
+        )
+    else:
+        add_image_outputs(result.get("image_urls") or [], result.get("media_ids") or [])
+        for u in result.get("video_urls") or []:
+            add(str(u), "video")
     if result.get("Link"):
         add(str(result["Link"]), default_kind)
 
@@ -390,15 +508,10 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             elif mid:
                 add(f"/media/{mid}", kind, mid)
 
-        for mid in result.get("media_ids") or []:
-            mid_s = str(mid or "").strip()
-            if mid_s:
-                if is_video:
-                    from flow2api.services.stored_media import public_media_url
-
-                    add(public_media_url(mid_s), default_kind, mid_s)
-                else:
-                    add(f"/media/{mid_s}", default_kind, mid_s)
+        if is_video:
+            add_video_outputs([], result.get("media_ids") or [], fill_orphans=fill_orphans)
+        else:
+            add_image_outputs([], result.get("media_ids") or [])
 
     return items[:4]
 

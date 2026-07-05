@@ -494,16 +494,24 @@ def finalize_video_result_urls(request_id: str, result: dict[str, Any]) -> dict[
     if resolve_stored_video_path(request_id, 0):
         out = apply_video_public_urls(request_id, out)
     elif external:
-        out["video_urls"] = external
+        out["video_urls"] = list(external)
         out["Link"] = external[0]
+        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+        if media_ids and len(external) < len(media_ids):
+            pubs = list(external)
+            for mid in media_ids[len(external) :]:
+                pubs.append(public_media_url(mid))
+            out["video_urls"] = pubs
+            out["Link"] = pubs[0]
     else:
         media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
         if media_ids:
-            pub = public_media_url(media_ids[0])
-            out["video_urls"] = [pub]
-            out["Link"] = pub
+            pubs = [public_media_url(m) for m in media_ids]
+            out["video_urls"] = pubs
+            out["Link"] = pubs[0]
             out["media_entries"] = [
-                {"url": pub, "media_id": media_ids[0], "kind": "video"},
+                {"url": pub, "media_id": mid, "kind": "video"}
+                for mid, pub in zip(media_ids, pubs)
             ]
 
     return normalize_publisher_urls(rewrite_result_public_urls(out))

@@ -67,6 +67,10 @@ DEFAULT_PROFILE_CLEAR_INTERVAL_S = int(
 DEFAULT_PROFILE_403_CACHE_MINUTES = int(
     os.environ.get("FLOW2API_PROFILE_403_CACHE_MINUTES", "30")
 )
+POST_CLEAR_403_RETRY_MAX = int(os.environ.get("FLOW2API_POST_CLEAR_403_RETRY_MAX", "3"))
+POST_CLEAR_403_DELAY_S = int(os.environ.get("FLOW2API_POST_CLEAR_403_DELAY_S", "30"))
+POST_SUCCESS_CLEAR_DELAY_S = int(os.environ.get("FLOW2API_POST_SUCCESS_CLEAR_DELAY_S", "20"))
+POST_CLEAR_COOLDOWN_S = int(os.environ.get("FLOW2API_POST_CLEAR_COOLDOWN_S", "10"))
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
 HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))
@@ -75,15 +79,26 @@ PURGE_INTERVAL_S = int(os.environ.get("FLOW2API_PURGE_INTERVAL_S", "300"))
 # Priority: Host learned from tunnel/proxy request > FLOW2API_PUBLIC_BASE_URL > default fallback.
 _PUBLIC_BASE_URL_ENV = os.environ.get("FLOW2API_PUBLIC_BASE_URL", "").strip().rstrip("/")
 _PUBLIC_BASE_URL_DEFAULT = os.environ.get(
-    "FLOW2API_PUBLIC_BASE_URL_DEFAULT", "https://flow2.viettheo.site"
+    "FLOW2API_PUBLIC_BASE_URL_DEFAULT", f"http://127.0.0.1:{HTTP_PORT}"
 ).strip().rstrip("/")
 _learned_public_base_url: str = ""
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "[::1]"})
 
 
-def _is_public_hostname(host: str) -> bool:
+def _host_without_port(host: str) -> str:
     h = str(host or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("[") and "]" in h:
+        return h.split("]", 1)[0] + "]"
+    if ":" in h:
+        return h.rsplit(":", 1)[0]
+    return h
+
+
+def _is_public_hostname(host: str) -> bool:
+    h = _host_without_port(host)
     if not h or h in _LOCAL_HOSTS:
         return False
     if h.endswith(".localhost"):
@@ -140,8 +155,18 @@ def learn_public_base_url_from_headers(headers: Any) -> None:
 
 
 def get_public_base_url() -> str:
-    if _learned_public_base_url:
-        return _learned_public_base_url
+    learned = _learned_public_base_url
+    if learned:
+        try:
+            from urllib.parse import urlparse
+
+            host = _host_without_port(urlparse(learned).hostname or "")
+            if host in _LOCAL_HOSTS and learned.lower().startswith("https://"):
+                learned = ""
+        except Exception:
+            pass
+    if learned:
+        return learned
     if _PUBLIC_BASE_URL_ENV:
         return _PUBLIC_BASE_URL_ENV
     return _PUBLIC_BASE_URL_DEFAULT
@@ -193,6 +218,10 @@ UI_UPLOAD_ERROR_RETRY_WAIT_S = float(
 )
 # Số vòng retry nút Refresh trên thẻ 「Không thành công」 (variant x2–x4).
 UI_GRID_VARIANT_RETRY_MAX = int(os.environ.get("FLOW2API_UI_GRID_VARIANT_RETRY_MAX", "3"))
+# Chờ variant xuất hiện sau submit (ảnh/video x2–x4) — hết giờ trả partial, không restart pipeline.
+UI_VARIANT_SETTLE_TIMEOUT_S = int(os.environ.get("FLOW2API_UI_VARIANT_SETTLE_TIMEOUT_S", "60"))
+# Trước/sau poll video: gom thêm media_id từ trang Flow — ngắn hơn settle sau submit.
+UI_VARIANT_DISCOVER_TIMEOUT_S = int(os.environ.get("FLOW2API_UI_VARIANT_DISCOVER_TIMEOUT_S", "12"))
 CDP_BASE_PORT = int(os.environ.get("FLOW2API_CDP_BASE_PORT", "9236"))
 # Port CDP cố định cho profile Chrome có tab Flow (Default = 9236).
 PLAYWRIGHT_FLOW_CDP_PORT = int(

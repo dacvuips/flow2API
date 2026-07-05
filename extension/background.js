@@ -366,15 +366,31 @@ function connectToAgent() {
           },
         });
       } else if (msg.method === 'clear_control') {
-        sendToAgent({
-          id: msg.id,
-          status: 410,
-          result: {
-            ok: false,
-            error: 'feature_removed',
-            message: 'Clear Data da bo trong extension.',
-          },
-        });
+        const action = String(msg.params?.action || '').toLowerCase();
+        try {
+          let result;
+          if (action === 'get_state') {
+            await loadClearState();
+            result = { ok: true, state: getPublicClearState() };
+          } else if (action === 'now') {
+            result = await performClearNow(msg.params?.projectId);
+          } else if (action === 'start' || action === 'stop') {
+            result = { ok: true, state: getPublicClearState() };
+          } else {
+            result = { ok: false, error: 'invalid_action' };
+          }
+          sendToAgent({
+            id: msg.id,
+            status: result.ok ? 200 : 400,
+            result,
+          });
+        } catch (e) {
+          sendToAgent({
+            id: msg.id,
+            status: 500,
+            error: e?.message || 'clear_control_failed',
+          });
+        }
       }
     } catch (e) {
       console.error('[Flow2API] Message error:', e);
@@ -849,6 +865,220 @@ async function ensureFreshFlowToken(reason = 'request', force = false) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Clear Site Data (on-demand, agent-triggered) ─────────────────────
+
+const CLEAR_DATA_ORIGIN = 'https://labs.google';
+
+const DEFAULT_CLEAR_STATE = {
+  running: false,
+  intervalSec: 0,
+  tabId: null,
+  origin: null,
+  clearCount: 0,
+  nextRunAt: null,
+};
+
+let clearState = { ...DEFAULT_CLEAR_STATE };
+
+const BROWSING_DATA_REMOVE_OPTS = {
+  cache: true,
+  cacheStorage: true,
+  cookies: true,
+  fileSystems: true,
+  indexedDB: true,
+  localStorage: true,
+  serviceWorkers: true,
+  webSQL: true,
+};
+
+function canReloadTab(tab) {
+  if (!tab?.id) return false;
+  const url = tab.url || '';
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+}
+
+function isLabsGoogleUrl(url) {
+  try {
+    return new URL(String(url || '')).hostname === 'labs.google';
+  } catch {
+    return false;
+  }
+}
+
+function isLabsGoogleTab(tab) {
+  return !!tab && isLabsGoogleUrl(tab.url);
+}
+
+function browsingDataRemove(origins, options) {
+  return new Promise((resolve, reject) => {
+    chrome.browsingData.remove({ origins }, options, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function findFlowTabForProject(projectId) {
+  const id = String(projectId || '').trim().toLowerCase();
+  if (!id) return null;
+  const tabs = await chrome.tabs.query({ url: ['https://labs.google/*'] });
+  return (
+    tabs.find(
+      (t) => t.url
+        && t.url.toLowerCase().includes(`/project/${id}`)
+        && canReloadTab(t)
+        && !t.discarded,
+    )
+    || null
+  );
+}
+
+function extractFlowLocaleFromUrl(url) {
+  try {
+    const m = new URL(String(url || '')).pathname.match(/^\/fx\/([a-z]{2})\/tools\/flow\//);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildProjectUrl(projectId, locale) {
+  const id = String(projectId || '').trim();
+  if (!id) return null;
+  const loc = locale ? `${locale}/` : '';
+  return `https://labs.google/fx/${loc}tools/flow/project/${id}`;
+}
+
+async function findFlowTabForClear(projectId) {
+  const pid = String(projectId || '').trim();
+  if (pid) {
+    const tab = await findFlowTabForProject(pid);
+    if (tab) return tab;
+  }
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  return (
+    tabs.find((t) => !t.discarded && canReloadTab(t))
+    || tabs.find((t) => canReloadTab(t))
+    || null
+  );
+}
+
+async function loadClearState() {
+  const data = await chrome.storage.local.get('f2apiClear');
+  if (data.f2apiClear) {
+    clearState = { ...DEFAULT_CLEAR_STATE, ...data.f2apiClear, running: false, nextRunAt: null };
+  }
+}
+
+async function saveClearState() {
+  await chrome.storage.local.set({ f2apiClear: clearState });
+}
+
+function getPublicClearState() {
+  return {
+    running: false,
+    intervalSec: clearState.intervalSec || 0,
+    clearCount: clearState.clearCount || 0,
+    tabId: clearState.tabId,
+    origin: clearState.origin,
+    cachedProjectId: _cachedProjectId,
+    secondsUntilNext: null,
+  };
+}
+
+async function clearProjectSiteData(tabId, projectId, projectUrl) {
+  const pid = String(projectId || '').trim();
+  if (!pid) throw new Error('missing_project_id');
+
+  noteProjectId(pid);
+  await browsingDataRemove([CLEAR_DATA_ORIGIN], BROWSING_DATA_REMOVE_OPTS);
+
+  let pageUrl = projectUrl || buildProjectUrl(pid, null);
+  if (tabId) {
+    const tab = await chrome.tabs.get(tabId);
+    if (!canReloadTab(tab)) throw new Error('invalid_tab');
+    if (!isLabsGoogleUrl(tab.url)) throw new Error('not_labs_google');
+
+    const locale = extractFlowLocaleFromUrl(tab.url);
+    pageUrl = projectUrl
+      || (tab.url && tab.url.toLowerCase().includes(`/project/${pid.toLowerCase()}`)
+        ? tab.url.split('?')[0]
+        : buildProjectUrl(pid, locale));
+    clearState.tabId = tabId;
+  }
+
+  clearState.origin = CLEAR_DATA_ORIGIN;
+  clearState.projectId = pid;
+  clearState.projectUrl = pageUrl;
+  return pageUrl;
+}
+
+async function performClearNow(projectId) {
+  const pid = String(projectId || _cachedProjectId || '').trim();
+  if (!pid) {
+    return {
+      ok: false,
+      error: 'missing_project_id',
+      message: 'Cần project_id — mở tab Flow project hoặc chạy task trước.',
+    };
+  }
+
+  const tab = await findFlowTabForProject(pid);
+  const projectUrl = tab?.url?.split('?')[0] || null;
+
+  if (!tab?.id) {
+    try {
+      noteProjectId(pid);
+      await browsingDataRemove([CLEAR_DATA_ORIGIN], BROWSING_DATA_REMOVE_OPTS);
+      clearState.clearCount = (clearState.clearCount || 0) + 1;
+      clearState.projectId = pid;
+      clearState.projectUrl = buildProjectUrl(pid, null);
+      await saveClearState();
+      return {
+        ok: true,
+        state: getPublicClearState(),
+        projectId: pid,
+        projectUrl: clearState.projectUrl,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        error: 'clear_failed',
+        message: String(e?.message || e),
+      };
+    }
+  }
+
+  if (!isLabsGoogleTab(tab)) {
+    return {
+      ok: false,
+      error: 'not_labs_google',
+      message: 'Clear Data chỉ áp dụng trên tab project https://labs.google/fx/.../project/…',
+    };
+  }
+
+  try {
+    const pageUrl = await clearProjectSiteData(tab.id, pid, projectUrl);
+    clearState.clearCount = (clearState.clearCount || 0) + 1;
+    await saveClearState();
+    return {
+      ok: true,
+      state: getPublicClearState(),
+      projectId: pid,
+      projectUrl: pageUrl,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'clear_failed',
+      message: String(e?.message || e),
+    };
+  }
 }
 
 function runCaptchaExclusive(fn) {

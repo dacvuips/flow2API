@@ -47,6 +47,25 @@ class ExtensionSession:
         self.applied_proxy_url: str = ""
         self.pending_proxy_url: str | None = None
         self.clear_state: dict[str, Any] = {}
+        self.dispatch_hold_until: float = 0.0
+
+    def is_dispatch_on_hold(self) -> bool:
+        return time.time() < self.dispatch_hold_until
+
+    def dispatch_hold_seconds_remaining(self) -> int | None:
+        remain = int(self.dispatch_hold_until - time.time())
+        return remain if remain > 0 else None
+
+    def extend_dispatch_hold(self, seconds: float) -> None:
+        sec = float(seconds or 0)
+        if sec <= 0:
+            return
+        until = time.time() + sec
+        if until > self.dispatch_hold_until:
+            self.dispatch_hold_until = until
+
+    def release_dispatch_hold(self) -> None:
+        self.dispatch_hold_until = 0.0
 
     @property
     def trace_request_id(self) -> Optional[str]:
@@ -219,11 +238,14 @@ class ExtensionSession:
         action: str,
         *,
         interval_sec: int | None = None,
+        project_id: str | None = None,
         timeout: float = 30.0,
     ) -> dict:
         params: dict[str, Any] = {"action": str(action or "").strip().lower()}
         if interval_sec is not None:
             params["intervalSec"] = max(1, min(3600, int(interval_sec)))
+        if project_id:
+            params["projectId"] = str(project_id).strip()
         resp = await self._send("clear_control", params, timeout=timeout)
         result = resp.get("result") if isinstance(resp.get("result"), dict) else None
         if not result and isinstance(resp.get("data"), dict):
@@ -692,6 +714,8 @@ class ExtensionPool:
                 continue
             if not self._profile_matches_credit_pool(session.profile_id, credit_required):
                 continue
+            if session.is_dispatch_on_hold():
+                continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:
                 out.append(session)
@@ -767,6 +791,8 @@ class ExtensionPool:
                 continue
             if not self._profile_matches_credit_pool(session.profile_id, credit_required):
                 continue
+            if session.is_dispatch_on_hold():
+                continue
             limit = get_profile_max_concurrent(session.profile_id)
             if session.active_jobs < limit:
                 eligible.append(session)
@@ -798,12 +824,53 @@ class ExtensionPool:
         if session:
             session.active_jobs += 1
 
-    def job_finished(self, profile_id: str) -> None:
+    def job_finished(
+        self,
+        profile_id: str,
+        *,
+        clear_trigger: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
         session = self._sessions.get(profile_id)
         if session and session.active_jobs > 0:
             session.active_jobs -= 1
         if session:
             self._schedule_pending_proxy_flush(session)
+            if clear_trigger and session.active_jobs <= 0:
+                self._schedule_profile_clear(session, clear_trigger, project_id=project_id)
+
+    def _schedule_profile_clear(
+        self,
+        session: ExtensionSession,
+        trigger: str,
+        *,
+        project_id: str | None = None,
+    ) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._run_profile_clear(session, trigger, project_id=project_id))
+
+    async def _run_profile_clear(
+        self,
+        session: ExtensionSession,
+        trigger: str,
+        *,
+        project_id: str | None = None,
+    ) -> None:
+        from flow2api.services import system_ops
+
+        result = await system_ops.maybe_clear_profile_when_idle(
+            session,
+            trigger=trigger,
+            project_id=project_id,
+        )
+        if result and result.get("ok"):
+            events.publish(
+                "profile_clear_changed",
+                {"profile_id": session.profile_id, "trigger": trigger},
+            )
 
     def _schedule_pending_proxy_flush(self, session: ExtensionSession) -> None:
         if session.active_jobs > 0 or session.pending_proxy_url is None:

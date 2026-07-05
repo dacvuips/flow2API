@@ -12,6 +12,8 @@ from flow2api.config import (
     HTTP_404_POLICY_ERROR_MSG,
     IMAGE_POLL_MAX,
     POLL_INTERVAL_S,
+    POST_CLEAR_403_DELAY_S,
+    POST_CLEAR_403_RETRY_MAX,
     RECAPTCHA_RETRY_MAX,
     TASK_RUNNING_TIMEOUT_S,
     TASK_TIMEOUT_ERROR,
@@ -29,6 +31,7 @@ from flow2api.services.flow_sdk import (
     format_api_error,
     is_extension_disconnect_error,
     is_extension_timeout_error,
+    is_http_403_failure,
     is_http_404_failure,
     is_invalid_argument_retry_failure,
     is_prominent_people_filter_failure,
@@ -93,21 +96,54 @@ def _ui_video_submit_raw(ui_meta: dict[str, Any], *, project_id: str = "") -> di
     """Chuẩn hóa response submit UI → shape poll video (flow_sdk)."""
     gen = ui_meta.get("ui_generation") if isinstance(ui_meta, dict) else None
     if not isinstance(gen, dict):
-        return {}
+        gen = {}
+
+    all_mids: list[str] = []
+    seen: set[str] = set()
+    for src in (ui_meta.get("media_ids"), gen.get("media_ids")):
+        for m in (src or []):
+            s = str(m or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                all_mids.append(s)
+
     raw = gen.get("raw")
     if isinstance(raw, dict) and raw:
         out = dict(raw)
+    elif all_mids:
+        out = {"media": [], "operations": []}
     else:
-        media_ids = [str(m) for m in (gen.get("media_ids") or []) if m]
-        if not media_ids:
-            return {}
-        out = {
-            "media": [{"name": mid, "mediaId": mid} for mid in media_ids],
-            "operations": [],
-        }
-    pid = str(project_id or ui_meta.get("project_id") or "").strip()
+        return {}
+
+    pid = str(project_id or ui_meta.get("project_id") or out.get("projectId") or "").strip()
     if pid and not out.get("projectId"):
         out["projectId"] = pid
+
+    existing_media = {
+        str(m.get("name") or m.get("mediaId") or "").strip()
+        for m in (out.get("media") or [])
+        if isinstance(m, dict)
+    }
+    media = [dict(m) for m in (out.get("media") or []) if isinstance(m, dict)]
+    for mid in all_mids:
+        if mid and mid not in existing_media:
+            entry: dict[str, Any] = {"name": mid, "mediaId": mid}
+            if pid:
+                entry["projectId"] = pid
+            media.append(entry)
+            existing_media.add(mid)
+    if media:
+        out["media"] = media
+
+    if all_mids:
+        ops = flow_sdk.extract_video_operations(out)
+        poll_ids = flow_sdk.collect_video_poll_media_ids(out, ops)
+        missing = [m for m in all_mids if m not in poll_ids]
+        if missing:
+            logger.info(
+                "Playwright UI: bổ sung %s media_id vào submit_raw cho poll",
+                len(missing),
+            )
     return out
 
 
@@ -211,10 +247,15 @@ async def _run_flow_ui_prep(
     return meta
 
 
-async def _resolve_ui_image_previews(client: Any, ui_meta: dict[str, Any]) -> dict[str, Any]:
+async def _resolve_ui_image_previews(
+    client: Any,
+    ui_meta: dict[str, Any],
+    *,
+    rid: str = "",
+) -> dict[str, Any]:
     """
     UI submit đôi khi trả media_ids trước, URL ảnh về sau.
-    Bổ sung image_urls cho mọi media_id (variant x2–x4).
+    Bổ sung image_urls cho mọi media_id (variant x2–x4) — publish từng ảnh khi sẵn sàng.
     """
     gen = ui_meta.get("ui_generation") if isinstance(ui_meta, dict) else None
     if not isinstance(gen, dict):
@@ -242,6 +283,28 @@ async def _resolve_ui_image_previews(client: Any, ui_meta: dict[str, Any]) -> di
                     url = ""
             if url:
                 aligned.append(url)
+                if rid and len(aligned) > len(resolved):
+                    entries = [
+                        {"url": u, "media_id": media_ids[j] if j < len(media_ids) else "", "kind": "image"}
+                        for j, u in enumerate(aligned)
+                    ]
+                    gen_live = {
+                        **gen,
+                        "image_urls": list(aligned),
+                        "media_ids": media_ids[: len(aligned)],
+                        "media_entries": entries,
+                    }
+                    activity.publish_running_outputs(
+                        rid,
+                        {
+                            "ui_generation": gen_live,
+                            "image_urls": list(aligned),
+                            "media_ids": media_ids[: len(aligned)],
+                            "media_entries": entries,
+                            "ui_prep": True,
+                        },
+                        task_type="gen_image",
+                    )
         if len(aligned) > len(resolved):
             resolved = aligned
 
@@ -722,6 +785,67 @@ class WorkerController:
         self._project_by_profile[profile_id] = project_id
         return project_id
 
+    def _resolve_clear_project_id(self, profile_id: str, params: dict[str, Any]) -> str:
+        return str(
+            params.get("project_id")
+            or self._project_by_profile.get(profile_id)
+            or ""
+        ).strip()
+
+    async def _run_process_with_403_clear_retry(self, rid: str, profile_id: str) -> None:
+        from flow2api.services.system_ops import apply_profile_clear_now
+
+        pool = get_extension_pool()
+        while True:
+            try:
+                await self._process_one(rid)
+                return
+            except Exception as exc:
+                cur = activity.get_request(rid)
+                retry_params = json.loads(cur.params_json or "{}") if cur else {}
+                msg = format_api_error(exc).strip() or "unknown_error"
+                api_trace = end_api_trace(rid)
+                if not is_http_403_failure(exc, msg, api_trace):
+                    raise
+                post_clear_403_retry = int(retry_params.get("post_clear_403_retry_count") or 0)
+                if post_clear_403_retry >= POST_CLEAR_403_RETRY_MAX:
+                    raise
+                proj_id = self._resolve_clear_project_id(profile_id, retry_params)
+                session = pool.get(profile_id)
+                if proj_id and session and session.connected:
+                    try:
+                        await apply_profile_clear_now(session, project_id=proj_id)
+                        append_request_log(
+                            rid,
+                            "worker",
+                            f"403: clear project {proj_id[:12]}…",
+                            level="warn",
+                            data={"profile_id": profile_id, "project_id": proj_id},
+                        )
+                        await session.refresh_flow_token()
+                    except Exception as clear_exc:
+                        logger.warning(
+                            "403 clear project failed rid=%s profile=%s: %s",
+                            rid[:8],
+                            profile_id[:12],
+                            clear_exc,
+                        )
+                retry_params["post_clear_403_retry_count"] = post_clear_403_retry + 1
+                activity.update_request(rid, params=retry_params)
+                append_request_log(
+                    rid,
+                    "worker",
+                    (
+                        f"403 retry sau clear {post_clear_403_retry + 1}/"
+                        f"{POST_CLEAR_403_RETRY_MAX} — chờ {POST_CLEAR_403_DELAY_S}s, "
+                        f"profile={profile_id[:12]}"
+                    ),
+                    level="warn",
+                    profile_id=profile_id,
+                )
+                await asyncio.sleep(POST_CLEAR_403_DELAY_S)
+                begin_api_trace(rid)
+
     def _assign_profile(
         self,
         rid: str,
@@ -857,6 +981,7 @@ class WorkerController:
         client = get_flow_client()
         client.trace_request_id = rid
         begin_api_trace(rid)
+        clear_trigger: str | None = None
         append_request_log(
             rid,
             "worker",
@@ -866,7 +991,7 @@ class WorkerController:
         )
         try:
             self._raise_if_cancelled(rid)
-            await self._process_one(rid)
+            await self._run_process_with_403_clear_retry(rid, profile_id)
         except RequestCancelled:
             end_api_trace(rid)
             cur = activity.get_request(rid)
@@ -1144,10 +1269,20 @@ class WorkerController:
                 level="info",
                 data={"api_calls": len(api_trace)} if api_trace else None,
             )
+            clear_trigger = "success"
         finally:
             client.trace_request_id = None
             unbind_task_profile()
-            pool.job_finished(profile_id)
+            cur_after = activity.get_request(rid)
+            clear_params = (
+                json.loads(cur_after.params_json or "{}") if cur_after else params
+            )
+            clear_project_id = self._resolve_clear_project_id(profile_id, clear_params)
+            pool.job_finished(
+                profile_id,
+                clear_trigger=clear_trigger,
+                project_id=clear_project_id or None,
+            )
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:
@@ -1218,7 +1353,14 @@ class WorkerController:
 
             if is_ui_prep_only():
                 if req_type == "gen_image":
-                    ui_meta = await _resolve_ui_image_previews(client, ui_meta)
+                    if isinstance(ui_meta, dict):
+                        ui_meta = _flatten_ui_generation_meta(ui_meta)
+                        activity.publish_running_outputs(
+                            rid,
+                            {"ui_prep": True, "profile_id": profile_id, **ui_meta},
+                            task_type=req_type,
+                        )
+                    ui_meta = await _resolve_ui_image_previews(client, ui_meta, rid=rid)
                     if isinstance(ui_meta, dict):
                         ui_meta = _flatten_ui_generation_meta(ui_meta)
                         gen = ui_meta.get("ui_generation")
@@ -1264,6 +1406,17 @@ class WorkerController:
                             "profile_id": profile_id,
                             **(ui_meta if isinstance(ui_meta, dict) else {}),
                         },
+                    )
+                    activity.publish_running_outputs(
+                        rid,
+                        {
+                            "ui_prep": True,
+                            "ui_submitted": True,
+                            "project_id": project_id,
+                            "profile_id": profile_id,
+                            **(ui_meta if isinstance(ui_meta, dict) else {}),
+                        },
+                        task_type=req_type,
                     )
                     events.publish("queue_changed", {"id": rid})
                     await self._poll_video(rid, submit_raw, project_id)
@@ -1554,8 +1707,101 @@ class WorkerController:
         existing_urls: list[str],
         existing_media: list[str],
     ) -> tuple[list[str], list[str]] | None:
-        """Không bấm Retry trên lưới sau poll — giữ kết quả partial."""
-        return None
+        """Gom thêm media_ids từ trang Flow đang mở, poll video còn thiếu."""
+        from flow2api.config import UI_VARIANT_DISCOVER_TIMEOUT_S
+        from flow2api.services.playwright_flow import (
+            collect_extra_video_variants_for_profile,
+            is_ui_automation_enabled,
+        )
+
+        if not is_ui_automation_enabled():
+            return None
+        want = max(1, min(4, int(variant_count or 1)))
+        if len(existing_media) >= want:
+            return None
+
+        expanded = await collect_extra_video_variants_for_profile(
+            profile_id,
+            existing_media_ids=existing_media,
+            variant_count=want,
+            timeout_s=float(UI_VARIANT_DISCOVER_TIMEOUT_S),
+            project_id=project_id,
+        )
+        new_ids = [m for m in expanded if m and m not in existing_media]
+        if not new_ids:
+            return None
+
+        client = get_flow_client()
+        try:
+            new_urls, new_media = await flow_sdk.poll_video_by_media(
+                client,
+                project_id,
+                new_ids,
+                VIDEO_POLL_MEDIA_MAX,
+                should_abort=self._abort_hook(rid),
+            )
+        except Exception as exc:
+            logger.warning(
+                "poll extra video variants rid=%s: %s",
+                rid[:8],
+                exc,
+            )
+            return None
+        if not new_urls:
+            return None
+
+        urls = list(existing_urls)
+        media = list(existing_media)
+        for u, m in zip(new_urls, new_media):
+            if m and m not in media:
+                media.append(m)
+                urls.append(u)
+        append_request_log(
+            rid,
+            "worker",
+            f"Poll thêm {len(new_urls)} video variant ({len(media)}/{want})",
+            level="info",
+        )
+        return urls, media
+
+    def _video_poll_progress_handler(
+        self,
+        rid: str,
+        *,
+        media_ids: list[str],
+        poll_project_id: str,
+        profile_id: str,
+        variant_count: int,
+        task_type: str,
+    ):
+        """Gọi từ on_round sync — publish video mới ngay khi poll xong từng media."""
+        last_n = [0]
+
+        def on_round(_round: int, _poll: dict, completed: dict[str, str]) -> None:
+            poll_ids = list(
+                dict.fromkeys(media_ids + flow_sdk.harvest_poll_media_ids(_poll, media_ids))
+            )
+            urls, mids = flow_sdk.ordered_media_poll_outputs(completed, poll_ids)
+            if len(mids) <= last_n[0]:
+                return
+            last_n[0] = len(mids)
+            try:
+                activity.publish_running_outputs(
+                    rid,
+                    {
+                        "video_urls": urls,
+                        "media_ids": mids,
+                        "project_id": poll_project_id,
+                        "profile_id": profile_id,
+                        "variant_count": variant_count,
+                        "ui_submitted": True,
+                    },
+                    task_type=task_type,
+                )
+            except Exception as exc:
+                logger.debug("video poll progress rid=%s: %s", rid[:8], exc)
+
+        return on_round
 
     async def _poll_video(self, rid: str, submit_raw: dict, project_id: str) -> None:
         client = get_flow_client()
@@ -1567,6 +1813,58 @@ class WorkerController:
             )
 
         media_ids = flow_sdk.collect_video_poll_media_ids(submit_raw, operations)
+        row_poll = activity.get_request(rid)
+        poll_params = (
+            json.loads(row_poll.params_json or "{}") if row_poll else {}
+        )
+        variant_count = resolve_variant_count(poll_params)
+        profile_id_poll = str(poll_params.get("profile_id") or "").strip()
+        poll_project_id = flow_sdk.resolve_poll_project_id(submit_raw, operations, project_id)
+
+        if len(media_ids) < variant_count and profile_id_poll:
+            from flow2api.config import UI_VARIANT_DISCOVER_TIMEOUT_S
+            from flow2api.services.playwright_flow import (
+                collect_extra_video_variants_for_profile,
+                is_ui_automation_enabled,
+            )
+
+            if is_ui_automation_enabled():
+                expanded = await collect_extra_video_variants_for_profile(
+                    profile_id_poll,
+                    existing_media_ids=media_ids,
+                    variant_count=variant_count,
+                    timeout_s=float(UI_VARIANT_DISCOVER_TIMEOUT_S),
+                    project_id=poll_project_id,
+                )
+                if len(expanded) > len(media_ids):
+                    media_ids = expanded
+                    pid = poll_project_id or project_id
+                    existing_names = {
+                        str(m.get("name") or m.get("mediaId") or "").strip()
+                        for m in (submit_raw.get("media") or [])
+                        if isinstance(m, dict)
+                    }
+                    media_list = [
+                        dict(m) for m in (submit_raw.get("media") or []) if isinstance(m, dict)
+                    ]
+                    for mid in media_ids:
+                        if mid and mid not in existing_names:
+                            entry: dict[str, Any] = {"name": mid, "mediaId": mid}
+                            if pid:
+                                entry["projectId"] = pid
+                            media_list.append(entry)
+                            existing_names.add(mid)
+                    submit_raw["media"] = media_list
+                    if pid and not submit_raw.get("projectId"):
+                        submit_raw["projectId"] = pid
+                    operations = flow_sdk.extract_video_operations(submit_raw)
+                    append_request_log(
+                        rid,
+                        "worker",
+                        f"Playwright UI: mở rộng poll video {len(media_ids)}/{variant_count} media_ids",
+                        level="info",
+                    )
+
         submit_media_names = [
             str(m.get("name") or m.get("mediaId"))
             for m in (submit_raw.get("media") or [])
@@ -1580,8 +1878,18 @@ class WorkerController:
         workflow_ops = [
             {"_primary_media_id": mid, "_workflow_mode": True} for mid in media_ids
         ]
-        poll_project_id = flow_sdk.resolve_poll_project_id(submit_raw, operations, project_id)
+        if not poll_project_id:
+            poll_project_id = flow_sdk.resolve_poll_project_id(submit_raw, operations, project_id)
         source_workflow_id = flow_sdk.extract_workflow_id_from_submit(submit_raw)
+        task_type = str(row_poll.type or "") if row_poll else ""
+        poll_progress = self._video_poll_progress_handler(
+            rid,
+            media_ids=media_ids,
+            poll_project_id=poll_project_id or project_id,
+            profile_id=profile_id_poll,
+            variant_count=variant_count,
+            task_type=task_type,
+        )
 
         async def _finish(urls: list[str], media: list[str], **extra: Any) -> None:
             row_done = activity.get_request(rid)
@@ -1642,6 +1950,7 @@ class WorkerController:
                     media_ids,
                     VIDEO_POLL_MEDIA_MAX,
                     should_abort=self._abort_hook(rid),
+                    on_round=poll_progress,
                     requeue_on_get_media_404=workflow_mode,
                 )
                 await _finish(urls, media, poll_mode="media")
@@ -1700,6 +2009,7 @@ class WorkerController:
                             media_ids,
                             max_rounds=5,
                             should_abort=self._abort_hook(rid),
+                            on_round=poll_progress,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="media_poll")
@@ -1730,6 +2040,7 @@ class WorkerController:
                             media_ids,
                             max_rounds=15,
                             should_abort=self._abort_hook(rid),
+                            on_round=poll_progress,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="media_poll")
@@ -1773,6 +2084,7 @@ class WorkerController:
                         media_ids,
                         max_rounds=3,
                         should_abort=self._abort_hook(rid),
+                        on_round=poll_progress,
                     )
                     if urls:
                         await _finish(urls, media, recovered_from="media_poll")
@@ -1807,6 +2119,7 @@ class WorkerController:
                     media_ids,
                     max_rounds=30,
                     should_abort=self._abort_hook(rid),
+                    on_round=poll_progress,
                 )
                 if urls:
                     await _finish(urls, media, recovered_from="media_poll")

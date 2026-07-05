@@ -17,10 +17,9 @@ if not exist .venv (
 call .venv\Scripts\activate.bat
 
 set FLOW2API_FRONTEND=%~dp0..\frontend
-
 set FLOW2API_RELOAD=0
-
-
+rem Local dev: link media/video http://127.0.0.1:1994 (tunnel van override khi co request qua domain)
+set FLOW2API_PUBLIC_BASE_URL_DEFAULT=http://127.0.0.1:1994
 
 set FLOW2API_PLAYWRIGHT_ENABLED=1
 

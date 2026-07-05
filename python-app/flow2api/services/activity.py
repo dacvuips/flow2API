@@ -80,6 +80,35 @@ def update_request(rid: str, **fields: Any) -> None:
         db.close()
 
 
+def publish_running_outputs(
+    rid: str,
+    patch: dict[str, Any],
+    *,
+    task_type: str = "",
+) -> bool:
+    """Cập nhật result từng phần khi task còn running — dashboard refresh qua queue_changed."""
+    from flow2api.services.dashboard_events import events
+    from flow2api.services.result_media import align_variant_output_urls, _resolved_output_count
+
+    row = get_request(rid)
+    if not row or row.status not in ("running", "queued"):
+        return False
+    prev = json.loads(row.result_json or "{}")
+    if not isinstance(prev, dict):
+        prev = {}
+    task = task_type or row.type
+    result = align_variant_output_urls({**prev, **patch}, task, fill_missing=False)
+    out_n = _resolved_output_count(result, task)
+    prev_n = _resolved_output_count(prev, task)
+    if out_n <= prev_n:
+        return False
+    result["partial"] = True
+    result["output_count"] = out_n
+    update_request(rid, status="running", result=result)
+    events.publish("queue_changed", {"id": rid, "partial": True, "outputs": out_n})
+    return True
+
+
 def get_request(rid: str) -> Optional[RequestRecord]:
     db = SessionLocal()
     try:
@@ -311,17 +340,25 @@ def record_to_public(
         result = finalize_video_result_urls(row.id, result)
     else:
         result = rewrite_result_public_urls(result)
+    from flow2api.services.request_params import resolve_variant_count
+    from flow2api.services.result_media import (
+        align_variant_output_urls,
+        input_preview_items_from_params,
+        preview_items_from_result,
+        slim_result_for_list,
+    )
+
+    result = align_variant_output_urls(
+        result,
+        row.type,
+        fill_missing=(str(row.status or "") == "done"),
+    )
     params = json.loads(row.params_json or "{}")
     profile_label = (
         params.get("profile_label")
         or params.get("profile_email")
         or params.get("profile_id")
         or ""
-    )
-    from flow2api.services.result_media import (
-        input_preview_items_from_params,
-        preview_items_from_result,
-        slim_result_for_list,
     )
 
     show_preview = include_preview if include_preview is not None else for_list
@@ -358,9 +395,16 @@ def record_to_public(
         "created_at": row.created_at.isoformat() + "Z",
         "updated_at": row.updated_at.isoformat() + "Z",
     }
+    variant_count = resolve_variant_count(json.loads(row.params_json or "{}"))
+    if isinstance(result, dict) and result.get("output_count"):
+        payload["output_count"] = int(result["output_count"])
+    elif variant_count > 1:
+        payload["output_count"] = variant_count
     if show_preview:
         payload["preview_items"] = preview_items
         payload["output_count"] = max(
+            payload.get("output_count") or 0,
+            variant_count,
             len(preview_items),
             len(result.get("image_urls") or []) if isinstance(result.get("image_urls"), list) else 0,
             len(result.get("video_urls") or []) if isinstance(result.get("video_urls"), list) else 0,

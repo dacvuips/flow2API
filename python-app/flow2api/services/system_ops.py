@@ -1364,30 +1364,114 @@ async def push_proxy_to_extensions(*, defer_if_busy: bool = True) -> None:
 
 
 async def sync_profile_clear_settings(session: Any) -> dict | None:
-    """Apply dashboard clear-data settings to one extension session."""
-    from flow2api.services.worker_settings import (
-        get_profile_clear_interval_sec,
-        is_profile_clear_enabled,
-    )
-
+    """Clear Data is event-driven; ensure legacy periodic clear is stopped."""
     if not getattr(session, "connected", False):
         return None
     pid = str(getattr(session, "profile_id", "") or "")
     if not pid or pid.startswith("_"):
         return None
-    enabled = is_profile_clear_enabled(pid)
-    interval = get_profile_clear_interval_sec(pid)
     try:
-        if enabled:
-            return await session.clear_control("start", interval_sec=interval)
         return await session.clear_control("stop")
     except Exception as exc:
         logger.warning("sync clear settings failed %s: %s", pid[:12], exc)
         return None
 
 
-async def apply_profile_clear_now(session: Any) -> dict:
-    return await session.clear_control("now", timeout=45.0)
+async def maybe_clear_profile_when_idle(
+    session: Any,
+    *,
+    trigger: str,
+    project_id: str | None = None,
+) -> dict | None:
+    """Clear labs.google site data for a Flow project when profile has no active jobs."""
+    from flow2api.services.worker_settings import is_profile_clear_enabled
+
+    if trigger not in ("success",):
+        return None
+    if not getattr(session, "connected", False):
+        return None
+    pid = str(getattr(session, "profile_id", "") or "")
+    if not pid or pid.startswith("_"):
+        return None
+    if int(getattr(session, "active_jobs", 0) or 0) > 0:
+        return None
+    if not is_profile_clear_enabled(pid):
+        return None
+    proj = str(project_id or "").strip()
+    if not proj:
+        logger.warning("profile clear skipped profile=%s: missing project_id", pid[:12])
+        return None
+    from flow2api.config import POST_CLEAR_COOLDOWN_S, POST_SUCCESS_CLEAR_DELAY_S
+
+    delay_s = max(0, int(POST_SUCCESS_CLEAR_DELAY_S)) if trigger == "success" else 0
+    cleared = False
+    try:
+        if delay_s > 0:
+            if hasattr(session, "extend_dispatch_hold"):
+                session.extend_dispatch_hold(delay_s)
+            logger.info(
+                "profile clear chờ %ss sau task thành công profile=%s project=%s",
+                delay_s,
+                pid[:12],
+                proj[:12],
+            )
+            await asyncio.sleep(delay_s)
+            if int(getattr(session, "active_jobs", 0) or 0) > 0:
+                logger.info(
+                    "profile clear bỏ qua profile=%s: có job mới trong lúc chờ",
+                    pid[:12],
+                )
+                if hasattr(session, "release_dispatch_hold"):
+                    session.release_dispatch_hold()
+                return None
+            if not getattr(session, "connected", False):
+                if hasattr(session, "release_dispatch_hold"):
+                    session.release_dispatch_hold()
+                return None
+        result = await apply_profile_clear_now(session, project_id=proj)
+        cleared = True
+        logger.info(
+            "profile clear after %s project=%s profile=%s ok=%s",
+            trigger,
+            proj[:12],
+            pid[:12],
+            result.get("ok"),
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "profile clear failed profile=%s project=%s trigger=%s: %s",
+            pid[:12],
+            proj[:12],
+            trigger,
+            exc,
+        )
+        return None
+    finally:
+        if cleared and hasattr(session, "extend_dispatch_hold"):
+            cooldown = max(0, int(POST_CLEAR_COOLDOWN_S))
+            if cooldown > 0:
+                session.extend_dispatch_hold(cooldown)
+                logger.info(
+                    "profile %s chờ %ss sau clear trước khi nhận task mới",
+                    pid[:12],
+                    cooldown,
+                )
+
+
+async def apply_profile_clear_now(
+    session: Any,
+    *,
+    project_id: str | None = None,
+) -> dict:
+    proj = str(project_id or "").strip()
+    if not proj:
+        raise ValueError("missing_project_id")
+    return await session.clear_control(
+        "now",
+        project_id=proj,
+        timeout=45.0,
+    )
 
 
 def _extension_push_config() -> dict[str, Any]:

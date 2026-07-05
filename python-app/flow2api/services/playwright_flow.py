@@ -21,6 +21,8 @@ from flow2api.config import (
     UI_UPLOAD_PREVIEW_TIMEOUT_S,
     UI_UPLOAD_RETRY_MAX,
     UI_UPLOAD_ERROR_RETRY_WAIT_S,
+    UI_VARIANT_SETTLE_TIMEOUT_S,
+    UI_VARIANT_DISCOVER_TIMEOUT_S,
 )
 from flow2api.services import flow_sdk
 from flow2api.services.flow_sdk import UPLOAD_IMAGE_PATH
@@ -143,6 +145,10 @@ _KNOWN_VIDEO_MODELS: dict[str, str] = {
 _GENERATE_IMAGE_API_PATTERNS = re.compile(r"flowMedia:batchGenerateImages|batchGenerateImages", re.I)
 _GENERATE_VIDEO_API_PATTERNS = re.compile(
     r"batchAsyncGenerateVideo|batchAsyncGenerateVideoEditVideo|batchGenerateVideo|batchGenerateVideos",
+    re.I,
+)
+_VIDEO_POLL_API_PATTERNS = re.compile(
+    r"batchCheckAsyncVideoGenerationStatus|video:batchCheckAsync",
     re.I,
 )
 _ERROR_SKIP_ICON_PATTERNS = re.compile(
@@ -269,7 +275,14 @@ def _count_generation_outputs(meta: dict[str, Any], generation_kind: str) -> int
         return 0
     kind = str(generation_kind or "").strip().lower()
     if kind == "video":
-        return len([m for m in (meta.get("media_ids") or []) if str(m).strip()])
+        mids = [m for m in (meta.get("media_ids") or []) if str(m).strip()]
+        if mids:
+            return len(mids)
+        raw = meta.get("raw")
+        if isinstance(raw, dict):
+            ops = flow_sdk.extract_video_operations(raw)
+            return len(flow_sdk.collect_video_poll_media_ids(raw, ops))
+        return 0
     urls = [u for u in (meta.get("image_urls") or []) if str(u).strip()]
     mids = [m for m in (meta.get("media_ids") or []) if str(m).strip()]
     return max(len(urls), len(mids))
@@ -3701,40 +3714,133 @@ def _submit_meta_as_merge_part(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _absorb_extra_image_submit_responses(
+async def _try_absorb_extra_image_submit_response(
     page: Any,
     meta: dict[str, Any],
     *,
     want: int,
-    deadline: float,
+    wait_ms: int = 2500,
 ) -> dict[str, Any]:
-    """Gom thêm response batchGenerateImages khi các variant còn đang generate."""
+    """Gom tối đa một response batchGenerateImages mỗi lần gọi."""
     merged = dict(meta)
-    while time.monotonic() < deadline:
-        if await _has_generation_error_card(page):
-            break
-        remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
-        if remaining_ms <= 0:
-            break
-        try:
-            resp = await page.wait_for_response(
-                _is_image_generate_response,
-                timeout=min(2500, remaining_ms),
+    if _count_generation_outputs(merged, "image") >= want:
+        return merged
+    try:
+        resp = await page.wait_for_response(
+            _is_image_generate_response,
+            timeout=max(200, int(wait_ms)),
+        )
+        status, payload = await _extract_response_payload(resp)
+        if status >= 400:
+            return merged
+        part = _normalize_image_submit_payload(payload)
+        part["status"] = status
+        return _merge_generation_submit_parts(
+            [_submit_meta_as_merge_part(merged), part],
+            kind="image",
+        )
+    except Exception:
+        return merged
+
+
+async def _try_absorb_extra_video_submit_response(
+    page: Any,
+    meta: dict[str, Any],
+    *,
+    want: int,
+    wait_ms: int = 2500,
+) -> dict[str, Any]:
+    """Gom tối đa một response batchAsyncGenerateVideo mỗi lần gọi."""
+    merged = dict(meta)
+    if _count_generation_outputs(merged, "video") >= want:
+        return merged
+    try:
+        resp = await page.wait_for_response(
+            _is_video_generate_response,
+            timeout=max(200, int(wait_ms)),
+        )
+        status, payload = await _extract_response_payload(resp)
+        if status >= 400:
+            return merged
+        part = _normalize_video_submit_payload(payload)
+        part["status"] = status
+        return _merge_generation_submit_parts(
+            [_submit_meta_as_merge_part(merged), part],
+            kind="video",
+        )
+    except Exception:
+        return merged
+
+
+async def _try_absorb_extra_video_poll_response(
+    page: Any,
+    meta: dict[str, Any],
+    *,
+    want: int,
+    wait_ms: int = 2500,
+) -> dict[str, Any]:
+    """Gom media_ids từ batchCheckAsyncVideoGenerationStatus (Flow poll trên trang)."""
+    merged = dict(meta)
+    if _count_generation_outputs(merged, "video") >= want:
+        return merged
+    try:
+        resp = await page.wait_for_response(
+            _is_video_poll_response,
+            timeout=max(200, int(wait_ms)),
+        )
+        status, payload = await _extract_response_payload(resp)
+        if status >= 400:
+            return merged
+        part = _normalize_video_poll_payload(payload)
+        part["status"] = status
+        out = _merge_generation_submit_parts(
+            [_submit_meta_as_merge_part(merged), part],
+            kind="video",
+        )
+        n = _count_generation_outputs(out, "video")
+        if n > _count_generation_outputs(merged, "video"):
+            logger.info(
+                "Playwright UI: poll video +%s media_id(s) → %s/%s",
+                n - _count_generation_outputs(merged, "video"),
+                n,
+                want,
             )
-            status, payload = await _extract_response_payload(resp)
-            if status >= 400:
-                continue
-            part = _normalize_image_submit_payload(payload)
-            part["status"] = status
-            merged = _merge_generation_submit_parts(
-                [_submit_meta_as_merge_part(merged), part],
-                kind="image",
+        return out
+    except Exception:
+        return merged
+
+
+async def _count_visible_generation_tiles(page: Any, generation_kind: str) -> int:
+    """Đếm tile video/ảnh hiển thị trên lưới Flow (UI có thể đủ trước khi meta cập nhật)."""
+    kind = str(generation_kind or "").strip().lower()
+    try:
+        if kind == "video":
+            n = await page.evaluate(
+                """() => {
+                  let n = 0;
+                  for (const v of document.querySelectorAll('video')) {
+                    const r = v.getBoundingClientRect();
+                    if (r.width > 48 && r.height > 48 && r.top < innerHeight && r.bottom > 0) n++;
+                  }
+                  return n;
+                }"""
             )
-            if _count_generation_outputs(merged, "image") >= want:
-                break
-        except Exception:
-            await asyncio.sleep(0.45)
-    return merged
+        else:
+            n = await page.evaluate(
+                """() => {
+                  let n = 0;
+                  for (const img of document.querySelectorAll('img[src]')) {
+                    const src = img.currentSrc || img.src || '';
+                    if (!src || src.includes('svg')) continue;
+                    const r = img.getBoundingClientRect();
+                    if (r.width > 48 && r.height > 48 && r.top < innerHeight && r.bottom > 0) n++;
+                  }
+                  return n;
+                }"""
+            )
+        return max(0, int(n or 0))
+    except Exception:
+        return 0
 
 
 _IMAGE_VARIANT_SETTLE_S: dict[int, float] = {1: 20.0, 2: 40.0, 3: 60.0, 4: 80.0}
@@ -3770,9 +3876,8 @@ async def _settle_variant_grid_with_retry(
     min_have: int = 0,
 ) -> dict[str, Any] | None:
     """
-    Kiểm tra kết quả sau submit — đủ variant thì trả về ngay.
-    Thiếu variant: chờ thêm (ảnh x2–x4 thường lần lượt) — không restart sớm.
-    Chỉ restart khi có thẻ lỗi hoặc hết timeout mà chưa có output nào.
+    Chờ tối đa UI_VARIANT_SETTLE_TIMEOUT_S (mặc định 60s) từ lúc submit.
+    Đủ variant → trả ngay. Hết giờ → trả partial (kể cả 0), không restart pipeline.
     """
     want = max(1, min(4, int(variant_count or 1)))
     kind = str(generation_kind or "").strip().lower()
@@ -3782,57 +3887,152 @@ async def _settle_variant_grid_with_retry(
     have = max(_count_generation_outputs(meta, kind), int(min_have or 0))
 
     if have >= want:
-        if await _has_generation_error_card(page):
-            await _reraise_as_upload_restart(
-                page,
-                RuntimeError(f"grid_error_with_partial have={have}/{want}"),
-                context=reason,
-            )
+        logger.info("Playwright UI: đủ variant %s/%s ngay sau submit", have, want)
         return meta or existing
 
-    total_wait = _variant_settle_timeout_s(kind, want, timeout_s)
-    deadline = time.monotonic() + total_wait
+    total_wait = float(
+        timeout_s if timeout_s is not None else UI_VARIANT_SETTLE_TIMEOUT_S
+    )
+    if str(reason or "") == "during_poll":
+        total_wait = min(total_wait, float(UI_VARIANT_DISCOVER_TIMEOUT_S))
+    total_wait = max(3.0 if str(reason or "") == "during_poll" else 10.0, total_wait)
+    started = time.monotonic()
+    deadline = started + total_wait
     logger.info(
-        "Playwright UI: chờ variant %s/%s (%s) tối đa %.0fs",
+        "Playwright UI: chờ variant %s/%s (%s) tối đa %.0fs — đủ sớm xuất ngay, hết giờ trả partial",
         have,
         want,
         kind,
         total_wait,
     )
 
+    tick_wait_ms = 2500
     while time.monotonic() < deadline:
-        if await _has_generation_error_card(page):
-            await _reraise_as_upload_restart(
-                page,
-                RuntimeError(f"grid_error have={have}/{want}"),
-                context=reason,
-            )
-
+        remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
+        dom_n = 0
         if kind == "image" and want > 1:
-            meta = await _absorb_extra_image_submit_responses(
-                page, meta, want=want, deadline=deadline
+            meta = await _try_absorb_extra_image_submit_response(
+                page, meta, want=want, wait_ms=min(tick_wait_ms, remaining_ms)
             )
-        have = _count_generation_outputs(meta, kind)
-        if have >= want:
-            logger.info("Playwright UI: đủ variant %s/%s", have, want)
+        elif kind == "video" and want > 1:
+            meta = await _try_absorb_extra_video_submit_response(
+                page, meta, want=want, wait_ms=min(tick_wait_ms, remaining_ms)
+            )
+            if _count_generation_outputs(meta, kind) < want:
+                meta = await _try_absorb_extra_video_poll_response(
+                    page, meta, want=want, wait_ms=min(tick_wait_ms, remaining_ms)
+                )
+            dom_n = await _count_visible_generation_tiles(page, kind)
+            if dom_n >= want and _count_generation_outputs(meta, kind) < want:
+                meta = await _try_absorb_extra_video_poll_response(
+                    page, meta, want=want, wait_ms=min(1200, remaining_ms)
+                )
+        meta_n = _count_generation_outputs(meta, kind)
+        have = max(meta_n, dom_n if want > 1 else 0)
+        if meta_n >= want:
+            elapsed = time.monotonic() - started
+            logger.info(
+                "Playwright UI: đủ variant %s/%s sau %.1fs — xuất ngay",
+                have,
+                want,
+                elapsed,
+            )
             return meta or existing
 
         await asyncio.sleep(0.45)
 
     have = _count_generation_outputs(meta, kind)
-    if have > 0 and not await _has_generation_error_card(page):
+    if have >= want:
+        logger.info("Playwright UI: đủ variant %s/%s", have, want)
+    elif have > 0:
         logger.info(
-            "Playwright UI: partial %s/%s variant — không có thẻ lỗi, tiếp tục",
+            "Playwright UI: partial %s/%s variant sau %.0fs (%s) — xuất kết quả, không retry",
             have,
             want,
+            total_wait,
+            reason,
         )
-        return meta or existing
+    else:
+        logger.warning(
+            "Playwright UI: không có output sau %.0fs (want=%s, %s) — không retry pipeline",
+            total_wait,
+            want,
+            reason,
+        )
+    return meta or existing
 
-    await _reraise_as_upload_restart(
+
+async def collect_extra_video_variants_for_profile(
+    profile_id: str,
+    *,
+    existing_media_ids: list[str],
+    variant_count: int,
+    timeout_s: float | None = None,
+    project_id: str = "",
+) -> list[str]:
+    """
+    Trang Flow vẫn mở sau submit — gom thêm media_ids từ response batchAsyncGenerateVideo
+    khi poll phát hiện thiếu variant (x2–x4).
+    """
+    if not is_ui_automation_enabled():
+        return list(existing_media_ids)
+    want = max(1, min(4, int(variant_count or 1)))
+    have_ids = [str(m).strip() for m in (existing_media_ids or []) if str(m).strip()]
+    if len(have_ids) >= want:
+        return have_ids
+
+    try:
+        pool = get_playwright_pool()
+        session = await pool.get_session(profile_id)
+        page = await session.get_page(flow_url_hint=_flow_url(), sync_proxy=False)
+    except Exception as exc:
+        logger.debug("collect_extra_video_variants: no page profile=%s: %s", profile_id[:12], exc)
+        return have_ids
+
+    pid = str(project_id or "").strip()
+    meta: dict[str, Any] = {
+        "media_ids": list(have_ids),
+        "raw": {
+            **({"projectId": pid} if pid else {}),
+            "media": [
+                {
+                    "name": mid,
+                    "mediaId": mid,
+                    **({"projectId": pid} if pid else {}),
+                }
+                for mid in have_ids
+            ],
+            "operations": [],
+        },
+    }
+    settled = await _settle_variant_grid_with_retry(
         page,
-        RuntimeError(f"incomplete_outputs have={have}/{want}"),
-        context=reason,
+        generation_kind="video",
+        variant_count=want,
+        existing=meta,
+        reason="during_poll",
+        timeout_s=int(timeout_s) if timeout_s is not None else UI_VARIANT_SETTLE_TIMEOUT_S,
     )
+    if not isinstance(settled, dict):
+        return have_ids
+    out = [str(m).strip() for m in (settled.get("media_ids") or []) if str(m).strip()]
+    if not out:
+        raw = settled.get("raw")
+        if isinstance(raw, dict):
+            out = flow_sdk.collect_video_poll_media_ids(
+                raw,
+                flow_sdk.extract_video_operations(raw),
+            )
+    merged = list(dict.fromkeys(have_ids + out))
+    if len(merged) > len(have_ids):
+        logger.info(
+            "Playwright UI: thêm variant video %s→%s/%s (profile=%s)",
+            len(have_ids),
+            len(merged),
+            want,
+            profile_id[:12],
+        )
+    return merged
 
 
 def _normalize_image_submit_payload(payload: Any) -> dict[str, Any]:
@@ -5106,6 +5306,31 @@ def _is_video_generate_response(resp: Any) -> bool:
     return bool(_GENERATE_VIDEO_API_PATTERNS.search(url))
 
 
+def _is_video_poll_response(resp: Any) -> bool:
+    try:
+        url = str(resp.url or "")
+    except Exception:
+        return False
+    return bool(_VIDEO_POLL_API_PATTERNS.search(url))
+
+
+def _normalize_video_poll_payload(payload: Any) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        inner = data.get("data")
+        if inner.get("media") or inner.get("operations"):
+            data = inner
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    ops = flow_sdk.extract_video_operations(data)
+    media_ids = flow_sdk.collect_video_poll_media_ids(data, ops)
+    return {
+        "submitted": True,
+        "media_ids": media_ids,
+        "raw": data,
+    }
+
+
 async def _submit_arrow_button(page: Any) -> Any | None:
     """Nút gửi ở bên phải prompt bar (mũi tên tròn)."""
     chip = await _model_chip_button_locator(page, prefer="auto")
@@ -5210,6 +5435,64 @@ def _normalize_video_submit_payload(payload: Any) -> dict[str, Any]:
     }
 
 
+def _merge_video_submit_raw_dicts(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Gộp media/operations/workflows từ nhiều response batchAsyncGenerateVideo."""
+    merged: dict[str, Any] = {}
+    all_media: list[dict[str, Any]] = []
+    seen_media: set[str] = set()
+    all_ops: list[dict[str, Any]] = []
+    seen_ops: set[str] = set()
+    all_workflows: list[dict[str, Any]] = []
+
+    for part in parts:
+        raw = part.get("raw")
+        if not isinstance(raw, dict):
+            continue
+        if not merged:
+            merged = {
+                k: v
+                for k, v in raw.items()
+                if k not in ("media", "operations", "workflows")
+            }
+        for key in ("projectId", "workflowId"):
+            if raw.get(key) and not merged.get(key):
+                merged[key] = raw[key]
+        for entry in raw.get("media") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("mediaId") or "").strip()
+            if name and name not in seen_media:
+                seen_media.add(name)
+                all_media.append(dict(entry))
+        for entry in raw.get("operations") or []:
+            if not isinstance(entry, dict):
+                continue
+            op_inner = entry.get("operation") or entry
+            op_key = str(
+                op_inner.get("name")
+                or op_inner.get("operationId")
+                or op_inner.get("mediaId")
+                or ""
+            ).strip()
+            if not op_key:
+                op_key = f"idx:{len(all_ops)}"
+            if op_key in seen_ops:
+                continue
+            seen_ops.add(op_key)
+            all_ops.append(dict(entry))
+        for wf in raw.get("workflows") or []:
+            if isinstance(wf, dict):
+                all_workflows.append(dict(wf))
+
+    if all_media:
+        merged["media"] = all_media
+    if all_ops:
+        merged["operations"] = all_ops
+    if all_workflows:
+        merged["workflows"] = all_workflows
+    return merged
+
+
 def _merge_generation_submit_parts(
     parts: list[dict[str, Any]],
     *,
@@ -5251,17 +5534,33 @@ def _merge_generation_submit_parts(
             if url:
                 seen_urls.add(url)
 
-    if kind == "video" and not merged["media_ids"]:
-        for part in parts:
-            for m in part.get("media_ids") or []:
-                s = str(m or "").strip()
-                if s and s not in seen_mids:
-                    seen_mids.add(s)
-                    merged["media_ids"].append(s)
+    if kind == "video":
+        if not merged["media_ids"]:
+            for part in parts:
+                for m in part.get("media_ids") or []:
+                    s = str(m or "").strip()
+                    if s and s not in seen_mids:
+                        seen_mids.add(s)
+                        merged["media_ids"].append(s)
+        raw_parts = [p for p in parts if isinstance(p.get("raw"), dict)]
+        if raw_parts:
+            merged_raw = _merge_video_submit_raw_dicts(raw_parts)
+            if merged_raw:
+                merged["raw"] = merged_raw
+                for mid in flow_sdk.collect_video_poll_media_ids(
+                    merged_raw,
+                    flow_sdk.extract_video_operations(merged_raw),
+                ):
+                    s = str(mid or "").strip()
+                    if s and s not in seen_mids:
+                        seen_mids.add(s)
+                        merged["media_ids"].append(s)
+    elif parts:
+        merged["raw"] = parts[-1].get("raw")
 
     merged["status"] = int(parts[-1].get("status") or 200) if parts else 200
     merged["source"] = str(parts[-1].get("source") or "submit_arrow") if parts else "submit_arrow"
-    if parts:
+    if parts and "raw" not in merged:
         merged["raw"] = parts[-1].get("raw")
     return merged
 
@@ -5299,7 +5598,11 @@ async def _collect_submit_responses(
 
     # Một response batchGenerate* thường đã chứa đủ variant; chờ thêm nếu thiếu (ảnh x2–x4 lâu hơn).
     if want > 1 and len(responses) < want:
-        extra_wait = _image_variant_settle_timeout_s(want) if label == "image" else min(12.0, want * 3.0)
+        extra_wait = (
+            _image_variant_settle_timeout_s(want)
+            if label == "image"
+            else max(30.0, want * 12.0)
+        )
         extra_deadline = time.monotonic() + extra_wait
         while len(responses) < want and time.monotonic() < extra_deadline:
             remaining_ms = max(300, int((extra_deadline - time.monotonic()) * 1000))

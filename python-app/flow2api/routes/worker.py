@@ -304,6 +304,7 @@ async def update_profile_clear(
 @router.post("/profiles/{profile_id}/clear/now")
 async def clear_profile_now(
     profile_id: str,
+    project_id: str | None = None,
     _=Depends(_auth_key_id),
 ):
     from flow2api.services import system_ops
@@ -314,8 +315,16 @@ async def clear_profile_now(
         raise HTTPException(404, "profile_not_found")
     if not session.connected:
         raise HTTPException(503, "extension_not_connected")
+    proj = str(project_id or "").strip()
+    if not proj:
+        raise HTTPException(
+            400,
+            "missing_project_id — truyền ?project_id=... (UUID project Flow)",
+        )
     try:
-        result = await system_ops.apply_profile_clear_now(session)
+        result = await system_ops.apply_profile_clear_now(session, project_id=proj)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, str(exc)) from exc
     if not result.get("ok"):
@@ -326,7 +335,7 @@ async def clear_profile_now(
     events.publish("profile_clear_changed", {"profile_id": profile_id, "manual": True})
     return {
         "ok": True,
-        "message": "Đã clear labs.google và reload tab Flow",
+        "message": f"Đã clear data project {proj[:12]}…",
         "clear_result": result,
         "profiles": pool.list_public(),
     }
