@@ -186,25 +186,36 @@ def _user_data_dir() -> Path:
     if CHROME_USER_DATA_DIR:
         return Path(CHROME_USER_DATA_DIR)
     local = Path(os.environ.get("LOCALAPPDATA", ""))
+    candidates: list[Path] = []
     exe = _resolve_chrome_exe()
     if exe:
         exe_key = str(exe).lower()
         if "chromium" in exe_key:
-            chromium_ud = local / "Chromium" / "User Data"
-            if chromium_ud.is_dir() or not (local / "Google" / "Chrome" / "User Data").is_dir():
-                return chromium_ud
+            candidates.append(local / "Chromium" / "User Data")
+        else:
+            candidates.append(local / "Google" / "Chrome" / "User Data")
         portable_ud = exe.parent.parent / "User Data"
-        if portable_ud.is_dir():
-            return portable_ud
-        chrome_ud = local / "Google" / "Chrome" / "User Data"
-        if chrome_ud.is_dir():
-            return chrome_ud
+        if portable_ud not in candidates:
+            candidates.insert(0, portable_ud)
     for candidate in (
         local / "Chromium" / "User Data",
         local / "Google" / "Chrome" / "User Data",
     ):
-        if candidate.is_dir():
-            return candidate
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    best: Path | None = None
+    best_count = -1
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        count = len(_list_profiles_in_root(candidate))
+        if count > best_count:
+            best = candidate
+            best_count = count
+    if best is not None and best_count > 0:
+        return best
+
     if exe and "chromium" in str(exe).lower():
         return local / "Chromium" / "User Data"
     return local / "Google" / "Chrome" / "User Data"
@@ -229,6 +240,105 @@ if not defined CHROME_PATH (
 def _cdp_user_data_dir() -> Path:
     """Non-standard Chrome user-data-dir (bắt buộc từ Chrome 136+ để CDP hoạt động)."""
     return Path(CDP_USER_DATA_DIR)
+
+
+def _chrome_profile_roots() -> list[Path]:
+    """Thư mục user-data Chromium/Chrome desktop + bản CDP riêng."""
+    roots: list[Path] = []
+    for candidate in (_user_data_dir(), _cdp_user_data_dir()):
+        if candidate not in roots:
+            roots.append(candidate)
+    return roots
+
+
+def _list_profiles_in_root(root: Path) -> list[str]:
+    found: list[str] = []
+    if (root / "Default" / "Preferences").is_file():
+        found.append("Default")
+    if root.is_dir():
+        for entry in sorted(root.glob("Profile *")):
+            if (entry / "Preferences").is_file():
+                found.append(entry.name)
+    return found
+
+
+def _extract_email_from_json(raw: Any) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    account_info = raw.get("account_info")
+    if isinstance(account_info, list):
+        for item in account_info:
+            if isinstance(item, dict):
+                email = str(item.get("email") or "").strip()
+                if "@" in email:
+                    return email
+    elif isinstance(account_info, dict):
+        email = str(account_info.get("email") or "").strip()
+        if "@" in email:
+            return email
+    profile = raw.get("profile")
+    if isinstance(profile, dict):
+        for key in ("name", "user_name", "gaia_name"):
+            name = str(profile.get(key) or "").strip()
+            if "@" in name:
+                return name
+        info_cache = profile.get("info_cache")
+        if isinstance(info_cache, dict):
+            for item in info_cache.values():
+                if not isinstance(item, dict):
+                    continue
+                for key in ("user_name", "gaia_name", "hosted_domain"):
+                    name = str(item.get(key) or "").strip()
+                    if "@" in name:
+                        return name
+    signin = raw.get("signin")
+    if isinstance(signin, dict):
+        for key in ("signed_in_email", "email", "username"):
+            email = str(signin.get(key) or "").strip()
+            if "@" in email:
+                return email
+    google = raw.get("google")
+    if isinstance(google, dict):
+        accounts = google.get("accounts")
+        if isinstance(accounts, dict):
+            for item in accounts.values():
+                if isinstance(item, dict):
+                    email = str(item.get("email") or item.get("account_id") or "").strip()
+                    if "@" in email:
+                        return email
+    return ""
+
+
+def _read_chrome_profile_email_from_root(chrome_dir: str, root: Path) -> str:
+    prefs_path = root / chrome_dir / "Preferences"
+    if prefs_path.is_file():
+        try:
+            raw = json.loads(prefs_path.read_text(encoding="utf-8"))
+            email = _extract_email_from_json(raw)
+            if email:
+                return email
+        except Exception:
+            pass
+    local_state = root / "Local State"
+    if local_state.is_file():
+        try:
+            raw = json.loads(local_state.read_text(encoding="utf-8"))
+            email = _extract_email_from_json(raw)
+            if email:
+                return email
+            profile = raw.get("profile")
+            if isinstance(profile, dict):
+                info_cache = profile.get("info_cache")
+                if isinstance(info_cache, dict):
+                    entry = info_cache.get(chrome_dir)
+                    if isinstance(entry, dict):
+                        for key in ("user_name", "gaia_name", "hosted_domain"):
+                            name = str(entry.get(key) or "").strip()
+                            if "@" in name:
+                                return name
+        except Exception:
+            pass
+    return ""
 
 
 def _mirror_dir_robocopy(src: Path, dst: Path, *, exclude_cache: bool = True) -> None:
@@ -327,15 +437,10 @@ def ensure_cdp_profile_ready(chrome_dir: str, *, force: bool = False) -> tuple[P
 
 
 def list_chrome_profiles() -> list[str]:
-    root = _user_data_dir()
-    found: list[str] = []
-    if (root / "Default" / "Preferences").is_file():
-        found.append("Default")
-    if root.is_dir():
-        for entry in sorted(root.glob("Profile *")):
-            if (entry / "Preferences").is_file():
-                found.append(entry.name)
-    return found
+    found: set[str] = set()
+    for root in _chrome_profile_roots():
+        found.update(_list_profiles_in_root(root))
+    return sorted(found, key=_chrome_profile_sort_key)
 
 
 def _chrome_profile_sort_key(name: str) -> tuple[int, int | str]:
@@ -353,32 +458,12 @@ def sorted_chrome_profiles() -> list[str]:
     return sorted(list_chrome_profiles(), key=_chrome_profile_sort_key)
 
 
-def read_chrome_profile_email(chrome_dir: str) -> str:
-    prefs_path = _user_data_dir() / chrome_dir / "Preferences"
-    if not prefs_path.is_file():
-        return ""
-    try:
-        raw = json.loads(prefs_path.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    if not isinstance(raw, dict):
-        return ""
-    account_info = raw.get("account_info")
-    if isinstance(account_info, list):
-        for item in account_info:
-            if isinstance(item, dict):
-                email = str(item.get("email") or "").strip()
-                if "@" in email:
-                    return email
-    elif isinstance(account_info, dict):
-        email = str(account_info.get("email") or "").strip()
-        if "@" in email:
+def read_chrome_profile_email(chrome_dir: str, *, root: Path | None = None) -> str:
+    roots = [root] if root is not None else _chrome_profile_roots()
+    for candidate in roots:
+        email = _read_chrome_profile_email_from_root(chrome_dir, candidate)
+        if email:
             return email
-    profile = raw.get("profile")
-    if isinstance(profile, dict):
-        name = str(profile.get("name") or "").strip()
-        if "@" in name:
-            return name
     return ""
 
 
@@ -423,18 +508,53 @@ def email_to_chrome_dir(email: str) -> str | None:
     needle = str(email or "").strip().lower()
     if not needle or "@" not in needle:
         return None
-    for chrome_dir in sorted_chrome_profiles():
-        em = read_chrome_profile_email(chrome_dir).strip().lower()
-        if em and em == needle:
-            return chrome_dir
+    for root in _chrome_profile_roots():
+        for chrome_dir in _list_profiles_in_root(root):
+            em = _read_chrome_profile_email_from_root(chrome_dir, root).strip().lower()
+            if em and em == needle:
+                return chrome_dir
+    return None
+
+
+def _extension_sessions_with_email() -> list[Any]:
+    try:
+        from flow2api.services.extension_pool import get_extension_pool
+
+        sessions = get_extension_pool().list_sessions()
+    except Exception:
+        return []
+    out = []
+    for session in sessions:
+        pid = str(session.profile_id or "").strip()
+        email = str(session.email or "").strip()
+        if not pid or pid.startswith("_") or "@" not in email:
+            continue
+        out.append(session)
+    out.sort(key=lambda s: str(s.display_name() or s.email or "").lower())
+    return out
+
+
+def _playwright_port_for_extension_email(email: str) -> int | None:
+    needle = str(email or "").strip().lower()
+    if not needle or "@" not in needle:
+        return None
+    chrome_dir = email_to_chrome_dir(email)
+    if chrome_dir:
+        return get_cdp_port_for_chrome_dir(chrome_dir)
+    from flow2api.config import CDP_BASE_PORT
+
+    sessions = _extension_sessions_with_email()
+    for idx, session in enumerate(sessions):
+        if str(session.email or "").strip().lower() == needle:
+            return CDP_BASE_PORT + idx
     return None
 
 
 def get_cdp_port_for_email(email: str) -> int | None:
     chrome_dir = email_to_chrome_dir(email)
-    if not chrome_dir:
-        return None
-    return get_cdp_port_for_chrome_dir(chrome_dir)
+    if chrome_dir:
+        return get_cdp_port_for_chrome_dir(chrome_dir)
+    return _playwright_port_for_extension_email(email)
 
 
 def get_playwright_flow_email() -> str:
@@ -466,16 +586,52 @@ def get_cdp_port_for_extension_profile(profile_id: str) -> int:
 
 def list_playwright_profile_map() -> list[dict[str, Any]]:
     port_map = chrome_cdp_port_map()
-    rows: list[dict[str, Any]] = []
+    rows_by_key: dict[str, dict[str, Any]] = {}
     for chrome_dir in sorted_chrome_profiles():
         email = read_chrome_profile_email(chrome_dir)
-        rows.append(
-            {
-                "chrome_dir": chrome_dir,
-                "email": email,
-                "cdp_port": port_map.get(chrome_dir),
-            }
+        key = email.strip().lower() if email and "@" in email else f"__chrome__{chrome_dir}"
+        rows_by_key[key] = {
+            "chrome_dir": chrome_dir,
+            "email": email,
+            "cdp_port": port_map.get(chrome_dir),
+            "source": "chromium",
+        }
+    for session in _extension_sessions_with_email():
+        email = str(session.email or "").strip()
+        key = email.lower()
+        chrome_dir = email_to_chrome_dir(email) or ""
+        port = get_cdp_port_for_email(email)
+        existing = rows_by_key.get(key)
+        if existing:
+            if not existing.get("email"):
+                existing["email"] = email
+            if not existing.get("chrome_dir") and chrome_dir:
+                existing["chrome_dir"] = chrome_dir
+            if existing.get("cdp_port") is None and port is not None:
+                existing["cdp_port"] = port
+            existing["source"] = "extension+chromium" if existing.get("source") == "chromium" else "extension"
+            existing["profile_id"] = session.profile_id
+            existing["connected"] = session.connected
+            existing["ready"] = session.is_ready()
+            continue
+        rows_by_key[key] = {
+            "chrome_dir": chrome_dir,
+            "email": email,
+            "cdp_port": port,
+            "source": "extension",
+            "profile_id": session.profile_id,
+            "connected": session.connected,
+            "ready": session.is_ready(),
+        }
+    rows = list(rows_by_key.values())
+    rows.sort(
+        key=lambda x: (
+            not x.get("ready"),
+            not x.get("connected"),
+            not x.get("email"),
+            x.get("email") or x.get("chrome_dir") or "",
         )
+    )
     return rows
 
 
@@ -514,9 +670,15 @@ def resolve_playwright_target(*, flow_email: str = "", flow_chrome_profile: str 
     profile = str(flow_chrome_profile or "").strip()
     if email:
         chrome_dir = email_to_chrome_dir(email)
-        if not chrome_dir:
-            raise ValueError(f"invalid_chrome_email:{email}")
-        return chrome_dir, get_cdp_port_for_chrome_dir(chrome_dir), email
+        if chrome_dir:
+            return chrome_dir, get_cdp_port_for_chrome_dir(chrome_dir), email
+        port = _playwright_port_for_extension_email(email)
+        if port is not None:
+            fallback = get_playwright_flow_chrome_profile()
+            known = set(list_chrome_profiles())
+            chrome_dir = fallback if not known or fallback in known else (sorted(known)[0] if known else "Default")
+            return chrome_dir, port, email
+        raise ValueError(f"invalid_chrome_email:{email}")
     if profile:
         known = set(list_chrome_profiles())
         if known and profile not in known:
