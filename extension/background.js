@@ -74,6 +74,309 @@ let _captchaChain = Promise.resolve();
 // Cached Flow projectId (in-memory) — informational / popup only.
 let _cachedProjectId = null;
 
+// Headers sniffed from real Flow page → aisandbox requests (per Chrome profile).
+const FLOW_DNR_HEADERS_RULE_ID = 9001;
+const FLOW_POST_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+const FLOW_DEFAULT_REFERER = 'https://labs.google/';
+const FLOW_DNR_HEADER_KEYS = [
+  ['user-agent', 'User-Agent'],
+  ['sec-ch-ua', 'sec-ch-ua'],
+  ['sec-ch-ua-mobile', 'sec-ch-ua-mobile'],
+  ['sec-ch-ua-platform', 'sec-ch-ua-platform'],
+  ['x-browser-channel', 'x-browser-channel'],
+  ['x-browser-copyright', 'x-browser-copyright'],
+  ['x-browser-validation', 'x-browser-validation'],
+  ['x-browser-year', 'x-browser-year'],
+  ['x-client-data', 'x-client-data'],
+];
+const FLOW_HEADER_SKIP = new Set([
+  'authorization',
+  'cookie',
+  'content-length',
+  'host',
+  'connection',
+  'transfer-encoding',
+  'upgrade-insecure-requests',
+]);
+const FLOW_API_HEADER_ALLOWLIST = new Set([
+  'accept',
+  'accept-language',
+  'user-agent',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-ch-ua-full-version-list',
+  'sec-ch-ua-arch',
+  'sec-ch-ua-bitness',
+  'sec-ch-ua-model',
+  'sec-ch-ua-platform-version',
+  'sec-fetch-site',
+  'sec-fetch-mode',
+  'sec-fetch-dest',
+  'sec-fetch-user',
+  'priority',
+  'x-browser-channel',
+  'x-browser-copyright',
+  'x-browser-validation',
+  'x-browser-year',
+  'x-client-data',
+  'x-goog-api-client',
+]);
+let _pageApiHeadersByTab = new Map();
+let _pageApiHeadersLatest = {};
+let _pageApiHeadersCapturedAt = 0;
+const FLOW_HEADERS_PROBE_WAIT_MS = 4000;
+const FLOW_HEADERS_MAX_AGE_MS = 30 * 60 * 1000;
+
+function headersArrayToMap(requestHeaders) {
+  const out = {};
+  for (const h of requestHeaders || []) {
+    const name = String(h?.name || '').trim();
+    if (!name) continue;
+    out[name.toLowerCase()] = String(h.value || '');
+  }
+  return out;
+}
+
+function isExtensionInitiatedRequest(details) {
+  return String(details?.initiator || '').startsWith('chrome-extension://');
+}
+
+function isFlowSandboxPageRequest(details) {
+  if (!String(details?.url || '').includes('aisandbox-pa.googleapis.com')) return false;
+  if (String(details?.method || '').toUpperCase() === 'OPTIONS') return false;
+  if (isExtensionInitiatedRequest(details)) return false;
+  if ((details.tabId ?? -1) < 0) return false;
+  const initiator = String(details.initiator || '');
+  if (initiator.includes('labs.google')) return true;
+  return details.type === 'xmlhttprequest' || details.type === 'other';
+}
+
+function mergeSniffedHeadersInto(target, mapped, method) {
+  let changed = false;
+  for (const [lower, value] of Object.entries(mapped)) {
+    if (!value || FLOW_HEADER_SKIP.has(lower)) continue;
+    if (lower === 'content-type') {
+      if (method !== 'POST' || !value.includes('text/plain')) continue;
+    }
+    if (
+      lower === 'referer'
+      || lower === 'origin'
+      || lower === 'content-type'
+      || FLOW_API_HEADER_ALLOWLIST.has(lower)
+    ) {
+      if (target[lower] !== value) {
+        target[lower] = value;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function hasUsableApiHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return false;
+  return !!(headers['user-agent'] || headers['sec-ch-ua'] || headers['x-browser-validation']);
+}
+
+function getPageApiHeadersForTab(tabId) {
+  if (tabId != null && tabId >= 0) {
+    const entry = _pageApiHeadersByTab.get(tabId);
+    if (entry?.headers && hasUsableApiHeaders(entry.headers)) {
+      return entry.headers;
+    }
+  }
+  return _pageApiHeadersLatest;
+}
+
+function noteCapturedPageApiHeaders(tabId, mapped, method) {
+  let changed = false;
+  if (tabId != null && tabId >= 0) {
+    const prev = _pageApiHeadersByTab.get(tabId)?.headers || {};
+    const next = { ...prev };
+    if (mergeSniffedHeadersInto(next, mapped, method)) {
+      _pageApiHeadersByTab.set(tabId, { headers: next, capturedAt: Date.now() });
+      changed = true;
+    }
+  }
+  if (mergeSniffedHeadersInto(_pageApiHeadersLatest, mapped, method)) {
+    changed = true;
+  }
+  if (!changed) return false;
+  _pageApiHeadersCapturedAt = Date.now();
+  const byTabObj = {};
+  for (const [id, entry] of _pageApiHeadersByTab.entries()) {
+    byTabObj[String(id)] = entry;
+  }
+  chrome.storage.session.set({
+    pageApiHeadersByTab: byTabObj,
+    pageApiHeadersLatest: _pageApiHeadersLatest,
+    pageApiHeadersCapturedAt: _pageApiHeadersCapturedAt,
+  }).catch(() => {});
+  syncFlowApiHeaderDnrRules(_pageApiHeadersLatest).catch(() => {});
+  return true;
+}
+
+function captureFlowApiHeadersFromDetails(details) {
+  if (!isFlowSandboxPageRequest(details)) return;
+  const mapped = headersArrayToMap(details.requestHeaders);
+  const method = String(details.method || '').toUpperCase();
+  noteCapturedPageApiHeaders(details.tabId, mapped, method);
+}
+
+async function loadCapturedFlowApiHeaders() {
+  try {
+    const data = await chrome.storage.session.get([
+      'pageApiHeadersByTab',
+      'pageApiHeadersLatest',
+      'pageApiHeadersCapturedAt',
+      'pageApiHeaders',
+    ]);
+    if (data.pageApiHeadersByTab && typeof data.pageApiHeadersByTab === 'object') {
+      _pageApiHeadersByTab = new Map();
+      for (const [id, entry] of Object.entries(data.pageApiHeadersByTab)) {
+        const tabId = Number(id);
+        if (!Number.isNaN(tabId) && entry?.headers) {
+          _pageApiHeadersByTab.set(tabId, entry);
+        }
+      }
+    }
+    if (data.pageApiHeadersLatest && typeof data.pageApiHeadersLatest === 'object') {
+      _pageApiHeadersLatest = data.pageApiHeadersLatest;
+    } else if (data.pageApiHeaders && typeof data.pageApiHeaders === 'object') {
+      _pageApiHeadersLatest = data.pageApiHeaders;
+    }
+    _pageApiHeadersCapturedAt = Number(data.pageApiHeadersCapturedAt) || 0;
+    await syncFlowApiHeaderDnrRules(_pageApiHeadersLatest);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function syncFlowApiHeaderDnrRules(headerSource = _pageApiHeadersLatest) {
+  const requestHeaders = [];
+  for (const [lower, canonical] of FLOW_DNR_HEADER_KEYS) {
+    const value = headerSource?.[lower];
+    if (value) {
+      requestHeaders.push({ header: canonical, operation: 'set', value });
+    }
+  }
+  if (!requestHeaders.length) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [FLOW_DNR_HEADERS_RULE_ID],
+    });
+    return;
+  }
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [FLOW_DNR_HEADERS_RULE_ID],
+    addRules: [{
+      id: FLOW_DNR_HEADERS_RULE_ID,
+      priority: 3,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders,
+      },
+      condition: {
+        urlFilter: '||aisandbox-pa.googleapis.com^',
+        resourceTypes: ['xmlhttprequest'],
+        initiatorDomains: [chrome.runtime.id],
+      },
+    }],
+  });
+}
+
+async function pickPrimaryFlowTab() {
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  return tabs.find((t) => !t.discarded && (t.id ?? -1) >= 0) || tabs[0] || null;
+}
+
+/** Sniff aisandbox headers from the same Flow tab used for reCAPTCHA (webRequest). */
+async function ensureFlowApiHeadersFromTab(tabId, reason = 'api_request') {
+  if (tabId == null || tabId < 0) return false;
+  const entry = _pageApiHeadersByTab.get(tabId);
+  const age = entry?.capturedAt ? Date.now() - entry.capturedAt : Infinity;
+  if (hasUsableApiHeaders(entry?.headers) && age < FLOW_HEADERS_MAX_AGE_MS) {
+    await syncFlowApiHeaderDnrRules(entry.headers);
+    return true;
+  }
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.discarded) {
+      await chrome.tabs.reload(tabId);
+      await sleep(2500);
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => fetch('https://aisandbox-pa.googleapis.com/v1/credits', { credentials: 'include' }),
+    });
+    console.log(`[Flow2API] Header sniff triggered on Flow tab ${tabId} (${reason})`);
+  } catch (e) {
+    console.warn('[Flow2API] Header sniff probe failed:', e?.message || e);
+    return hasUsableApiHeaders(entry?.headers);
+  }
+
+  const deadline = Date.now() + FLOW_HEADERS_PROBE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const fresh = _pageApiHeadersByTab.get(tabId);
+    if (hasUsableApiHeaders(fresh?.headers)) {
+      await syncFlowApiHeaderDnrRules(fresh.headers);
+      return true;
+    }
+    await sleep(200);
+  }
+  return hasUsableApiHeaders(entry?.headers) || hasUsableApiHeaders(_pageApiHeadersLatest);
+}
+
+function resolveFlowReferer(tab, headerSource) {
+  const tabUrl = String(tab?.url || '');
+  if (tabUrl.includes('labs.google') && tabUrl.includes('/project/')) {
+    return tabUrl;
+  }
+  if (headerSource?.referer) return headerSource.referer;
+  if (tabUrl.includes('labs.google')) return tabUrl;
+  return FLOW_DEFAULT_REFERER;
+}
+
+async function buildFlowApiFetchHeaders(agentHeaders = {}, tabHint = null) {
+  const tab = tabHint || await pickPrimaryFlowTab();
+  const headerSource = getPageApiHeadersForTab(tab?.id);
+  const out = {};
+
+  for (const [lower, value] of Object.entries(headerSource)) {
+    if (!value || FLOW_HEADER_SKIP.has(lower)) continue;
+    if (lower === 'content-type') continue;
+    out[lower] = value;
+  }
+
+  out.referer = resolveFlowReferer(tab, headerSource);
+  out.origin = headerSource.origin || 'https://labs.google';
+
+  if (!out.accept) out.accept = '*/*';
+  if (!out['accept-language']) out['accept-language'] = 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7';
+  if (!out.priority) out.priority = 'u=1, i';
+  if (!out['sec-fetch-site']) out['sec-fetch-site'] = 'cross-site';
+  if (!out['sec-fetch-mode']) out['sec-fetch-mode'] = 'cors';
+  if (!out['sec-fetch-dest']) out['sec-fetch-dest'] = 'empty';
+
+  for (const [k, v] of Object.entries(agentHeaders || {})) {
+    const lower = String(k || '').toLowerCase();
+    if (!v || FLOW_HEADER_SKIP.has(lower) || lower === 'content-type') continue;
+    out[lower] = String(v);
+  }
+
+  if (flowKey) out.authorization = `Bearer ${flowKey}`;
+  return out;
+}
+
+function applyFlowPostContentType(fetchHeaders, tabId = null) {
+  const headerSource = getPageApiHeadersForTab(tabId);
+  const captured = headerSource['content-type'];
+  fetchHeaders['content-type'] = (captured && captured.includes('text/plain'))
+    ? captured
+    : FLOW_POST_CONTENT_TYPE;
+}
+
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (!tab?.url) return;
   const onFlow = flowUrls.some((pattern) => {
@@ -166,7 +469,7 @@ async function init() {
   if (data.metrics)        Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
   profileId = data.profileId || await getOrCreateProfileId();
-  chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [9001] }).catch(() => {});
+  await loadCapturedFlowApiHeaders();
   connectToAgent();
   try {
     const flowTabs = await chrome.tabs.query({ url: flowUrls });
@@ -195,6 +498,7 @@ async function init() {
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (!details?.requestHeaders?.length) return;
+    captureFlowApiHeadersFromDetails(details);
 
     const authHeader = details.requestHeaders.find(
       (h) => h.name?.toLowerCase() === 'authorization',
@@ -594,11 +898,19 @@ async function handleApiRequest(msg) {
 
     // Step 2: Solve captcha if needed
     let captchaToken = null;
+    let headerTab = await pickPrimaryFlowTab();
     if (captchaAction) {
       const pidFromBody = extractProjectIdFromBody(body);
       if (pidFromBody) noteProjectId(pidFromBody);
       const captchaResult = await solveCaptcha(id, captchaAction);
       captchaToken = captchaResult?.token || null;
+      if (captchaResult?.tabId) {
+        try {
+          headerTab = await chrome.tabs.get(captchaResult.tabId);
+        } catch {
+          /* keep headerTab */
+        }
+      }
       if (captchaToken) {
         console.log(`[Flow2API] reCAPTCHA solved action=${captchaAction} len=${captchaToken.length}`);
       }
@@ -640,13 +952,17 @@ async function handleApiRequest(msg) {
       }
     }
 
-    const fetchHeaders = { ...(headers || {}), authorization: `Bearer ${flowKey}` };
+    if (headerTab?.id) {
+      await ensureFlowApiHeadersFromTab(headerTab.id, captchaAction ? 'post_captcha' : 'api_request');
+    }
+
+    const fetchHeaders = await buildFlowApiFetchHeaders(headers, headerTab);
     let requestBody;
     if (method !== 'GET') {
       const isPlainObject = finalBody && typeof finalBody === 'object' && !(finalBody instanceof FormData) && !(finalBody instanceof Blob) && !(finalBody instanceof ArrayBuffer);
       requestBody = isPlainObject ? JSON.stringify(finalBody) : finalBody;
-      if (isPlainObject && !Object.keys(fetchHeaders).some(k => k.toLowerCase() === 'content-type')) {
-        fetchHeaders['Content-Type'] = 'application/json';
+      if (isPlainObject) {
+        applyFlowPostContentType(fetchHeaders, headerTab?.id ?? null);
       }
     }
 

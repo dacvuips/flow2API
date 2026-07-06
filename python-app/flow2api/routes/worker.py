@@ -16,8 +16,10 @@ from flow2api.services.worker_settings import (
     set_profile_clear_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
+    set_profile_error_cooldown_sec,
     set_profile_media_allowed,
 )
+from flow2api.services.profile_job_guard import unblock_profile_trpc401
 from flow2api.worker.processor import get_worker
 
 router = APIRouter(prefix="/api/worker", tags=["worker"])
@@ -59,6 +61,11 @@ class ProfileMediaBody(BaseModel):
 class ProfileClearBody(BaseModel):
     enabled: bool = True
     interval_sec: int | None = Field(None, ge=1, le=3600)
+
+
+class ProfileJobGuardBody(BaseModel):
+    error_cooldown_sec: int | None = Field(None, ge=1, le=3600)
+    trpc401_unblock: bool | None = None
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -286,6 +293,44 @@ async def update_profile_clear(
         "profiles": pool.list_public(),
         "clear_result": clear_result,
         "message": f"Đã {state} Clear Data cho profile",
+        "ok": True,
+    }
+
+
+@router.put("/profiles/{profile_id}/job-guard")
+async def update_profile_job_guard(
+    profile_id: str,
+    body: ProfileJobGuardBody,
+    _=Depends(_auth_key_id),
+):
+    pool = get_extension_pool()
+    if not pool.get(profile_id):
+        raise HTTPException(404, "profile_not_found")
+    if body.error_cooldown_sec is None and body.trpc401_unblock is None:
+        raise HTTPException(400, "missing_job_guard_fields")
+    saved = get_worker_settings()
+    if body.error_cooldown_sec is not None:
+        try:
+            saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid_profile_id") from exc
+    if body.trpc401_unblock:
+        try:
+            unblock_profile_trpc401(profile_id)
+            saved = get_worker_settings()
+        except ValueError as exc:
+            raise HTTPException(400, "invalid_profile_id") from exc
+    events.publish(
+        "profile_job_guard_changed",
+        {
+            "profile_id": profile_id,
+            "error_cooldown_sec": body.error_cooldown_sec,
+            "trpc401_unblock": body.trpc401_unblock,
+        },
+    )
+    return {
+        **saved.to_dict(),
+        "profiles": pool.list_public(),
         "ok": True,
     }
 

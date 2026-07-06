@@ -1463,6 +1463,39 @@ def is_http_404_failure(
     return False
 
 
+def is_http_403_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """HTTP 403 / PERMISSION_DENIED — not reCAPTCHA (handled separately)."""
+    if is_recaptcha_error(str(msg or "")):
+        return False
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and int(raw.get("status") or 0) == 403:
+            return False if is_recaptcha_error(error_from_response(raw)) else True
+    text = str(msg or "").strip().upper()
+    if "HTTP_403" in text or "STATUS: 403" in text:
+        return True
+    if "PERMISSION_DENIED" in text and "TRPC_401" not in text:
+        return True
+    for entry in api_trace or []:
+        status = int(entry.get("http_status") or 0)
+        if status != 403:
+            continue
+        data = entry.get("data")
+        err_text = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                err_text = str(err.get("message") or err.get("status") or "")
+        if is_recaptcha_error(err_text):
+            continue
+        return True
+    return False
+
+
 def compact_api_response(resp: Any, label: str = "") -> dict:
     """Shrink extension callback for logs / task result (keep structure, drop huge blobs)."""
     if not isinstance(resp, dict):
@@ -1603,9 +1636,8 @@ def is_recaptcha_error(msg: str) -> bool:
 
 
 def recaptcha_retry_delay(attempt: int = 0) -> float:
-    """Chờ 10s trước mỗi lần retry reCAPTCHA (không retry ngay)."""
-    del attempt
-    return 10.0
+    """Backoff 10s, 20s, 30s… — attempt 0 → 10s, attempt 1 → 20s."""
+    return float((max(0, int(attempt)) + 1) * 10)
 
 
 def _recaptcha_retry_delay(attempt: int) -> float:

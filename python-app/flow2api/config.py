@@ -35,7 +35,10 @@ POLL_INTERVAL_S = float(os.environ.get("FLOW2API_POLL_INTERVAL", "2.5"))
 IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
 VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
-RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "10"))
+RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
+PROFILE_DEFAULT_ERROR_COOLDOWN_S = int(
+    os.environ.get("FLOW2API_PROFILE_DEFAULT_ERROR_COOLDOWN_S", "30")
+)
 HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
 HTTP_404_POLICY_ERROR_MSG = (
     "Vui lòng kiểm tra lại prompt và ảnh đã vi phạm chinh sách!"

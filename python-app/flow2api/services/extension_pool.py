@@ -458,6 +458,9 @@ class ExtensionSession:
         clear_interval = get_profile_clear_interval_sec(self.profile_id)
         cs = self.clear_state if isinstance(self.clear_state, dict) else {}
         clear_running = bool(cs.get("running"))
+        from flow2api.services.profile_job_guard import get_profile_job_pause_public
+
+        pause_info = get_profile_job_pause_public(self.profile_id)
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -486,6 +489,7 @@ class ExtensionSession:
             "clear_interval_sec": int(cs.get("intervalSec") or clear_interval),
             "clear_count": int(cs.get("clearCount") or 0),
             "clear_seconds_until_next": cs.get("secondsUntilNext"),
+            **pause_info,
             **proxy_fields,
         }
 
@@ -656,6 +660,7 @@ class ExtensionPool:
         request_type: str | None = None,
     ) -> list[ExtensionSession]:
         from flow2api.services.flow_client import profile_accepts_request_type
+        from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -666,6 +671,8 @@ class ExtensionPool:
             if exclude and session.profile_id in exclude:
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
+                continue
+            if is_profile_job_dispatch_blocked(session.profile_id):
                 continue
             if not profile_accepts_request_type(session.profile_id, request_type):
                 continue
@@ -730,6 +737,7 @@ class ExtensionPool:
             profile_accepts_request_type,
             profile_media_pick_priority,
         )
+        from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -741,6 +749,8 @@ class ExtensionPool:
             if session.profile_id.startswith("_"):
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
+                continue
+            if is_profile_job_dispatch_blocked(session.profile_id):
                 continue
             if not profile_accepts_request_type(session.profile_id, request_type):
                 continue

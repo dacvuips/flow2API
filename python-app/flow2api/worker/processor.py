@@ -29,6 +29,7 @@ from flow2api.services.flow_sdk import (
     format_api_error,
     is_extension_disconnect_error,
     is_extension_timeout_error,
+    is_http_403_failure,
     is_http_404_failure,
     is_invalid_argument_retry_failure,
     is_prominent_people_filter_failure,
@@ -37,6 +38,10 @@ from flow2api.services.flow_sdk import (
 )
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
+from flow2api.services.profile_job_guard import (
+    block_profile_trpc401,
+    start_profile_403_cooldown,
+)
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.result_media import prepare_params_for_worker_requeue
@@ -794,19 +799,50 @@ class WorkerController:
                     str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                 )
                 return
-            trpc_401_retry = int(retry_params.get("trpc_401_retry_count") or 0)
-            if is_trpc_401_failure(exc, msg, api_trace) and trpc_401_retry < RECAPTCHA_RETRY_MAX:
-                delay_s = flow_sdk.recaptcha_retry_delay(trpc_401_retry)
-                retry_params["trpc_401_retry_count"] = trpc_401_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
+            if is_trpc_401_failure(exc, msg, api_trace):
+                failed_profile = str(retry_params.get("profile_id") or "").strip()
+                if failed_profile:
+                    block_profile_trpc401(failed_profile)
+                retry_params.pop("trpc_401_retry_count", None)
                 retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                append_request_log(
+                    rid,
+                    "worker",
+                    (
+                        f"TRPC_401 — khóa profile {failed_profile[:12] or '?'} "
+                        f"→ chuyển profile khác ngay"
+                    ),
+                    level="warn",
+                    profile_id=failed_profile or None,
+                )
                 logger.warning(
-                    "TRPC_401 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    trpc_401_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
+                    "TRPC_401 profile blocked rid=%s profile=%s → requeue",
                     rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    failed_profile[:12] or "-",
+                )
+                return
+            if is_http_403_failure(exc, msg, api_trace):
+                failed_profile = str(retry_params.get("profile_id") or "").strip()
+                cooldown_s = 0
+                if failed_profile:
+                    until = start_profile_403_cooldown(failed_profile)
+                    cooldown_s = max(0, int(until - time.time()))
+                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                append_request_log(
+                    rid,
+                    "worker",
+                    (
+                        f"HTTP 403 — ngưng nhận job profile {failed_profile[:12] or '?'} "
+                        f"{cooldown_s}s → chuyển profile khác ngay"
+                    ),
+                    level="warn",
+                    profile_id=failed_profile or None,
+                )
+                logger.warning(
+                    "HTTP 403 cooldown %ss rid=%s profile=%s → requeue",
+                    cooldown_s,
+                    rid[:8],
+                    failed_profile[:12] or "-",
                 )
                 return
             if isinstance(exc, FlowApiError):

@@ -28,6 +28,9 @@ class WorkerSettings:
     profile_video_allowed: list[str] = field(default_factory=list)
     profile_clear_disabled: list[str] = field(default_factory=list)
     profile_clear_interval: dict[str, int] = field(default_factory=dict)
+    profile_default_error_cooldown_sec: int = 30
+    profile_error_cooldown_sec: dict[str, int] = field(default_factory=dict)
+    profile_trpc401_blocked: list[str] = field(default_factory=list)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -70,6 +73,21 @@ class WorkerSettings:
                 if not pid or str(pid).startswith("_"):
                     continue
                 clear_interval[str(pid)] = max(1, min(3600, int(val or 5)))
+        default_cooldown = max(
+            1,
+            min(3600, int(self.profile_default_error_cooldown_sec or 30)),
+        )
+        error_cooldown: dict[str, int] = {}
+        if isinstance(self.profile_error_cooldown_sec, dict):
+            for pid, val in self.profile_error_cooldown_sec.items():
+                if not pid or str(pid).startswith("_"):
+                    continue
+                error_cooldown[str(pid)] = max(1, min(3600, int(val or default_cooldown)))
+        trpc_blocked: list[str] = []
+        if isinstance(self.profile_trpc401_blocked, list):
+            for pid in self.profile_trpc401_blocked:
+                if pid and not str(pid).startswith("_"):
+                    trpc_blocked.append(str(pid))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -81,6 +99,9 @@ class WorkerSettings:
             profile_video_allowed=sorted(set(video_allowed)),
             profile_clear_disabled=sorted(set(clear_disabled)),
             profile_clear_interval=clear_interval,
+            profile_default_error_cooldown_sec=default_cooldown,
+            profile_error_cooldown_sec=error_cooldown,
+            profile_trpc401_blocked=sorted(set(trpc_blocked)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,6 +117,9 @@ class WorkerSettings:
             "profile_video_allowed": list(n.profile_video_allowed),
             "profile_clear_disabled": list(n.profile_clear_disabled),
             "profile_clear_interval": dict(n.profile_clear_interval),
+            "profile_default_error_cooldown_sec": n.profile_default_error_cooldown_sec,
+            "profile_error_cooldown_sec": dict(n.profile_error_cooldown_sec),
+            "profile_trpc401_blocked": list(n.profile_trpc401_blocked),
         }
 
 
@@ -147,6 +171,12 @@ def _load_file() -> WorkerSettings | None:
     clear_interval = raw.get("profile_clear_interval") or {}
     if not isinstance(clear_interval, dict):
         clear_interval = {}
+    error_cooldown = raw.get("profile_error_cooldown_sec") or {}
+    if not isinstance(error_cooldown, dict):
+        error_cooldown = {}
+    trpc_blocked = raw.get("profile_trpc401_blocked") or []
+    if not isinstance(trpc_blocked, list):
+        trpc_blocked = []
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
@@ -158,6 +188,11 @@ def _load_file() -> WorkerSettings | None:
         profile_video_allowed=[str(x) for x in video_allowed],
         profile_clear_disabled=[str(x) for x in clear_disabled],
         profile_clear_interval={str(k): int(v) for k, v in clear_interval.items()},
+        profile_default_error_cooldown_sec=int(
+            raw.get("profile_default_error_cooldown_sec", 30)
+        ),
+        profile_error_cooldown_sec={str(k): int(v) for k, v in error_cooldown.items()},
+        profile_trpc401_blocked=[str(x) for x in trpc_blocked],
     ).normalized()
 
 
@@ -261,6 +296,55 @@ def set_profile_credit_allowed(profile_id: str, allowed: bool) -> WorkerSettings
     return save_worker_settings(profile_credit_allowed=allowed_ids)
 
 
+def get_profile_error_cooldown_sec(profile_id: str) -> int:
+    from flow2api.config import PROFILE_DEFAULT_ERROR_COOLDOWN_S
+
+    pid = str(profile_id or "").strip()
+    settings = get_worker_settings()
+    default = max(
+        1,
+        min(3600, int(settings.profile_default_error_cooldown_sec or PROFILE_DEFAULT_ERROR_COOLDOWN_S)),
+    )
+    if pid in settings.profile_error_cooldown_sec:
+        return max(1, min(3600, int(settings.profile_error_cooldown_sec[pid])))
+    return default
+
+
+def set_profile_error_cooldown_sec(profile_id: str, cooldown_sec: int) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    return save_worker_settings(
+        profile_error_cooldown_sec={pid: max(1, min(3600, int(cooldown_sec)))}
+    )
+
+
+def is_profile_trpc401_blocked(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_trpc401_blocked
+
+
+def block_profile_trpc401(profile_id: str) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    blocked = [x for x in current.profile_trpc401_blocked if x != pid]
+    blocked.append(pid)
+    return save_worker_settings(profile_trpc401_blocked=blocked)
+
+
+def unblock_profile_trpc401(profile_id: str) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    blocked = [x for x in current.profile_trpc401_blocked if x != pid]
+    return save_worker_settings(profile_trpc401_blocked=blocked)
+
+
 def save_worker_settings(**fields: Any) -> WorkerSettings:
     with _LOCK:
         current = _load_file() or _defaults_from_env()
@@ -332,6 +416,31 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                 else:
                     merged_clear[str(pid)] = int(val)
             data["profile_clear_interval"] = merged_clear
+        if (
+            "profile_default_error_cooldown_sec" in fields
+            and fields["profile_default_error_cooldown_sec"] is not None
+        ):
+            data["profile_default_error_cooldown_sec"] = int(
+                fields["profile_default_error_cooldown_sec"]
+            )
+        if "profile_error_cooldown_sec" in fields and isinstance(
+            fields["profile_error_cooldown_sec"], dict
+        ):
+            merged_cd = dict(data.get("profile_error_cooldown_sec") or {})
+            for pid, val in fields["profile_error_cooldown_sec"].items():
+                if val is None:
+                    merged_cd.pop(str(pid), None)
+                else:
+                    merged_cd[str(pid)] = int(val)
+            data["profile_error_cooldown_sec"] = merged_cd
+        if "profile_trpc401_blocked" in fields:
+            raw_blocked = fields["profile_trpc401_blocked"]
+            if isinstance(raw_blocked, list):
+                data["profile_trpc401_blocked"] = [
+                    str(x)
+                    for x in raw_blocked
+                    if x and not str(x).startswith("_")
+                ]
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)
 
@@ -390,6 +499,8 @@ def all_known_profile_ids() -> list[str]:
     ids.update(settings.profile_clear_disabled)
     ids.update(settings.profile_clear_interval.keys())
     ids.update(settings.profile_credit_allowed)
+    ids.update(settings.profile_error_cooldown_sec.keys())
+    ids.update(settings.profile_trpc401_blocked)
     try:
         from flow2api.services.extension_pool import get_extension_pool
 
