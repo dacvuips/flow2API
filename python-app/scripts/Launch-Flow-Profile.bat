@@ -2,11 +2,17 @@
 setlocal
 title Flow2API — Launch Flow Profile
 
-set "CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-if not exist "%CHROME_PATH%" (
-  echo Chrome not found
+set "CHROME_PATH="
+if defined FLOW2API_CHROME_PATH set "CHROME_PATH=%FLOW2API_CHROME_PATH%"
+if not defined CHROME_PATH if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files\Chromium\Application\chrome.exe" set "CHROME_PATH=C:\Program Files\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files (x86)\Chromium\Application\chrome.exe" set "CHROME_PATH=C:\Program Files (x86)\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Chromium\Application\chrome.exe" set "CHROME_PATH=%LOCALAPPDATA%\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Chromium\Application\chromium.exe" set "CHROME_PATH=%LOCALAPPDATA%\Chromium\Application\chromium.exe"
+if not defined CHROME_PATH (
+  echo Chrome/Chromium not found. Set FLOW2API_CHROME_PATH=duong dan chrome.exe
   exit /b 1
 )
 

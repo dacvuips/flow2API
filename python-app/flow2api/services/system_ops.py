@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from flow2api.config import APP_ROOT, CDP_USER_DATA_DIR, CHROME_CDP_START_MINIMIZED, STORAGE_DIR
+from flow2api.config import APP_ROOT, CDP_USER_DATA_DIR, CHROME_CDP_START_MINIMIZED, CHROME_EXECUTABLE, CHROME_USER_DATA_DIR, STORAGE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -155,17 +155,75 @@ def _chrome_windows_start_cmd() -> str:
     return "start /min" if CHROME_CDP_START_MINIMIZED else "start"
 
 
-def _chrome_paths() -> list[Path]:
-    candidates = [
+def _chrome_exe_candidates() -> list[Path]:
+    if CHROME_EXECUTABLE:
+        return [Path(CHROME_EXECUTABLE)]
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    return [
         Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        local / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(r"C:\Program Files\Chromium\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Chromium\Application\chrome.exe"),
+        local / "Chromium" / "Application" / "chrome.exe",
+        local / "Chromium" / "Application" / "chromium.exe",
     ]
-    return [p for p in candidates if p.is_file()]
+
+
+def _resolve_chrome_exe() -> Path | None:
+    for candidate in _chrome_exe_candidates():
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _chrome_paths() -> list[Path]:
+    resolved = _resolve_chrome_exe()
+    return [resolved] if resolved else []
 
 
 def _user_data_dir() -> Path:
-    return Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+    if CHROME_USER_DATA_DIR:
+        return Path(CHROME_USER_DATA_DIR)
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    exe = _resolve_chrome_exe()
+    if exe:
+        exe_key = str(exe).lower()
+        if "chromium" in exe_key:
+            chromium_ud = local / "Chromium" / "User Data"
+            if chromium_ud.is_dir() or not (local / "Google" / "Chrome" / "User Data").is_dir():
+                return chromium_ud
+        portable_ud = exe.parent.parent / "User Data"
+        if portable_ud.is_dir():
+            return portable_ud
+        chrome_ud = local / "Google" / "Chrome" / "User Data"
+        if chrome_ud.is_dir():
+            return chrome_ud
+    for candidate in (
+        local / "Chromium" / "User Data",
+        local / "Google" / "Chrome" / "User Data",
+    ):
+        if candidate.is_dir():
+            return candidate
+    if exe and "chromium" in str(exe).lower():
+        return local / "Chromium" / "User Data"
+    return local / "Google" / "Chrome" / "User Data"
+
+
+def _bat_chrome_path_resolve_block() -> str:
+    return r'''set "CHROME_PATH="
+if defined FLOW2API_CHROME_PATH set "CHROME_PATH=%FLOW2API_CHROME_PATH%"
+if not defined CHROME_PATH if exist "C:\Program Files\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe" set "CHROME_PATH=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files\Chromium\Application\chrome.exe" set "CHROME_PATH=C:\Program Files\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "C:\Program Files (x86)\Chromium\Application\chrome.exe" set "CHROME_PATH=C:\Program Files (x86)\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Chromium\Application\chrome.exe" set "CHROME_PATH=%LOCALAPPDATA%\Chromium\Application\chrome.exe"
+if not defined CHROME_PATH if exist "%LOCALAPPDATA%\Chromium\Application\chromium.exe" set "CHROME_PATH=%LOCALAPPDATA%\Chromium\Application\chromium.exe"
+if not defined CHROME_PATH (
+  echo Chrome/Chromium not found. Set FLOW2API_CHROME_PATH=duong dan chrome.exe
+  exit /b 1
+)'''
 
 
 def _cdp_user_data_dir() -> Path:
@@ -209,6 +267,18 @@ def _cdp_profile_ready(chrome_dir: str) -> bool:
     )
 
 
+def _bootstrap_empty_cdp_profile(dst_root: Path, chrome_dir: str) -> None:
+    """Tạo profile CDP trống khi Chromium/Chrome desktop chưa có profile nguồn."""
+    prof = dst_root / chrome_dir
+    prof.mkdir(parents=True, exist_ok=True)
+    prefs = prof / "Preferences"
+    if not prefs.is_file():
+        prefs.write_text(json.dumps({"profile": {"name": chrome_dir}}), encoding="utf-8")
+    local_state = dst_root / "Local State"
+    if not local_state.is_file():
+        local_state.write_text("{}", encoding="utf-8")
+
+
 def sync_chrome_profile_for_cdp(chrome_dir: str, *, force: bool = False) -> Path:
     """
     Đồng bộ profile Chrome sang thư mục user-data CDP riêng.
@@ -229,7 +299,14 @@ def sync_chrome_profile_for_cdp(chrome_dir: str, *, force: bool = False) -> Path
     src_root = _user_data_dir()
     src_prof = src_root / chrome_dir
     if not (src_prof / "Preferences").is_file():
-        raise RuntimeError(f"profile_not_found:{chrome_dir}")
+        logger.warning(
+            "Profile nguon %s khong co tai %s — tao profile CDP moi (dang nhap lan dau trong Chrome CDP)",
+            chrome_dir,
+            src_prof,
+        )
+        dst_root.mkdir(parents=True, exist_ok=True)
+        _bootstrap_empty_cdp_profile(dst_root, chrome_dir)
+        return dst_root
 
     dst_root.mkdir(parents=True, exist_ok=True)
     dst_ls = dst_root / "Local State"
@@ -530,13 +607,7 @@ def ensure_flow_launch_script() -> Path:
 setlocal
 title Flow2API — Launch Flow Profile
 
-set "CHROME_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" (
-  echo Chrome not found
-  exit /b 1
-)
+{_bat_chrome_path_resolve_block()}
 
 set "USER_DATA={cdp_user_data}"
 set "FLOW_URL={flow_url}"
@@ -788,7 +859,7 @@ def launch_flow_chrome_profile(
             "message": f"Không tìm thấy Chrome profile «{profile}»",
         }
     if not _chrome_paths():
-        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy Chrome/Chromium (chrome.exe)"}
 
     cfg = load_config()
     flow_url = str(cfg.get("flow_url") or _FLOW_URL_DEFAULT)
@@ -877,20 +948,15 @@ def ensure_launch_script() -> Path:
 
     flow_profile = get_playwright_flow_chrome_profile().replace('"', "")
     flow_cdp = get_playwright_flow_cdp_port()
+    chrome_user_data = str(_user_data_dir()).replace('"', "")
     bat = _launch_bat_path()
     content = f"""@echo off
 setlocal enabledelayedexpansion
 title Flow2API — Launch Chrome Profiles
 
-set "CHROME_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" (
-  echo Chrome not found
-  exit /b 1
-)
+{_bat_chrome_path_resolve_block()}
 
-set "USER_DATA=%LOCALAPPDATA%\\Google\\Chrome\\User Data"
+set "USER_DATA={chrome_user_data}"
 set "FLOW_URL={flow_url}"
 set "FLOW_PROFILE={flow_profile}"
 set "FLOW_CDP={flow_cdp}"
@@ -940,7 +1006,7 @@ def launch_all_profiles() -> dict[str, Any]:
     if not profiles:
         return {"ok": False, "error": "no_chrome_profiles", "message": "Không tìm thấy Chrome profile nào"}
     if not _chrome_paths():
-        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy Chrome/Chromium (chrome.exe)"}
     subprocess.Popen(
         ["cmd", "/c", str(bat)],
         cwd=str(_SCRIPTS_DIR),

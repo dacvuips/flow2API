@@ -258,6 +258,9 @@ CDP_PROBE_HOSTS = tuple(
 CDP_USER_DATA_DIR = Path(
     os.environ.get("FLOW2API_CDP_USER_DATA_DIR", str(STORAGE_DIR / "chrome-cdp-user-data"))
 )
+# Chrome hoặc Chromium (máy mới thường dùng Chromium).
+CHROME_EXECUTABLE = os.environ.get("FLOW2API_CHROME_PATH", "").strip()
+CHROME_USER_DATA_DIR = os.environ.get("FLOW2API_CHROME_USER_DATA_DIR", "").strip()
 # Mở Chrome CDP thu nhỏ (taskbar) — Playwright vẫn điều khiển qua CDP, không cần cửa sổ DevTools.
 CHROME_CDP_START_MINIMIZED = os.environ.get("FLOW2API_CHROME_START_MINIMIZED", "1").strip().lower() in (
     "1",
