@@ -1,4 +1,4 @@
-"""Profile job dispatch guard — TRPC_401 lock + HTTP 403 cooldown."""
+"""Profile job dispatch guard — HTTP 403 cooldown."""
 from __future__ import annotations
 
 import threading
@@ -13,38 +13,6 @@ _profile_403_cooldown_until: dict[str, float] = {}
 
 def _pid(profile_id: str) -> str:
     return str(profile_id or "").strip()
-
-
-def is_profile_trpc401_blocked(profile_id: str) -> bool:
-    from flow2api.services.worker_settings import is_profile_trpc401_blocked as _blocked
-
-    return _blocked(_pid(profile_id))
-
-
-def block_profile_trpc401(profile_id: str) -> None:
-    from flow2api.services.worker_settings import block_profile_trpc401 as _block
-
-    pid = _pid(profile_id)
-    if not pid or pid.startswith("_"):
-        return
-    _block(pid)
-    events.publish(
-        "profile_job_guard_changed",
-        {"profile_id": pid, "reason": "trpc_401", "blocked": True},
-    )
-
-
-def unblock_profile_trpc401(profile_id: str) -> None:
-    from flow2api.services.worker_settings import unblock_profile_trpc401 as _unblock
-
-    pid = _pid(profile_id)
-    if not pid:
-        return
-    _unblock(pid)
-    events.publish(
-        "profile_job_guard_changed",
-        {"profile_id": pid, "reason": "trpc_401", "blocked": False},
-    )
 
 
 def get_profile_error_cooldown_sec(profile_id: str) -> int:
@@ -92,25 +60,19 @@ def is_profile_in_403_cooldown(profile_id: str) -> bool:
 
 
 def is_profile_job_dispatch_blocked(profile_id: str) -> bool:
-    """True when profile must not receive new jobs (TRPC_401 lock or 403 cooldown)."""
+    """True when profile must not receive new jobs (403 cooldown)."""
     pid = _pid(profile_id)
     if not pid or pid.startswith("_"):
-        return True
-    if is_profile_trpc401_blocked(pid):
         return True
     return is_profile_in_403_cooldown(pid)
 
 
+def _cooldown_min_from_sec(sec: int) -> int:
+    return max(1, min(60, int(round(max(60, int(sec or 60)) / 60))))
+
+
 def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
     pid = _pid(profile_id)
-    if is_profile_trpc401_blocked(pid):
-        return {
-            "job_paused": True,
-            "job_pause_reason": "trpc_401",
-            "job_pause_until": None,
-            "job_pause_remaining_s": None,
-            "profile_error_cooldown_sec": get_profile_error_cooldown_sec(pid),
-        }
     remaining = get_403_cooldown_remaining(pid)
     if remaining > 0:
         with _LOCK:
@@ -120,12 +82,19 @@ def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
             "job_pause_reason": "http_403",
             "job_pause_until": until,
             "job_pause_remaining_s": remaining,
+            "job_pause_remaining_min": max(1, int((remaining + 59) / 60)),
             "profile_error_cooldown_sec": get_profile_error_cooldown_sec(pid),
+            "profile_error_cooldown_min": _cooldown_min_from_sec(
+                get_profile_error_cooldown_sec(pid)
+            ),
         }
+    cd_sec = get_profile_error_cooldown_sec(pid)
     return {
         "job_paused": False,
         "job_pause_reason": None,
         "job_pause_until": None,
         "job_pause_remaining_s": None,
-        "profile_error_cooldown_sec": get_profile_error_cooldown_sec(pid),
+        "job_pause_remaining_min": None,
+        "profile_error_cooldown_sec": cd_sec,
+        "profile_error_cooldown_min": _cooldown_min_from_sec(cd_sec),
     }

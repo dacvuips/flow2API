@@ -19,7 +19,6 @@ from flow2api.services.worker_settings import (
     set_profile_error_cooldown_sec,
     set_profile_media_allowed,
 )
-from flow2api.services.profile_job_guard import unblock_profile_trpc401
 from flow2api.worker.processor import get_worker
 
 router = APIRouter(prefix="/api/worker", tags=["worker"])
@@ -64,8 +63,7 @@ class ProfileClearBody(BaseModel):
 
 
 class ProfileJobGuardBody(BaseModel):
-    error_cooldown_sec: int | None = Field(None, ge=1, le=3600)
-    trpc401_unblock: bool | None = None
+    error_cooldown_sec: int | None = Field(None, ge=60, le=3600)
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -306,26 +304,18 @@ async def update_profile_job_guard(
     pool = get_extension_pool()
     if not pool.get(profile_id):
         raise HTTPException(404, "profile_not_found")
-    if body.error_cooldown_sec is None and body.trpc401_unblock is None:
+    if body.error_cooldown_sec is None:
         raise HTTPException(400, "missing_job_guard_fields")
     saved = get_worker_settings()
-    if body.error_cooldown_sec is not None:
-        try:
-            saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
-        except ValueError as exc:
-            raise HTTPException(400, "invalid_profile_id") from exc
-    if body.trpc401_unblock:
-        try:
-            unblock_profile_trpc401(profile_id)
-            saved = get_worker_settings()
-        except ValueError as exc:
-            raise HTTPException(400, "invalid_profile_id") from exc
+    try:
+        saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid_profile_id") from exc
     events.publish(
         "profile_job_guard_changed",
         {
             "profile_id": profile_id,
             "error_cooldown_sec": body.error_cooldown_sec,
-            "trpc401_unblock": body.trpc401_unblock,
         },
     )
     return {

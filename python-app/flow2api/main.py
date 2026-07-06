@@ -71,6 +71,7 @@ class _SuppressNoisyAccessLog(logging.Filter):
         "/api/worker/settings",
         "/api/settings",
         "/api/activity",
+        "/api/ext/callback",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
