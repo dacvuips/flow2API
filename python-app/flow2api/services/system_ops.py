@@ -828,6 +828,52 @@ def _clear_chrome_singleton_locks(user_data_root: Path | None = None) -> None:
                 logger.debug("clear singleton %s: %s", name, exc)
 
 
+def is_chrome_running_for_user_data(user_data: Path) -> bool:
+    ud = str(user_data.resolve()).lower()
+    for line in get_chrome_process_cmdlines():
+        if ud in line.lower():
+            return True
+    return False
+
+
+def close_chrome_for_user_data(user_data: Path) -> int:
+    """Đóng chrome.exe chỉ thuộc user-data-dir này — không đụng Chromium desktop/extension."""
+    if os.name != "nt":
+        return 0
+    ud = str(user_data.resolve())
+    esc = ud.replace("'", "''")
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{esc}*' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "@(Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{esc}*' }}).Count"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        tail = (result.stdout or "").strip().splitlines()
+        return int(tail[-1]) if tail and tail[-1].isdigit() else 0
+    except Exception as exc:
+        logger.debug("close_chrome_for_user_data: %s", exc)
+        return 0
+
+
+def ensure_chrome_for_user_data_closed(user_data: Path, *, max_wait_s: int = 15) -> bool:
+    deadline = time.time() + max(3, max_wait_s)
+    while time.time() < deadline:
+        if not is_chrome_running_for_user_data(user_data):
+            _clear_chrome_singleton_locks(user_data)
+            return True
+        close_chrome_for_user_data(user_data)
+        time.sleep(1.0)
+    return not is_chrome_running_for_user_data(user_data)
+
+
 def ensure_chrome_fully_closed(*, max_wait_s: int = 25) -> bool:
     """Đóng hết Chrome + xóa singleton lock — bắt buộc trước khi bật --remote-debugging-port."""
     deadline = time.time() + max(5, max_wait_s)
@@ -936,36 +982,34 @@ def diagnose_chrome_cdp(cdp_port: int) -> str:
     )
 
 
-def _launch_chrome_cdp_process(*, chrome_dir: str, cdp_port: int, flow_url: str) -> None:
+def _launch_chrome_cdp_process(
+    *,
+    chrome_dir: str,
+    cdp_port: int,
+    flow_url: str,
+    kill_chrome_first: bool = False,
+) -> None:
     paths = _chrome_paths()
     if not paths:
         raise RuntimeError("chrome_not_found")
     chrome = paths[0]
-
-    if is_chrome_running():
-        ensure_chrome_fully_closed(max_wait_s=20)
 
     user_data, _ = ensure_cdp_profile_ready(chrome_dir)
     prefs = user_data / chrome_dir / "Preferences"
     if not prefs.is_file():
         raise RuntimeError(f"profile_not_found:{chrome_dir}")
 
+    if chrome_has_cdp_flag(cdp_port):
+        logger.info("CDP port %s da mo — bo qua launch profile=%s", cdp_port, chrome_dir)
+        return
+
+    if kill_chrome_first:
+        ensure_chrome_for_user_data_closed(user_data)
+    elif is_chrome_running_for_user_data(user_data):
+        ensure_chrome_for_user_data_closed(user_data)
+
     _clear_chrome_singleton_locks(user_data)
     _prime_chrome_flow_startup(chrome_dir, flow_url, user_data_root=user_data)
-
-    # Windows: `start` + bat đáng tin cậy hơn Popen (tránh Chrome gắn instance không có CDP).
-    if os.name == "nt":
-        bat = ensure_flow_launch_script()
-        logger.info("Launch Chrome via bat profile=%s port=%s bat=%s", chrome_dir, cdp_port, bat)
-        subprocess.Popen(
-            ["cmd", "/c", str(bat)],
-            cwd=str(_SCRIPTS_DIR),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        time.sleep(4)
-        if chrome_has_cdp_flag(cdp_port):
-            return
-        logger.warning("Bat launch: Chrome chua co CDP flag — thu Popen truc tiep")
 
     args = [
         str(chrome),
@@ -975,7 +1019,12 @@ def _launch_chrome_cdp_process(*, chrome_dir: str, cdp_port: int, flow_url: str)
         *_chrome_cdp_shared_flags(),
         flow_url,
     ]
-    logger.info("Launch Chrome CDP direct profile=%s port=%s user_data=%s", chrome_dir, cdp_port, user_data)
+    logger.info(
+        "Launch Chrome CDP direct profile=%s port=%s user_data=%s",
+        chrome_dir,
+        cdp_port,
+        user_data,
+    )
     subprocess.Popen(args, cwd=str(_SCRIPTS_DIR), close_fds=True)
 
 
@@ -1033,19 +1082,24 @@ def launch_flow_chrome_profile(
                 "error": "chrome_still_running",
                 "message": "Không đóng hết Chrome — tắt thủ công rồi chạy lại launch-chrome-cdp.bat",
             }
-    elif is_chrome_running():
-        if not ensure_chrome_fully_closed():
-            return {
-                "ok": False,
-                "error": "chrome_still_running",
-                "message": (
-                    "Chrome đang chạy không có CDP — đóng hết Chrome "
-                    "(kể cả icon taskbar) rồi chạy lại launch-chrome-cdp.bat"
-                ),
-            }
+    elif chrome_has_cdp_flag(port):
+        return {
+            "ok": True,
+            "message": f"CDP port {port} đã mở cho {profile} ({email or '—'})",
+            "profile": profile,
+            "email": email,
+            "cdp_port": port,
+            "cdp_url": f"http://localhost:{port}/json/version",
+            "killed_chrome_first": False,
+        }
 
     try:
-        _launch_chrome_cdp_process(chrome_dir=profile, cdp_port=port, flow_url=flow_url)
+        _launch_chrome_cdp_process(
+            chrome_dir=profile,
+            cdp_port=port,
+            flow_url=flow_url,
+            kill_chrome_first=kill_chrome_first,
+        )
     except RuntimeError as exc:
         return {"ok": False, "error": "launch_failed", "message": str(exc)}
 
@@ -1092,7 +1146,7 @@ def launch_flow_chrome_profile(
 def launch_flow_chrome_for_extension(
     profile_id: str,
     *,
-    kill_chrome_first: bool = True,
+    kill_chrome_first: bool = False,
     wait_for_cdp: bool = False,
 ) -> dict[str, Any]:
     return launch_flow_chrome_profile(

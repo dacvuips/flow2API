@@ -204,14 +204,14 @@ async def _auto_launch_cdp_for_session(session: "PlaywrightProfileSession", port
         from flow2api.services.system_ops import launch_flow_chrome_for_extension
 
         logger.warning(
-            "CDP port %s chua mo — tu dong mo lai Chrome profile=%s (se dong Chrome cu truoc)",
+            "CDP port %s chua mo — tu dong mo Chrome CDP profile=%s (giu Chromium extension)",
             port,
             session.profile_id[:12],
         )
         result = await asyncio.to_thread(
             launch_flow_chrome_for_extension,
             session.profile_id,
-            kill_chrome_first=True,
+            kill_chrome_first=False,
             wait_for_cdp=True,
         )
         if not result.get("ok"):
@@ -408,6 +408,34 @@ class PlaywrightPool:
             chrome_dir or "?",
             port,
         )
+        if CDP_AUTO_LAUNCH:
+            asyncio.create_task(self._auto_launch_cdp_on_connect(pid, port))
+
+    async def _auto_launch_cdp_on_connect(self, profile_id: str, port: int) -> None:
+        if await probe_cdp_port(port, timeout=1.5):
+            return
+        async with _cdp_launch_lock:
+            if await probe_cdp_port(port, timeout=1.0):
+                return
+            from flow2api.services.system_ops import launch_flow_chrome_for_extension
+
+            logger.info(
+                "Extension ket noi — tu mo CDP port %s cho profile=%s",
+                port,
+                profile_id[:12],
+            )
+            result = await asyncio.to_thread(
+                launch_flow_chrome_for_extension,
+                profile_id,
+                kill_chrome_first=False,
+                wait_for_cdp=False,
+            )
+            if not result.get("ok"):
+                logger.warning(
+                    "Auto CDP on connect failed profile=%s: %s",
+                    profile_id[:12],
+                    result.get("message") or result,
+                )
 
     async def on_profile_disconnected(self, profile_id: str) -> None:
         pid = str(profile_id or "").strip()
