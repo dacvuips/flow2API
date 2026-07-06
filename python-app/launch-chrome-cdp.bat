@@ -50,7 +50,7 @@ if errorlevel 1 (
 
 echo [2/4] Kiem tra profile CDP (chi dong bo lan dau)...
 
-python -c "import os; from flow2api.services.system_ops import ensure_flow_launch_script, get_playwright_flow_chrome_profile, get_playwright_flow_cdp_port, ensure_cdp_profile_ready; force=os.environ.get('FLOW2API_CDP_FORCE_SYNC','').strip().lower() in ('1','true','yes','on'); p=get_playwright_flow_chrome_profile(); c=get_playwright_flow_cdp_port(); ud, synced=ensure_cdp_profile_ready(p, force=force); print(f'Profile: {p} @ CDP {c}'); print('Da dong bo profile (lan dau)' if synced else 'Dung profile CDP da co — giu session dang nhap'); print(ensure_flow_launch_script())"
+python -c "import os; from flow2api.services.system_ops import ensure_flow_launch_script, get_playwright_flow_chrome_profile, get_playwright_flow_cdp_port, ensure_cdp_profile_ready; force=os.environ.get('FLOW2API_CDP_FORCE_SYNC','').strip().lower() in ('1','true','yes','on'); p=get_playwright_flow_chrome_profile(); c=get_playwright_flow_cdp_port(); ud, synced=ensure_cdp_profile_ready(p, force=force); print(f'Profile: {p} @ CDP {c}'); print('Da dong bo profile (lan dau)' if synced else 'Dung profile CDP da co - giu session dang nhap'); print(ensure_flow_launch_script())"
 
 if errorlevel 1 exit /b 1
 

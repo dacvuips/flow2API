@@ -10,10 +10,10 @@ if not exist "%CHROME_PATH%" (
   exit /b 1
 )
 
-set "USER_DATA=D:\PhanMem\tool\Flow 2\Flow2API\python-app\storage\chrome-cdp-user-data"
+set "USER_DATA=D:\PhanMem\tool\Flow 2\flow2API\python-app\storage\chrome-cdp-user-data"
 set "FLOW_URL=https://labs.google/fx/vi/tools/flow"
-set "FLOW_PROFILE=Profile 21"
-set "FLOW_CDP=9248"
+set "FLOW_PROFILE=Default"
+set "FLOW_CDP=9236"
 
 if not exist "%USER_DATA%\%FLOW_PROFILE%\Preferences" (
   echo Profile %FLOW_PROFILE% not found in CDP user-data — chay launch-chrome-cdp.bat de dong bo

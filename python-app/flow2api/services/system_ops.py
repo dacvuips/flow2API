@@ -312,14 +312,34 @@ def chrome_cdp_port_map() -> dict[str, int]:
     return {name: CDP_BASE_PORT + idx for idx, name in enumerate(profiles)}
 
 
+def _playwright_cdp_port_fallback() -> int:
+    """Port CDP khi không map được profile Chrome (chưa cài / profile chưa có)."""
+    cfg = load_config()
+    try:
+        manual = int(cfg.get("playwright_flow_cdp_port") or 0)
+        if manual:
+            return max(1024, min(65535, manual))
+    except (TypeError, ValueError):
+        pass
+    env = str(os.environ.get("FLOW2API_PLAYWRIGHT_FLOW_CDP_PORT", "") or "").strip()
+    if env:
+        try:
+            return max(1024, min(65535, int(env)))
+        except ValueError:
+            pass
+    from flow2api.config import CDP_BASE_PORT
+
+    return CDP_BASE_PORT
+
+
 def get_cdp_port_for_chrome_dir(chrome_dir: str) -> int:
     chrome_dir = str(chrome_dir or "").strip()
     if not chrome_dir:
-        return get_playwright_flow_cdp_port()
+        return _playwright_cdp_port_fallback()
     mapped = chrome_cdp_port_map().get(chrome_dir)
     if mapped is not None:
         return mapped
-    return get_playwright_flow_cdp_port()
+    return _playwright_cdp_port_fallback()
 
 
 def email_to_chrome_dir(email: str) -> str | None:
@@ -456,20 +476,10 @@ def get_playwright_flow_cdp_port() -> int:
             return auto
     saved_profile = str(cfg.get("playwright_flow_chrome_profile") or "").strip()
     if saved_profile:
-        return get_cdp_port_for_chrome_dir(saved_profile)
-    try:
-        manual = int(cfg.get("playwright_flow_cdp_port") or 0)
-        if manual:
-            return max(1024, min(65535, manual))
-    except (TypeError, ValueError):
-        pass
-    env = str(os.environ.get("FLOW2API_PLAYWRIGHT_FLOW_CDP_PORT", "") or "").strip()
-    if env:
-        try:
-            return max(1024, min(65535, int(env)))
-        except ValueError:
-            pass
-    return 9236
+        known = set(list_chrome_profiles())
+        if known and saved_profile in known:
+            return get_cdp_port_for_chrome_dir(saved_profile)
+    return _playwright_cdp_port_fallback()
 
 
 def save_playwright_settings(
