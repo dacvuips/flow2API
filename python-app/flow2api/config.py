@@ -71,6 +71,15 @@ POST_CLEAR_403_RETRY_MAX = int(os.environ.get("FLOW2API_POST_CLEAR_403_RETRY_MAX
 POST_CLEAR_403_DELAY_S = int(os.environ.get("FLOW2API_POST_CLEAR_403_DELAY_S", "30"))
 POST_SUCCESS_CLEAR_DELAY_S = int(os.environ.get("FLOW2API_POST_SUCCESS_CLEAR_DELAY_S", "20"))
 POST_CLEAR_COOLDOWN_S = int(os.environ.get("FLOW2API_POST_CLEAR_COOLDOWN_S", "10"))
+# Sau clear data: chờ N giây rồi giả lập lăn chuột (2 xuống + 2 lên) trên tab Flow.
+POST_CLEAR_SCROLL_ENABLED = os.environ.get("FLOW2API_POST_CLEAR_SCROLL_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+POST_CLEAR_SCROLL_DELAY_S = int(os.environ.get("FLOW2API_POST_CLEAR_SCROLL_DELAY_S", "10"))
+POST_CLEAR_SCROLL_STEPS = int(os.environ.get("FLOW2API_POST_CLEAR_SCROLL_STEPS", "2"))
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
 HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))

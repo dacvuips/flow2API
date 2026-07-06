@@ -4,6 +4,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# Playwright UI luôn chọn model này — bỏ qua video_quality từ client (omni/fast/quality/lite).
+PLAYWRIGHT_VIDEO_QUALITY = "lite_relaxed"
+PLAYWRIGHT_VIDEO_MODEL_LABEL = "Veo 3.1 - Lite [Lower Priority]"
+
 
 def normalize_video_quality_value(raw: Any) -> str:
     s = str(raw or "").strip()
@@ -23,6 +27,16 @@ def get_video_quality(params: dict[str, Any], default: str = "") -> str:
         if val is not None and str(val).strip():
             return normalize_video_quality_value(val)
     return default
+
+
+def coerce_playwright_video_quality(raw: Any = None) -> str:
+    """Chuẩn hóa model video trước Playwright — luôn Veo 3.1 Lite [Lower Priority]."""
+    return PLAYWRIGHT_VIDEO_QUALITY
+
+
+def playwright_video_quality_from_params(params: dict[str, Any] | None) -> str:
+    """Lấy video_quality từ request rồi ép về model Playwright."""
+    return coerce_playwright_video_quality(get_video_quality(params or {}, default=""))
 
 
 def resolve_variant_count(params: dict[str, Any] | None, default: int = 1) -> int:

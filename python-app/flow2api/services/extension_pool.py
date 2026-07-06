@@ -246,6 +246,15 @@ class ExtensionSession:
             params["intervalSec"] = max(1, min(3600, int(interval_sec)))
         if project_id:
             params["projectId"] = str(project_id).strip()
+        from flow2api.config import (
+            POST_CLEAR_SCROLL_DELAY_S,
+            POST_CLEAR_SCROLL_ENABLED,
+            POST_CLEAR_SCROLL_STEPS,
+        )
+
+        params["scrollEnabled"] = POST_CLEAR_SCROLL_ENABLED
+        params["scrollDelaySec"] = max(0, int(POST_CLEAR_SCROLL_DELAY_S))
+        params["scrollSteps"] = max(1, min(4, int(POST_CLEAR_SCROLL_STEPS)))
         resp = await self._send("clear_control", params, timeout=timeout)
         result = resp.get("result") if isinstance(resp.get("result"), dict) else None
         if not result and isinstance(resp.get("data"), dict):
@@ -724,9 +733,15 @@ class ExtensionPool:
     def has_available_profile(
         self,
         *,
-        credit_required: bool = False,
+        credit_required: bool | None = None,
         request_type: str | None = None,
     ) -> bool:
+        """Có profile rảnh — mặc định kiểm tra cả pool thường lẫn pool Credit (Omni Flash)."""
+        if credit_required is None:
+            return bool(
+                self._sessions_with_capacity(credit_required=False, request_type=request_type)
+                or self._sessions_with_capacity(credit_required=True, request_type=request_type)
+            )
         return bool(
             self._sessions_with_capacity(
                 credit_required=credit_required,

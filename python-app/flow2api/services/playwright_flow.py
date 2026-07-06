@@ -28,6 +28,11 @@ from flow2api.services import flow_sdk
 from flow2api.services.flow_sdk import UPLOAD_IMAGE_PATH
 from flow2api.services.playwright_pool import get_playwright_pool, is_playwright_enabled
 from flow2api.services.result_media import _decode_image_bytes
+from flow2api.services.request_params import (
+    PLAYWRIGHT_VIDEO_MODEL_LABEL,
+    PLAYWRIGHT_VIDEO_QUALITY,
+    coerce_playwright_video_quality,
+)
 from flow2api.services.system_ops import load_config
 
 logger = logging.getLogger(__name__)
@@ -170,6 +175,28 @@ async def _ui_pause(sec: float = 0.35, step: str = "") -> None:
     if step:
         logger.info("Playwright UI pause %.2fs — %s", sec, step)
     await asyncio.sleep(sec)
+
+
+async def simulate_wheel_after_clear(
+    page: Any,
+    *,
+    steps: int = 2,
+    step_px: int = 420,
+    pause_s: float = 0.38,
+) -> None:
+    """Giả lập lăn chuột sau clear data — 2 lần xuống + 2 lần lên (mặc định)."""
+    n = max(1, min(4, int(steps or 2)))
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    logger.info("Playwright UI: lăn chuột sau clear — %sx xuống + %sx lên", n, n)
+    for _ in range(n):
+        await page.mouse.wheel(0, step_px)
+        await _ui_pause(pause_s, "wheel down sau clear")
+    for _ in range(n):
+        await page.mouse.wheel(0, -step_px)
+        await _ui_pause(pause_s, "wheel up sau clear")
 
 
 async def _ui_delay(step: str = "") -> float:
@@ -1832,7 +1859,28 @@ def _image_model_name_variants(model: str) -> list[str]:
     for label in _KNOWN_IMAGE_MODELS.values():
         if label == target or target in label or label in target:
             variants.add(label)
+    # UI Flow đôi khi viết liền "NanoBanana Pro"
+    for v in list(variants):
+        variants.add(v.replace("Nano Banana", "NanoBanana"))
+        variants.add(v.replace("NanoBanana", "Nano Banana"))
     return [v for v in variants if v]
+
+
+def _image_model_compact_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _normalize_label_text(text))
+
+
+def _image_model_labels_match(current: str, target: str) -> bool:
+    """So khớp chặt — tránh nhầm Nano Banana 2 với Nano Banana 2 Lite."""
+    if not str(current or "").strip() or not str(target or "").strip():
+        return False
+    cur_k = _image_model_compact_key(current)
+    tgt_k = _image_model_compact_key(target)
+    if cur_k and tgt_k and cur_k == tgt_k:
+        return True
+    if _label_fuzzy_matches(current, target):
+        return cur_k == tgt_k
+    return False
 
 
 def _video_model_name_variants(model: str) -> list[str]:
@@ -1843,8 +1891,34 @@ def _video_model_name_variants(model: str) -> list[str]:
         target,
         target.replace(" - Lite [Lower Priority]", " Lite [Lower Priority]"),
         target.replace(" Lite [Lower Priority]", " - Lite [Lower Priority]"),
+        "Veo3.1 - Lite [Lower Priority]",
+        "Veo 3.1 Lite [Lower Priority]",
+        "Veo3.1 Lite [Lower Priority]",
     }
     return [v for v in variants if v]
+
+
+def _playwright_forced_video_model_label() -> str:
+    return _KNOWN_VIDEO_MODELS[PLAYWRIGHT_VIDEO_QUALITY]
+
+
+def _playwright_forced_video_model_variants() -> list[str]:
+    return _video_model_name_variants(PLAYWRIGHT_VIDEO_QUALITY)
+
+
+def _compact_label_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _normalize_label_text(text))
+
+
+def _is_lite_lower_priority_label(text: str) -> bool:
+    """Khớp chip/dropdown Veo 3.1 Lite [Lower Priority] (kể cả Veo3.1 không dấu cách)."""
+    compact = _compact_label_key(text)
+    if not compact:
+        return False
+    has_lower = "lowerpriority" in compact or "lowpriority" in compact
+    if not has_lower:
+        return False
+    return "veo" in compact and "lite" in compact
 
 
 def _normalize_aspect_ratio(value: str) -> str:
@@ -4502,6 +4576,28 @@ async def _aspect_ratio_toolbar_locator(panel: Any) -> Any | None:
 async def _read_image_model_label(panel: Any) -> str:
     try:
         loc = panel.locator(
+            "button[aria-haspopup='listbox'], [role='combobox'], button, [role='button']"
+        ).filter(has_text=re.compile(r"nano\s*banana", re.I))
+        count = await loc.count()
+        for idx in range(count):
+            cand = loc.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "").strip()
+                if _UPLOAD_TEXT.search(txt):
+                    continue
+                if any(r in txt for r in _ASPECT_RATIOS) or _is_variant_count_label(txt):
+                    continue
+                low = txt.lower()
+                if "nano banana" in low.replace(" ", "") or "nano banana" in low:
+                    return txt.split("\n")[0].strip() or txt
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        loc = panel.locator(
             "button[aria-haspopup='listbox'], [role='combobox'], button, [role='button'], div"
         ).filter(has_text=_MODEL_CHIP_PATTERNS)
         count = await loc.count()
@@ -4535,13 +4631,22 @@ async def _is_image_model_selected(panel: Any, variants: list[str]) -> bool:
     if not current:
         return False
     for name in variants:
-        if _label_fuzzy_matches(current, name) or _label_fuzzy_matches(name, current):
+        if _image_model_labels_match(current, name):
             return True
     return False
 
 
-async def _open_model_dropdown_in_panel(panel: Any) -> bool:
+async def _is_target_image_model_selected(panel: Any, image_model: str) -> bool:
+    variants = _image_model_name_variants(image_model)
+    if not variants:
+        return False
+    return await _is_image_model_selected(panel, variants)
+
+
+async def _open_model_dropdown_in_panel(panel: Any, *, image_model: str = "") -> bool:
     """Bấm hàng chọn model (Nano Banana ...) trong panel settings."""
+    if image_model and await _is_target_image_model_selected(panel, image_model):
+        return False
     try:
         loc = panel.locator("button, [role='button']").filter(has_text=_MODEL_CHIP_PATTERNS)
         count = await loc.count()
@@ -4598,12 +4703,12 @@ async def _select_image_model(page: Any, panel: Any, image_model: str) -> bool:
     if not target:
         return False
 
-    if await _is_image_model_selected(panel, variants or [target]):
+    if await _is_image_model_selected(panel, variants):
         logger.info("Playwright UI: model image đã đúng %s — bỏ qua", target)
         return True
 
-    if not await _open_model_dropdown_in_panel(panel):
-        if await _is_image_model_selected(panel, variants or [target]):
+    if not await _open_model_dropdown_in_panel(panel, image_model=image_model):
+        if await _is_image_model_selected(panel, variants):
             logger.info("Playwright UI: model image khớp %s (không cần dropdown)", target)
             return True
         logger.warning("Playwright UI: không mở được dropdown model")
@@ -4628,6 +4733,23 @@ async def _select_image_model(page: Any, panel: Any, image_model: str) -> bool:
 
 
 async def _read_video_model_label(panel: Any) -> str:
+    try:
+        lp = panel.locator("button, [role='combobox'], [role='button'], div").filter(
+            has_text=re.compile(r"Lower\s*Priority", re.I)
+        )
+        count = await lp.count()
+        for idx in range(count):
+            cand = lp.nth(idx)
+            try:
+                if not await cand.is_visible():
+                    continue
+                txt = (await cand.inner_text() or "").strip()
+                if txt and _is_lite_lower_priority_label(txt):
+                    return txt
+            except Exception:
+                continue
+    except Exception:
+        pass
     try:
         loc = panel.locator(
             "button[aria-haspopup='listbox'], [role='combobox'], button, [role='button'], div"
@@ -4679,12 +4801,20 @@ async def _is_video_model_selected(panel: Any, variants: list[str]) -> bool:
             current = (await panel.inner_text() or "").strip()
         except Exception:
             current = ""
+    if _is_lite_lower_priority_label(current):
+        forced = _playwright_forced_video_model_variants()
+        if not variants or variants == forced or _playwright_forced_video_model_label() in variants:
+            return True
     if not current:
         return False
     for name in variants:
         if _label_fuzzy_matches(current, name) or _label_fuzzy_matches(name, current):
             return True
     return False
+
+
+async def _is_forced_video_model_selected(panel: Any) -> bool:
+    return await _is_video_model_selected(panel, _playwright_forced_video_model_variants())
 
 
 async def _open_video_model_dropdown_in_panel(panel: Any) -> bool:
@@ -4748,15 +4878,21 @@ async def _open_video_model_dropdown_in_panel(panel: Any) -> bool:
     return False
 
 
-async def _select_video_model(page: Any, panel: Any, video_quality: str) -> bool:
-    variants = _video_model_name_variants(video_quality)
-    target = variants[0] if variants else _normalize_video_model_name(video_quality)
-    if await _is_video_model_selected(panel, variants or [target]):
+async def _select_video_model(page: Any, panel: Any, video_quality: str = "") -> bool:
+    variants = _playwright_forced_video_model_variants()
+    target = _playwright_forced_video_model_label()
+    requested = str(video_quality or "").strip().lower()
+    if requested and requested not in ("", "lite_relaxed", PLAYWRIGHT_VIDEO_QUALITY):
+        logger.info(
+            "Playwright UI: bỏ qua video_quality=%s — luôn dùng %s",
+            video_quality,
+            target,
+        )
+    if await _is_forced_video_model_selected(panel):
         logger.info("Playwright UI: model video đã đúng %s — bỏ qua", target)
         return True
     if not await _open_video_model_dropdown_in_panel(panel):
-        # Dropdown không mở được nhưng label hiện tại có thể đã khớp
-        if await _is_video_model_selected(panel, variants or [target]):
+        if await _is_forced_video_model_selected(panel):
             logger.info("Playwright UI: model video khớp %s (không cần dropdown)", target)
             return True
         logger.warning("Playwright UI: không mở được dropdown model video")
@@ -4764,7 +4900,7 @@ async def _select_video_model(page: Any, panel: Any, video_quality: str) -> bool
     menu = await _model_dropdown_scope(page)
     if menu is None:
         return False
-    for name in variants or [target]:
+    for name in variants:
         if await _click_fuzzy_label(menu, name):
             await _ui_delay(f"sau chọn model video {name}")
             logger.info("Playwright UI: đã chọn model video %s", name)
@@ -4957,9 +5093,9 @@ async def configure_video_generation_ui(
     3) đóng panel khi xong.
     """
     target_ratio = _normalize_aspect_ratio(aspect_ratio)
-    target_model = _normalize_video_model_name(video_quality)
+    target_model = _playwright_forced_video_model_label()
     mode = "frame" if str(video_mode or "").strip().lower() == "frame" else "component"
-    logger.info("Playwright UI: cấu hình video — mode UI=%s", mode)
+    logger.info("Playwright UI: cấu hình video — mode UI=%s model=%s", mode, target_model)
 
     panel = await _open_settings_panel(page, generation_kind="video")
     if panel is None:
@@ -4988,7 +5124,7 @@ async def configure_video_generation_ui(
     )
     duration_ok = await _select_video_duration(panel, video_duration_s) if media_ready else False
     panel = await _refresh_settings_panel(page, panel) or panel
-    model_ok = await _select_video_model(page, panel, video_quality)
+    model_ok = await _select_video_model(page, panel, PLAYWRIGHT_VIDEO_QUALITY)
     await _close_floating_overlays(page, preserve_settings_panel=True)
     panel = await _refresh_settings_panel(page, panel) or panel
     mode_confirmed_in_panel = mode_ok
@@ -5753,6 +5889,16 @@ async def prepare_request_on_flow_ui(
     if not is_ui_automation_enabled():
         raise RuntimeError("ui_automation_disabled")
 
+    requested_vq = str(video_quality or "").strip()
+    video_quality = coerce_playwright_video_quality(video_quality)
+    if requested_vq and requested_vq.lower().replace("-", "_") != video_quality:
+        logger.info(
+            "Playwright UI: chuẩn hóa model video %s → %s (%s)",
+            requested_vq,
+            video_quality,
+            PLAYWRIGHT_VIDEO_MODEL_LABEL,
+        )
+
     pool = get_playwright_pool()
     session = await pool.get_session(profile_id)
 
@@ -5820,17 +5966,10 @@ async def prepare_request_on_flow_ui(
                 )
             await _ui_pause(0.4, "sau cấu hình image settings")
             return
-        vq = video_quality
-        if str(vq or "").strip().lower() != "lite_relaxed":
-            logger.info(
-                "Playwright UI: video model %s chưa ưu tiên, tạm ép về lite_relaxed",
-                vq,
-            )
-            vq = "lite_relaxed"
         video_settings_meta = await configure_video_generation_ui(
             page,
             aspect_ratio=aspect_ratio,
-            video_quality=vq,
+            video_quality=video_quality,
             video_mode=video_mode,
             video_duration_s=video_duration_s,
             variant_count=variant_count,

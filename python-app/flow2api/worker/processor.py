@@ -42,8 +42,10 @@ from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.request_params import (
+    PLAYWRIGHT_VIDEO_QUALITY,
     get_video_quality,
     normalize_request_params,
+    playwright_video_quality_from_params,
     resolve_variant_count,
 )
 from flow2api.services.result_media import prepare_params_for_worker_requeue
@@ -214,6 +216,16 @@ async def _run_flow_ui_prep(
         f"Playwright UI: upload ảnh qua UI ({len(image_base64s)}) + điền prompt…",
         level="info",
     )
+    requested_vq = get_video_quality(params, "lite_relaxed")
+    playwright_vq = playwright_video_quality_from_params(params)
+    if requested_vq and requested_vq != playwright_vq:
+        append_request_log(
+            rid,
+            "worker",
+            f"Playwright UI: đổi model video {requested_vq!r} → {playwright_vq!r} "
+            f"({PLAYWRIGHT_VIDEO_QUALITY})",
+            level="info",
+        )
     try:
         meta = await prepare_request_on_flow_ui(
             profile_id=profile_id,
@@ -224,7 +236,7 @@ async def _run_flow_ui_prep(
             image_base64s=image_base64s,
             aspect_ratio=str(params.get("aspect_ratio") or "16:9"),
             image_model=str(params.get("image_model") or "NANO_BANANA_PRO"),
-            video_quality=str(params.get("video_quality") or "lite_relaxed"),
+            video_quality=playwright_vq,
             video_mode=video_mode,
             video_duration_s=params.get("video_duration_s") or params.get("video_duration") or 8,
             variant_count=resolve_variant_count(params),

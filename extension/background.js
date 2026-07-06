@@ -373,7 +373,7 @@ function connectToAgent() {
             await loadClearState();
             result = { ok: true, state: getPublicClearState() };
           } else if (action === 'now') {
-            result = await performClearNow(msg.params?.projectId);
+            result = await performClearNow(msg.params?.projectId, msg.params || {});
           } else if (action === 'start' || action === 'stop') {
             result = { ok: true, state: getPublicClearState() };
           } else {
@@ -1018,7 +1018,53 @@ async function clearProjectSiteData(tabId, projectId, projectUrl) {
   return pageUrl;
 }
 
-async function performClearNow(projectId) {
+async function simulateFlowWheelScroll(tabId, { down = 2, up = 2, stepPx = 420, pauseMs = 380 } = {}) {
+  if (!tabId) return;
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (downN, upN, step, pause) => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const nudge = async (dy) => {
+        const cx = Math.floor(window.innerWidth / 2);
+        const cy = Math.floor(window.innerHeight / 2);
+        const target = document.elementFromPoint(cx, cy) || document.scrollingElement || document.body;
+        const opts = { deltaY: dy, deltaMode: 0, bubbles: true, cancelable: true, view: window };
+        if (target) target.dispatchEvent(new WheelEvent('wheel', opts));
+        window.dispatchEvent(new WheelEvent('wheel', opts));
+        window.scrollBy({ top: dy, left: 0, behavior: 'auto' });
+        if (target && typeof target.scrollBy === 'function') {
+          target.scrollBy({ top: dy, left: 0, behavior: 'auto' });
+        }
+      };
+      for (let i = 0; i < downN; i += 1) {
+        await nudge(step);
+        await sleep(pause);
+      }
+      for (let i = 0; i < upN; i += 1) {
+        await nudge(-step);
+        await sleep(pause);
+      }
+    },
+    args: [down, up, stepPx, pauseMs],
+  });
+}
+
+function scheduleWheelScrollAfterClear(tabId, opts = {}) {
+  const enabled = opts.scrollEnabled !== false && opts.scroll_enabled !== false;
+  if (!enabled || !tabId) return;
+  const delaySec = Math.max(0, Number(opts.scrollDelaySec ?? opts.scroll_delay_sec ?? 10));
+  const steps = Math.max(1, Math.min(4, Number(opts.scrollSteps ?? opts.scroll_steps ?? 2)));
+  setTimeout(() => {
+    chrome.tabs.get(tabId).then((tab) => {
+      if (!tab?.id || !isLabsGoogleTab(tab)) return;
+      return simulateFlowWheelScroll(tabId, { down: steps, up: steps });
+    }).catch((e) => {
+      console.warn('[Flow2API] wheel after clear failed:', e?.message || e);
+    });
+  }, delaySec * 1000);
+}
+
+async function performClearNow(projectId, opts = {}) {
   const pid = String(projectId || _cachedProjectId || '').trim();
   if (!pid) {
     return {
@@ -1066,6 +1112,7 @@ async function performClearNow(projectId) {
     const pageUrl = await clearProjectSiteData(tab.id, pid, projectUrl);
     clearState.clearCount = (clearState.clearCount || 0) + 1;
     await saveClearState();
+    scheduleWheelScrollAfterClear(tab.id, opts);
     return {
       ok: true,
       state: getPublicClearState(),

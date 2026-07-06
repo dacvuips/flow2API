@@ -123,9 +123,13 @@ def request_requires_credit_profile(
     request_type: str | None = None,
 ) -> bool:
     from flow2api.services import flow_sdk
+    from flow2api.services.playwright_flow import is_ui_automation_enabled
 
     rtype = str(request_type or "").lower()
     if rtype not in _OMNI_VIDEO_TYPES:
+        return False
+    # Playwright UI luôn chọn lite_relaxed — không cần pool Credit cho omni_flash.
+    if is_ui_automation_enabled():
         return False
     return flow_sdk.is_omni_flash(get_video_quality(params))
 
