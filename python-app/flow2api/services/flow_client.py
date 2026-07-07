@@ -147,14 +147,12 @@ def pick_profile_for_task(
         get_profile_max_concurrent,
         is_profile_dispatch_enabled,
     )
-    from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
 
     pool = get_extension_pool()
     if existing_profile_id:
         pid = str(existing_profile_id).strip()
         if (
             is_profile_dispatch_enabled(pid)
-            and not is_profile_job_dispatch_blocked(pid)
             and _profile_matches_credit_pool(pid, credit_required)
             and profile_accepts_request_type(pid, request_type)
         ):
@@ -208,7 +206,6 @@ def profile_available_for_queue(
     params: dict[str, Any],
     request_type: str | None = None,
 ) -> bool:
-    from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
     from flow2api.services.worker_settings import is_profile_dispatch_enabled
 
     credit_required = request_requires_credit_profile(params, request_type)
@@ -216,8 +213,6 @@ def profile_available_for_queue(
     if params.get("profile_assigned_by_user") and pid:
         pinned = str(pid).strip()
         if not is_profile_dispatch_enabled(pinned):
-            return False
-        if is_profile_job_dispatch_blocked(pinned):
             return False
         return bool(
             pick_profile_for_task(

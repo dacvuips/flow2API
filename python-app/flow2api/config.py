@@ -38,12 +38,6 @@ IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
 VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
-PROFILE_DEFAULT_ERROR_COOLDOWN_S = int(
-    os.environ.get("FLOW2API_PROFILE_DEFAULT_ERROR_COOLDOWN_S", "600")
-)
-PROFILE_POST_CLEAR_WAIT_S = int(
-    os.environ.get("FLOW2API_PROFILE_POST_CLEAR_WAIT_S", "10")
-)
 HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
 POLICY_REJECTION_ERROR_MSG = (
     "Google refused to create the image/video because it violates the content policy. "
@@ -62,9 +56,6 @@ TASK_TIMEOUT_ERROR_MSG = (
 )
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))
-DEFAULT_PROFILE_CLEAR_INTERVAL_S = int(
-    os.environ.get("FLOW2API_PROFILE_CLEAR_INTERVAL_S", "5")
-)
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.
 HTTP_HANDLER_TIMEOUT_S = float(os.environ.get("FLOW2API_HTTP_HANDLER_TIMEOUT_S", "25"))
 HEALTH_CACHE_TTL_S = float(os.environ.get("FLOW2API_HEALTH_CACHE_TTL_S", "3"))

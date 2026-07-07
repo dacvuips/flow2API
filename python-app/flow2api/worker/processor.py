@@ -11,7 +11,6 @@ from flow2api.config import (
     IMAGE_POLL_MAX,
     POLICY_REJECTION_ERROR_MSG,
     POLL_INTERVAL_S,
-    PROFILE_POST_CLEAR_WAIT_S,
     RECAPTCHA_RETRY_MAX,
     TASK_RUNNING_TIMEOUT_S,
     TASK_TIMEOUT_ERROR,
@@ -38,7 +37,6 @@ from flow2api.services.flow_sdk import (
 )
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
-from flow2api.services.profile_job_guard import start_profile_403_cooldown
 from flow2api.services.request_logs import append_request_log
 from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.result_media import prepare_params_for_worker_requeue
@@ -528,115 +526,35 @@ class WorkerController:
         events.publish("request_finished", {"id": rid, "status": "queued"})
         return params
 
-    def _handle_profile_403_cooldown(
+    def _handle_profile_error_switch(
         self,
         rid: str,
         retry_params: dict[str, Any],
         msg: str,
         *,
         label: str = "HTTP 403",
-        clear_reason: str = "Clear sau HTTP 403 — task đã chuyển profile khác (không reload)",
         reset_recaptcha_retries: bool = False,
     ) -> None:
         failed_profile = str(retry_params.get("profile_id") or "").strip()
-        cooldown_min = 0
-        configured_min = 0
-        if failed_profile:
-            from flow2api.services.profile_job_guard import get_profile_error_cooldown_sec
-
-            configured_s = get_profile_error_cooldown_sec(failed_profile)
-            configured_min = max(1, configured_s // 60)
-            until = start_profile_403_cooldown(failed_profile)
-            cooldown_s = max(0, int(until - time.time()))
-            cooldown_min = max(1, (cooldown_s + 59) // 60)
         if reset_recaptcha_retries:
             retry_params.pop("recaptcha_retry_count", None)
         retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-        new_profile = str(retry_params.get("profile_id") or "").strip()
-        if failed_profile and new_profile and new_profile != failed_profile:
-            self._schedule_clear_after_task(
-                failed_profile,
-                rid,
-                reason=clear_reason,
-                reload=False,
-            )
         append_request_log(
             rid,
             "worker",
             (
-                f"{label} — ngưng nhận job profile {failed_profile[:12] or '?'} "
-                f"{cooldown_min} phút (cấu hình {configured_min} phút) "
-                f"→ chuyển profile khác ngay"
+                f"{label} — chuyển profile khác ngay"
+                + (f" (từ {failed_profile[:12]})" if failed_profile else "")
             ),
             level="warn",
             profile_id=failed_profile or None,
         )
         logger.warning(
-            "%s cooldown %s min (configured %s min) rid=%s profile=%s → requeue",
+            "%s → requeue rid=%s profile=%s",
             label,
-            cooldown_min,
-            configured_min,
             rid[:8],
             failed_profile[:12] or "-",
         )
-
-    def _schedule_clear_after_task(
-        self,
-        profile_id: str,
-        rid: str,
-        *,
-        reason: str = "",
-        reload: bool = True,
-    ) -> None:
-        pid = str(profile_id or "").strip()
-        if not pid:
-            return
-        from flow2api.services.worker_settings import is_profile_clear_enabled
-
-        if not is_profile_clear_enabled(pid):
-            return
-        asyncio.create_task(
-            self._clear_after_task(pid, rid, reason=reason, reload=reload),
-            name=f"clear-after-{rid[:8]}-{pid[:8]}",
-        )
-
-    async def _clear_after_task(
-        self,
-        profile_id: str,
-        rid: str,
-        *,
-        reason: str = "",
-        reload: bool = True,
-    ) -> None:
-        session = get_extension_pool().get(profile_id)
-        if not session or not session.connected:
-            return
-        from flow2api.services.profile_clear import run_profile_clear
-
-        append_request_log(
-            rid,
-            "worker",
-            reason or "Clear sau khi kết thúc task — bắt đầu",
-            level="info",
-            profile_id=profile_id,
-        )
-        result = await run_profile_clear(session, source="after_task", reload=reload)
-        if result.get("ok"):
-            append_request_log(
-                rid,
-                "worker",
-                f"Clear xong — chờ {PROFILE_POST_CLEAR_WAIT_S}s trước job mới",
-                level="info",
-                profile_id=profile_id,
-            )
-        else:
-            append_request_log(
-                rid,
-                "worker",
-                f"Clear thất bại: {result.get('error') or result.get('message') or 'unknown'}",
-                level="warn",
-                profile_id=profile_id,
-            )
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
@@ -652,9 +570,6 @@ class WorkerController:
                 await asyncio.sleep(0.25)
 
     async def _scheduler_tick(self) -> int:
-        from flow2api.services.profile_job_guard import sweep_profile_job_guards
-
-        sweep_profile_job_guards()
         self._prune_running()
         self._expire_stale_running()
         settings = get_worker_settings()
@@ -788,14 +703,11 @@ class WorkerController:
                 )
                 return
             if flow_sdk.is_recaptcha_error(msg):
-                self._handle_profile_403_cooldown(
+                self._handle_profile_error_switch(
                     rid,
                     retry_params,
                     msg,
                     label="reCAPTCHA 403",
-                    clear_reason=(
-                        "Clear sau reCAPTCHA 403 — task đã chuyển profile khác (không reload)"
-                    ),
                     reset_recaptcha_retries=True,
                 )
                 return
@@ -888,7 +800,7 @@ class WorkerController:
                 )
                 return
             if is_http_403_failure(exc, msg, api_trace):
-                self._handle_profile_403_cooldown(
+                self._handle_profile_error_switch(
                     rid,
                     retry_params,
                     msg,
@@ -952,12 +864,7 @@ class WorkerController:
         finally:
             client.trace_request_id = None
             unbind_task_profile()
-            cur_final = activity.get_request(rid)
-            final_status = str(cur_final.status or "") if cur_final else ""
-            task_finished = final_status == "done" or final_status.startswith("failed:")
             pool.job_finished(profile_id)
-            if task_finished and profile_id:
-                self._schedule_clear_after_task(profile_id, rid)
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:

@@ -34,10 +34,6 @@ let statusRoot = null;
 let statusText = null;
 let statusDot = null;
 let statusTimer = null;
-let autoClickFeedbackUntil = 0;
-let autoClickPolling = false;
-
-const AUTO_CLICK_POLL_MS = 5000;
 
 function ensureStatusPopup() {
   if (statusRoot) return;
@@ -107,35 +103,12 @@ function ensureStatusPopup() {
 }
 
 function renderStatus(status) {
-  if (Date.now() < autoClickFeedbackUntil || autoClickPolling) return;
   ensureStatusPopup();
   const current = status?.manualDisconnect || !status?.connected ? 'off' : (status.state || 'idle');
   const state = current === 'running' ? 'running' : (current === 'idle' ? 'idle' : 'off');
   statusDot.textContent = STATUS_ICONS[state];
   statusDot.style.color = STATUS_COLORS[state];
   statusText.textContent = STATUS_LABELS[state];
-}
-
-function showAutoClickFeedback(kind) {
-  ensureStatusPopup();
-  const configs = {
-    searching: { icon: '…', color: '#f5b301', text: 'Đang tìm nút Create Flow…' },
-    success: { icon: '✓', color: '#22c55e', text: 'Đã click Create Flow' },
-  };
-  const cfg = configs[kind];
-  if (!cfg) return;
-  statusDot.textContent = cfg.icon;
-  statusDot.style.color = cfg.color;
-  statusText.textContent = cfg.text;
-  autoClickFeedbackUntil = kind === 'success' ? Date.now() + 10000 : 0;
-  chrome.storage.local.set({
-    autoClickLastStatus: { status: kind, message: cfg.text, at: Date.now() },
-  });
-  chrome.runtime.sendMessage({
-    type: 'AUTO_CLICK_STATUS',
-    status: kind,
-    message: cfg.text,
-  }).catch(() => {});
 }
 
 function refreshStatus() {
@@ -166,14 +139,6 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return false;
   }
 
-  if (msg.type === 'RETRY_AUTO_CLICK_CREATE') {
-    autoClickDoneForPath = '';
-    stopAutoClickCreateFlow();
-    startAutoClickCreateFlow();
-    reply?.({ ok: true });
-    return false;
-  }
-
   if (msg.type !== 'GET_CAPTCHA') return false;
 
   const { requestId, pageAction } = msg;
@@ -197,155 +162,5 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     detail: { requestId, pageAction },
   }));
 
-  return true; // keep channel open for async reply
+  return true;
 });
-
-// ─── Auto-click "Create with Google Flow" on landing page ───────────────────
-
-let autoClickTimer = null;
-let autoClickDoneForPath = '';
-let autoClickEnabled = true;
-let mainWorldReady = false;
-
-function isFlowPage() {
-  try {
-    const path = window.location.pathname || '';
-    return /\/fx(\/|$)/i.test(path) || /\/tools\/flow/i.test(path);
-  } catch {
-    return true;
-  }
-}
-
-function currentPageKey() {
-  return `${window.location.pathname}${window.location.search}`;
-}
-
-function waitForMainWorldReady(maxMs = 15000) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const check = () => {
-      if (document.documentElement?.dataset?.flow2apiMainReady === '1') {
-        resolve(true);
-        return;
-      }
-      if (Date.now() - start > maxMs) {
-        resolve(false);
-        return;
-      }
-      setTimeout(check, 50);
-    };
-    check();
-  });
-}
-
-function requestMainWorldAutoClick() {
-  const requestId = `ac_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
-  return new Promise((resolve) => {
-    const handler = (e) => {
-      if (e.detail?.requestId !== requestId) return;
-      document.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
-      clearTimeout(timer);
-      resolve(e.detail || { clicked: false, reason: 'empty_result' });
-    };
-    const timer = setTimeout(() => {
-      document.removeEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
-      resolve({ clicked: false, reason: 'main_world_timeout' });
-    }, 3000);
-    document.addEventListener('FLOW2API_AUTO_CLICK_RESULT', handler);
-    document.dispatchEvent(new CustomEvent('FLOW2API_TRY_AUTO_CLICK_CREATE', {
-      detail: { requestId },
-    }));
-  });
-}
-
-function stopAutoClickCreateFlow() {
-  autoClickPolling = false;
-  if (autoClickTimer) {
-    clearInterval(autoClickTimer);
-    autoClickTimer = null;
-  }
-}
-
-async function tickAutoClickCreateFlow() {
-  if (!autoClickEnabled || !isFlowPage()) {
-    stopAutoClickCreateFlow();
-    refreshStatus();
-    return;
-  }
-
-  const pathKey = currentPageKey();
-  if (autoClickDoneForPath === pathKey) {
-    stopAutoClickCreateFlow();
-    return;
-  }
-
-  if (!mainWorldReady) {
-    mainWorldReady = await waitForMainWorldReady();
-    if (!mainWorldReady) return;
-  }
-
-  const result = await requestMainWorldAutoClick();
-  if (result.clicked) {
-    autoClickDoneForPath = pathKey;
-    showAutoClickFeedback('success');
-    stopAutoClickCreateFlow();
-  }
-}
-
-function startAutoClickCreateFlow() {
-  if (!autoClickEnabled || !isFlowPage()) return;
-  if (autoClickTimer) return;
-
-  autoClickPolling = true;
-  showAutoClickFeedback('searching');
-  tickAutoClickCreateFlow();
-  autoClickTimer = setInterval(tickAutoClickCreateFlow, AUTO_CLICK_POLL_MS);
-}
-
-function bootAutoClickCreateFlow() {
-  if (!autoClickEnabled) return;
-  let watchedPathKey = currentPageKey();
-  const start = () => startAutoClickCreateFlow();
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
-  }
-  setInterval(() => {
-    const key = currentPageKey();
-    if (key === watchedPathKey) return;
-    watchedPathKey = key;
-    autoClickDoneForPath = '';
-    stopAutoClickCreateFlow();
-    startAutoClickCreateFlow();
-  }, 1000);
-  window.addEventListener('pageshow', () => {
-    autoClickDoneForPath = '';
-    mainWorldReady = document.documentElement?.dataset?.flow2apiMainReady === '1';
-    stopAutoClickCreateFlow();
-    startAutoClickCreateFlow();
-  });
-}
-
-function initAutoClickCreateFlow() {
-  chrome.storage.local.get(['autoClickCreateFlow'], (data) => {
-    if (chrome.runtime.lastError) return;
-    autoClickEnabled = data.autoClickCreateFlow !== false;
-    if (!autoClickEnabled) return;
-    bootAutoClickCreateFlow();
-  });
-}
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes.autoClickCreateFlow) return;
-  autoClickEnabled = changes.autoClickCreateFlow.newValue !== false;
-  if (!autoClickEnabled) {
-    stopAutoClickCreateFlow();
-    return;
-  }
-  autoClickDoneForPath = '';
-  stopAutoClickCreateFlow();
-  bootAutoClickCreateFlow();
-});
-
-initAutoClickCreateFlow();

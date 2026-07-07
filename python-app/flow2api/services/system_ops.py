@@ -556,31 +556,6 @@ async def push_proxy_to_extensions(*, defer_if_busy: bool = True) -> None:
             await push_proxy_to_session(session, defer_if_busy=defer_if_busy)
 
 
-async def sync_profile_clear_settings(session: Any) -> dict | None:
-    """Enable/disable clear-after-task (no periodic timer)."""
-    from flow2api.services.worker_settings import is_profile_clear_enabled
-
-    if not getattr(session, "connected", False):
-        return None
-    pid = str(getattr(session, "profile_id", "") or "")
-    if not pid or pid.startswith("_"):
-        return None
-    enabled = is_profile_clear_enabled(pid)
-    try:
-        if enabled:
-            return await session.clear_control("start")
-        return await session.clear_control("stop")
-    except Exception as exc:
-        logger.warning("sync clear settings failed %s: %s", pid[:12], exc)
-        return None
-
-
-async def apply_profile_clear_now(session: Any) -> dict:
-    from flow2api.services.profile_clear import run_profile_clear
-
-    return await run_profile_clear(session, source="manual")
-
-
 def _extension_push_config() -> dict[str, Any]:
     cfg = load_config()
     return {

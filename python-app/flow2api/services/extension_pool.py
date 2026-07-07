@@ -46,7 +46,6 @@ class ExtensionSession:
         self.assigned_total: int = 0
         self.applied_proxy_url: str = ""
         self.pending_proxy_url: str | None = None
-        self.clear_state: dict[str, Any] = {}
 
     @property
     def trace_request_id(self) -> Optional[str]:
@@ -199,46 +198,6 @@ class ExtensionSession:
                 exc,
             )
             return False
-
-    def _update_clear_state(self, payload: dict | None) -> None:
-        if not isinstance(payload, dict):
-            return
-        state = payload.get("state")
-        if isinstance(state, dict):
-            self.clear_state = dict(state)
-            return
-        merged: dict[str, Any] = dict(self.clear_state or {})
-        if payload.get("afterTaskEnabled") is not None:
-            merged["afterTaskEnabled"] = bool(payload.get("afterTaskEnabled"))
-        if payload.get("running") is not None and "afterTaskEnabled" not in payload:
-            merged["afterTaskEnabled"] = bool(payload.get("running"))
-        if payload.get("clearCount") is not None:
-            merged["clearCount"] = int(payload.get("clearCount") or 0)
-        self.clear_state = merged
-
-    async def clear_control(
-        self,
-        action: str,
-        *,
-        interval_sec: int | None = None,
-        reload: bool | None = None,
-        timeout: float = 30.0,
-    ) -> dict:
-        params: dict[str, Any] = {"action": str(action or "").strip().lower()}
-        if interval_sec is not None:
-            params["intervalSec"] = max(1, min(3600, int(interval_sec)))
-        if reload is not None:
-            params["reload"] = bool(reload)
-        resp = await self._send("clear_control", params, timeout=timeout)
-        result = resp.get("result") if isinstance(resp.get("result"), dict) else None
-        if not result and isinstance(resp.get("data"), dict):
-            result = resp["data"]
-        if isinstance(result, dict):
-            self._update_clear_state(result)
-            return result
-        if resp.get("error"):
-            raise RuntimeError(str(resp.get("error")))
-        return {"ok": False, "error": "clear_control_failed", "raw": resp}
 
     async def api_request(
         self,
@@ -485,8 +444,6 @@ class ExtensionSession:
     def to_public_dict(self) -> dict[str, Any]:
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
-            get_profile_clear_interval_sec,
-            is_profile_clear_enabled,
             is_profile_credit_allowed,
             is_profile_dispatch_enabled,
             is_profile_image_allowed,
@@ -497,18 +454,13 @@ class ExtensionSession:
             token_age = int(time.time() - self.token_captured_at)
         max_c = get_profile_max_concurrent(self.profile_id)
         dispatch_enabled = is_profile_dispatch_enabled(self.profile_id)
-        from flow2api.services.profile_job_guard import get_profile_job_pause_public
-
-        pause_info = get_profile_job_pause_public(self.profile_id)
-        job_paused = bool(pause_info.get("job_paused"))
-        if job_paused or not dispatch_enabled:
+        if not dispatch_enabled:
             slots = 0
         else:
             slots = max(0, max_c - self.active_jobs)
         accepts_new_jobs = bool(
             self.is_ready()
             and dispatch_enabled
-            and not job_paused
             and slots > 0
         )
         from flow2api.services.system_ops import (
@@ -531,11 +483,6 @@ class ExtensionSession:
         proxy_pending = (
             self.pending_proxy_url is not None and self.active_jobs > 0 and pool_eligible
         )
-        clear_enabled = is_profile_clear_enabled(self.profile_id)
-        clear_interval = get_profile_clear_interval_sec(self.profile_id)
-        cs = self.clear_state if isinstance(self.clear_state, dict) else {}
-        clear_after_task = bool(cs.get("afterTaskEnabled"))
-        clear_running = bool(clear_after_task and clear_enabled)
         credit_allowed = is_profile_credit_allowed(self.profile_id)
         return {
             "profile_id": self.profile_id,
@@ -561,13 +508,6 @@ class ExtensionSession:
             "proxy_attach_enabled": attach_on,
             "proxy_pending_apply": proxy_pending,
             "proxy_assigned": format_proxy_public(assigned_url).get("proxy_display") or "",
-            "clear_enabled": clear_enabled,
-            "clear_after_task": clear_after_task and clear_enabled,
-            "clear_running": clear_running,
-            "clear_interval_sec": int(cs.get("intervalSec") or clear_interval),
-            "clear_count": int(cs.get("clearCount") or 0),
-            "clear_seconds_until_next": cs.get("secondsUntilNext"),
-            **pause_info,
             **proxy_fields,
         }
 
@@ -656,7 +596,7 @@ class ExtensionPool:
             await session.send_json({"type": "system_push_config", "config": _extension_push_config()})
         except Exception:
             pass
-        from flow2api.services.system_ops import push_proxy_to_session, sync_profile_clear_settings
+        from flow2api.services.system_ops import push_proxy_to_session
         from flow2api.services.worker_settings import ensure_profile_media_on_connect
 
         try:
@@ -665,10 +605,6 @@ class ExtensionPool:
             pass
         try:
             await push_proxy_to_session(session)
-        except Exception:
-            pass
-        try:
-            await sync_profile_clear_settings(session)
         except Exception:
             pass
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})
@@ -738,7 +674,6 @@ class ExtensionPool:
         request_type: str | None = None,
     ) -> list[ExtensionSession]:
         from flow2api.services.flow_client import profile_accepts_request_type
-        from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -749,8 +684,6 @@ class ExtensionPool:
             if exclude and session.profile_id in exclude:
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
-                continue
-            if is_profile_job_dispatch_blocked(session.profile_id):
                 continue
             if not profile_accepts_request_type(session.profile_id, request_type):
                 continue
@@ -815,7 +748,6 @@ class ExtensionPool:
             profile_accepts_request_type,
             profile_media_pick_priority,
         )
-        from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
             is_profile_dispatch_enabled,
@@ -827,8 +759,6 @@ class ExtensionPool:
             if session.profile_id.startswith("_"):
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
-                continue
-            if is_profile_job_dispatch_blocked(session.profile_id):
                 continue
             if not profile_accepts_request_type(session.profile_id, request_type):
                 continue

@@ -198,70 +198,7 @@
     .metric-number.success { color: var(--green); }
     .metric-number.failed { color: var(--red); }
 
-    .clear-panel { padding: 12px 16px 16px; background: #fff; }
-    .clear-status {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 12px;
-    }
-    .clear-status-left { display: flex; align-items: center; gap: 8px; font-weight: 700; }
-    .clear-stats {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .clear-stat {
-      padding: 10px 8px;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: var(--panel-soft);
-      text-align: center;
-    }
-    .clear-stat-value { display: block; font-size: 16px; font-weight: 800; color: var(--text); font-variant-numeric: tabular-nums; }
-    .clear-stat-label { display: block; margin-top: 2px; font-size: 10px; font-weight: 700; color: var(--muted); letter-spacing: 0.04em; }
     .section-title { margin-bottom: 8px; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-    .preset-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 6px;
-      margin-bottom: 12px;
-    }
-    .preset-btn {
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--soft);
-      border-radius: 10px;
-      padding: 8px 4px;
-      font-family: inherit;
-      font-size: 12px;
-      font-weight: 650;
-      cursor: pointer;
-    }
-    .preset-btn.active {
-      border-color: var(--brand-blue);
-      color: var(--brand-blue);
-      background: #eff6ff;
-    }
-    .custom-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .custom-input {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 10px 12px;
-      font-family: inherit;
-      font-size: 14px;
-      font-weight: 700;
-      color: var(--text);
-      background: #fff;
-    }
     .hint {
       margin-bottom: 12px;
       color: var(--muted);
@@ -360,7 +297,6 @@
 
     <nav class="tab-nav" role="tablist">
       <button type="button" class="tab-btn active" data-tab="status" role="tab" aria-selected="true">Trạng thái</button>
-      <button type="button" class="tab-btn" data-tab="clear" role="tab" aria-selected="false">Clear Data</button>
       <button type="button" class="tab-btn" data-tab="mode" role="tab" aria-selected="false">Chế độ</button>
     </nav>
 
@@ -388,17 +324,6 @@
         <div class="row">
           <span class="label">Máy chủ</span>
           <span class="value">127.0.0.1:1609</span>
-        </div>
-        <div class="row">
-          <span class="label">Auto Create Flow</span>
-          <label class="toggle" title="Tự click &quot;Create with Google Flow&quot; khi mở trang landing">
-            <input type="checkbox" id="auto-click-create" checked />
-            <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
-          </label>
-        </div>
-        <div class="row">
-          <span class="label">Auto click</span>
-          <span class="value" id="auto-click-status">—</span>
         </div>
       </section>
 
@@ -473,57 +398,6 @@
             <div class="cs"><div class="n" id="cs-poll">—</div><div class="l">LAST POLL</div></div>
             <div class="cs"><div class="n" id="cs-online">—</div><div class="l">CENTERS ONLINE</div></div>
           </div>
-        </div>
-      </div>
-    </div>
-
-    <div id="tabClear" class="tab-panel" role="tabpanel" hidden>
-      <div class="clear-panel">
-        <div class="clear-status">
-          <div class="clear-status-left">
-            <span class="dot" id="clear-status-dot"></span>
-            <span id="clear-status-text">Đã tắt</span>
-          </div>
-          <button type="button" class="btn-reset" id="btn-clear-reset" title="Reset số lần clear">↻ Reset</button>
-        </div>
-
-        <div class="clear-stats">
-          <div class="clear-stat">
-            <span class="clear-stat-value" id="clear-count">0</span>
-            <span class="clear-stat-label">CLEARED</span>
-          </div>
-          <div class="clear-stat">
-            <span class="clear-stat-value" id="clear-interval-label">5p</span>
-            <span class="clear-stat-label">INTERVAL</span>
-          </div>
-          <div class="clear-stat">
-            <span class="clear-stat-value" id="clear-countdown">—</span>
-            <span class="clear-stat-label">NEXT IN</span>
-          </div>
-        </div>
-
-        <p class="section-title">Chọn nhanh</p>
-        <div class="preset-grid">
-          <button type="button" class="preset-btn clear-preset-btn active" data-sec="5">5s</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="10">10s</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="20">20s</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="60">1p</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="120">2p</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="300">5p</button>
-          <button type="button" class="preset-btn clear-preset-btn" data-sec="600">10p</button>
-        </div>
-
-        <p class="section-title">Tùy chỉnh (giây)</p>
-        <div class="custom-row">
-          <input type="number" id="clear-custom-input" class="custom-input" min="1" max="3600" step="1" value="5" aria-label="Clear interval seconds" />
-          <span class="label">giây</span>
-        </div>
-
-        <p class="hint" id="clear-hint">Tự bật khi mở tab project: xóa Cookies của <strong>labs.google</strong> mỗi <strong>5s</strong>.</p>
-
-        <div class="actions">
-          <button type="button" class="btn btn-primary" id="btn-clear-start">▶ BẮT ĐẦU</button>
-          <button type="button" class="btn btn-stop" id="btn-clear-stop" disabled>⏹ DỪNG</button>
         </div>
       </div>
     </div>

@@ -13,11 +13,8 @@ from flow2api.services.worker_settings import (
     get_worker_settings,
     save_profile_limit,
     save_worker_settings,
-    set_profile_clear_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
-    set_profile_error_cooldown_min,
-    set_profile_error_cooldown_sec,
     set_profile_media_allowed,
 )
 from flow2api.worker.processor import get_worker
@@ -56,16 +53,6 @@ class ProfileProxyBody(BaseModel):
 class ProfileMediaBody(BaseModel):
     image: bool | None = None
     video: bool | None = None
-
-
-class ProfileClearBody(BaseModel):
-    enabled: bool = True
-    interval_sec: int | None = Field(None, ge=1, le=3600)
-
-
-class ProfileJobGuardBody(BaseModel):
-    error_cooldown_min: int | None = Field(None, ge=1, le=60)
-    error_cooldown_sec: int | None = Field(None, ge=60, le=3600)
 
 
 def _bearer(authorization: str | None = Header(default=None)) -> str:
@@ -255,113 +242,3 @@ async def update_profile_media(
         "profiles": pool.list_public(),
         "ok": True,
     }
-
-
-@router.put("/profiles/{profile_id}/clear")
-async def update_profile_clear(
-    profile_id: str,
-    body: ProfileClearBody,
-    _=Depends(_auth_key_id),
-):
-    from flow2api.services import system_ops
-
-    pool = get_extension_pool()
-    session = pool.get(profile_id)
-    if not session:
-        raise HTTPException(404, "profile_not_found")
-    try:
-        saved = set_profile_clear_settings(
-            profile_id,
-            enabled=body.enabled,
-            interval_sec=body.interval_sec,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, "invalid_profile_id") from exc
-    clear_result = None
-    if session.connected:
-        try:
-            clear_result = await system_ops.sync_profile_clear_settings(session)
-        except Exception as exc:
-            raise HTTPException(502, str(exc)) from exc
-    events.publish(
-        "profile_clear_changed",
-        {"profile_id": profile_id, "enabled": body.enabled},
-    )
-    state = "bật" if body.enabled else "tắt"
-    return {
-        **saved.to_dict(),
-        "profiles": pool.list_public(),
-        "clear_result": clear_result,
-        "message": f"Đã {state} clear sau khi kết thúc task cho profile",
-        "ok": True,
-    }
-
-
-@router.put("/profiles/{profile_id}/job-guard")
-async def update_profile_job_guard(
-    profile_id: str,
-    body: ProfileJobGuardBody,
-    _=Depends(_auth_key_id),
-):
-    pool = get_extension_pool()
-    if not pool.get(profile_id):
-        raise HTTPException(404, "profile_not_found")
-    if body.error_cooldown_min is not None:
-        try:
-            saved = set_profile_error_cooldown_min(profile_id, body.error_cooldown_min)
-        except ValueError as exc:
-            raise HTTPException(400, "invalid_profile_id") from exc
-        cooldown_sec = int(body.error_cooldown_min) * 60
-    elif body.error_cooldown_sec is not None:
-        try:
-            saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
-        except ValueError as exc:
-            raise HTTPException(400, "invalid_profile_id") from exc
-        cooldown_sec = int(body.error_cooldown_sec)
-    else:
-        raise HTTPException(400, "missing_job_guard_fields")
-    events.publish(
-        "profile_job_guard_changed",
-        {
-            "profile_id": profile_id,
-            "error_cooldown_sec": max(60, min(3600, cooldown_sec)),
-            "error_cooldown_min": max(1, min(60, round(cooldown_sec / 60))),
-        },
-    )
-    return {
-        **saved.to_dict(),
-        "profiles": pool.list_public(),
-        "ok": True,
-    }
-
-
-@router.post("/profiles/{profile_id}/clear/now")
-async def clear_profile_now(
-    profile_id: str,
-    _=Depends(_auth_key_id),
-):
-    from flow2api.services import system_ops
-
-    pool = get_extension_pool()
-    session = pool.get(profile_id)
-    if not session:
-        raise HTTPException(404, "profile_not_found")
-    if not session.connected:
-        raise HTTPException(503, "extension_not_connected")
-    try:
-        result = await system_ops.apply_profile_clear_now(session)
-    except Exception as exc:
-        raise HTTPException(502, str(exc)) from exc
-    if not result.get("ok"):
-        raise HTTPException(
-            400,
-            result.get("message") or result.get("error") or "clear_failed",
-        )
-    events.publish("profile_clear_changed", {"profile_id": profile_id, "manual": True})
-    return {
-        "ok": True,
-        "message": "Đã clear cookies, reload tab — chờ 10s trước job mới",
-        "clear_result": result,
-        "profiles": pool.list_public(),
-    }
-
