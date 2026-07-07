@@ -528,6 +528,58 @@ class WorkerController:
         events.publish("request_finished", {"id": rid, "status": "queued"})
         return params
 
+    def _handle_profile_403_cooldown(
+        self,
+        rid: str,
+        retry_params: dict[str, Any],
+        msg: str,
+        *,
+        label: str = "HTTP 403",
+        clear_reason: str = "Clear sau HTTP 403 — task đã chuyển profile khác (không reload)",
+        reset_recaptcha_retries: bool = False,
+    ) -> None:
+        failed_profile = str(retry_params.get("profile_id") or "").strip()
+        cooldown_min = 0
+        configured_min = 0
+        if failed_profile:
+            from flow2api.services.profile_job_guard import get_profile_error_cooldown_sec
+
+            configured_s = get_profile_error_cooldown_sec(failed_profile)
+            configured_min = max(1, configured_s // 60)
+            until = start_profile_403_cooldown(failed_profile)
+            cooldown_s = max(0, int(until - time.time()))
+            cooldown_min = max(1, (cooldown_s + 59) // 60)
+        if reset_recaptcha_retries:
+            retry_params.pop("recaptcha_retry_count", None)
+        retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+        new_profile = str(retry_params.get("profile_id") or "").strip()
+        if failed_profile and new_profile and new_profile != failed_profile:
+            self._schedule_clear_after_task(
+                failed_profile,
+                rid,
+                reason=clear_reason,
+                reload=False,
+            )
+        append_request_log(
+            rid,
+            "worker",
+            (
+                f"{label} — ngưng nhận job profile {failed_profile[:12] or '?'} "
+                f"{cooldown_min} phút (cấu hình {configured_min} phút) "
+                f"→ chuyển profile khác ngay"
+            ),
+            level="warn",
+            profile_id=failed_profile or None,
+        )
+        logger.warning(
+            "%s cooldown %s min (configured %s min) rid=%s profile=%s → requeue",
+            label,
+            cooldown_min,
+            configured_min,
+            rid[:8],
+            failed_profile[:12] or "-",
+        )
+
     def _schedule_clear_after_task(
         self,
         profile_id: str,
@@ -735,6 +787,18 @@ class WorkerController:
                     profile_email=str(retry_params.get("profile_email") or "") or None,
                 )
                 return
+            if flow_sdk.is_recaptcha_error(msg):
+                self._handle_profile_403_cooldown(
+                    rid,
+                    retry_params,
+                    msg,
+                    label="reCAPTCHA 403",
+                    clear_reason=(
+                        "Clear sau reCAPTCHA 403 — task đã chuyển profile khác (không reload)"
+                    ),
+                    reset_recaptcha_retries=True,
+                )
+                return
             if is_policy_rejection_failure(exc, msg, api_trace):
                 msg = POLICY_REJECTION_ERROR_MSG
             upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
@@ -824,44 +888,11 @@ class WorkerController:
                 )
                 return
             if is_http_403_failure(exc, msg, api_trace):
-                failed_profile = str(retry_params.get("profile_id") or "").strip()
-                cooldown_s = 0
-                cooldown_min = 0
-                configured_min = 0
-                if failed_profile:
-                    from flow2api.services.profile_job_guard import get_profile_error_cooldown_sec
-
-                    configured_s = get_profile_error_cooldown_sec(failed_profile)
-                    configured_min = max(1, configured_s // 60)
-                    until = start_profile_403_cooldown(failed_profile)
-                    cooldown_s = max(0, int(until - time.time()))
-                    cooldown_min = max(1, (cooldown_s + 59) // 60)
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                new_profile = str(retry_params.get("profile_id") or "").strip()
-                if failed_profile and new_profile and new_profile != failed_profile:
-                    self._schedule_clear_after_task(
-                        failed_profile,
-                        rid,
-                        reason="Clear sau HTTP 403 — task đã chuyển profile khác (không reload)",
-                        reload=False,
-                    )
-                append_request_log(
+                self._handle_profile_403_cooldown(
                     rid,
-                    "worker",
-                    (
-                        f"HTTP 403 — ngưng nhận job profile {failed_profile[:12] or '?'} "
-                        f"{cooldown_min} phút (cấu hình {configured_min} phút) "
-                        f"→ chuyển profile khác ngay"
-                    ),
-                    level="warn",
-                    profile_id=failed_profile or None,
-                )
-                logger.warning(
-                    "HTTP 403 cooldown %s min (configured %s min) rid=%s profile=%s → requeue",
-                    cooldown_min,
-                    configured_min,
-                    rid[:8],
-                    failed_profile[:12] or "-",
+                    retry_params,
+                    msg,
+                    label="HTTP 403",
                 )
                 return
             if isinstance(exc, FlowApiError):
