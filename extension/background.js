@@ -699,7 +699,7 @@ function connectToAgent() {
                 message: 'Clear Data chỉ chạy trên tab Flow project (đường dẫn có /project/).',
               };
             } else {
-              await clearProjectCookies(tab.id, { reload: true });
+              await clearProjectCookies(tab.id, { reload: msg.params?.reload !== false });
               clearState.clearCount = (clearState.clearCount || 0) + 1;
               await saveClearState();
               broadcastClearState();

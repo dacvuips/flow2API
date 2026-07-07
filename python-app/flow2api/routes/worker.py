@@ -63,6 +63,7 @@ class ProfileClearBody(BaseModel):
 
 
 class ProfileJobGuardBody(BaseModel):
+    error_cooldown_min: int | None = Field(None, ge=1, le=60)
     error_cooldown_sec: int | None = Field(None, ge=60, le=3600)
 
 
@@ -290,7 +291,7 @@ async def update_profile_clear(
         **saved.to_dict(),
         "profiles": pool.list_public(),
         "clear_result": clear_result,
-        "message": f"Đã {state} clear sau task thành công cho profile",
+        "message": f"Đã {state} clear sau khi kết thúc task cho profile",
         "ok": True,
     }
 
@@ -304,18 +305,22 @@ async def update_profile_job_guard(
     pool = get_extension_pool()
     if not pool.get(profile_id):
         raise HTTPException(404, "profile_not_found")
-    if body.error_cooldown_sec is None:
+    if body.error_cooldown_min is not None:
+        cooldown_sec = int(body.error_cooldown_min) * 60
+    elif body.error_cooldown_sec is not None:
+        cooldown_sec = int(body.error_cooldown_sec)
+    else:
         raise HTTPException(400, "missing_job_guard_fields")
-    saved = get_worker_settings()
     try:
-        saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
+        saved = set_profile_error_cooldown_sec(profile_id, cooldown_sec)
     except ValueError as exc:
         raise HTTPException(400, "invalid_profile_id") from exc
     events.publish(
         "profile_job_guard_changed",
         {
             "profile_id": profile_id,
-            "error_cooldown_sec": body.error_cooldown_sec,
+            "error_cooldown_sec": max(60, min(3600, cooldown_sec)),
+            "error_cooldown_min": max(1, min(60, round(cooldown_sec / 60))),
         },
     )
     return {

@@ -208,16 +208,20 @@ def profile_available_for_queue(
     params: dict[str, Any],
     request_type: str | None = None,
 ) -> bool:
+    from flow2api.services.profile_job_guard import is_profile_job_dispatch_blocked
     from flow2api.services.worker_settings import is_profile_dispatch_enabled
 
     credit_required = request_requires_credit_profile(params, request_type)
     pid = params.get("profile_id")
     if params.get("profile_assigned_by_user") and pid:
-        if not is_profile_dispatch_enabled(str(pid)):
+        pinned = str(pid).strip()
+        if not is_profile_dispatch_enabled(pinned):
+            return False
+        if is_profile_job_dispatch_blocked(pinned):
             return False
         return bool(
             pick_profile_for_task(
-                str(pid),
+                pinned,
                 credit_required=credit_required,
                 request_type=request_type,
             )

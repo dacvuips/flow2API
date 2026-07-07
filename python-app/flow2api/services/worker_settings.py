@@ -28,7 +28,7 @@ class WorkerSettings:
     profile_video_allowed: list[str] = field(default_factory=list)
     profile_clear_disabled: list[str] = field(default_factory=list)
     profile_clear_interval: dict[str, int] = field(default_factory=dict)
-    profile_default_error_cooldown_sec: int = 60
+    profile_default_error_cooldown_sec: int = 600
     profile_error_cooldown_sec: dict[str, int] = field(default_factory=dict)
 
     def normalized(self) -> WorkerSettings:
@@ -74,14 +74,19 @@ class WorkerSettings:
                 clear_interval[str(pid)] = max(1, min(3600, int(val or 5)))
         default_cooldown = max(
             1,
-            min(3600, int(self.profile_default_error_cooldown_sec or 60)),
+            min(3600, int(self.profile_default_error_cooldown_sec or 600)),
         )
+        if default_cooldown == 60:
+            default_cooldown = 600
         error_cooldown: dict[str, int] = {}
         if isinstance(self.profile_error_cooldown_sec, dict):
             for pid, val in self.profile_error_cooldown_sec.items():
                 if not pid or str(pid).startswith("_"):
                     continue
-                error_cooldown[str(pid)] = max(1, min(3600, int(val or default_cooldown)))
+                v = int(val or default_cooldown)
+                if 0 < v < 60:
+                    v *= 60
+                error_cooldown[str(pid)] = max(60, min(3600, v))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -178,7 +183,7 @@ def _load_file() -> WorkerSettings | None:
         profile_clear_disabled=[str(x) for x in clear_disabled],
         profile_clear_interval={str(k): int(v) for k, v in clear_interval.items()},
         profile_default_error_cooldown_sec=int(
-            raw.get("profile_default_error_cooldown_sec", 60)
+            raw.get("profile_default_error_cooldown_sec", 600)
         ),
         profile_error_cooldown_sec={str(k): int(v) for k, v in error_cooldown.items()},
     ).normalized()
@@ -294,7 +299,11 @@ def get_profile_error_cooldown_sec(profile_id: str) -> int:
         min(3600, int(settings.profile_default_error_cooldown_sec or PROFILE_DEFAULT_ERROR_COOLDOWN_S)),
     )
     if pid in settings.profile_error_cooldown_sec:
-        return max(1, min(3600, int(settings.profile_error_cooldown_sec[pid])))
+        val = int(settings.profile_error_cooldown_sec[pid])
+        # Legacy: some builds stored minutes (1–59) instead of seconds.
+        if 0 < val < 60:
+            val *= 60
+        return max(60, min(3600, val))
     return default
 
 
@@ -302,9 +311,8 @@ def set_profile_error_cooldown_sec(profile_id: str, cooldown_sec: int) -> Worker
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
         raise ValueError("invalid_profile_id")
-    raw = max(60, min(3600, int(cooldown_sec)))
-    minutes = max(1, min(60, round(raw / 60)))
-    return save_worker_settings(profile_error_cooldown_sec={pid: minutes * 60})
+    sec = max(60, min(3600, int(cooldown_sec)))
+    return save_worker_settings(profile_error_cooldown_sec={pid: sec})
 
 
 def save_worker_settings(**fields: Any) -> WorkerSettings:

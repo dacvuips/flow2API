@@ -37,7 +37,7 @@ VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
 PROFILE_DEFAULT_ERROR_COOLDOWN_S = int(
-    os.environ.get("FLOW2API_PROFILE_DEFAULT_ERROR_COOLDOWN_S", "60")
+    os.environ.get("FLOW2API_PROFILE_DEFAULT_ERROR_COOLDOWN_S", "600")
 )
 PROFILE_POST_CLEAR_WAIT_S = int(
     os.environ.get("FLOW2API_PROFILE_POST_CLEAR_WAIT_S", "10")
@@ -53,10 +53,10 @@ WORKER_TASK_STAGGER_S = float(os.environ.get("FLOW2API_TASK_STAGGER_S", "0"))
 ACTIVITY_LIST_LIMIT = int(os.environ.get("FLOW2API_ACTIVITY_LIST_LIMIT", "100"))
 ACTIVITY_META_LIMIT = int(os.environ.get("FLOW2API_ACTIVITY_META_LIMIT", "10000"))
 ACTIVITY_PAGE_SIZE = int(os.environ.get("FLOW2API_ACTIVITY_PAGE_SIZE", "20"))
-TASK_RUNNING_TIMEOUT_S = int(os.environ.get("FLOW2API_TASK_RUNNING_TIMEOUT_S", "300"))
-TASK_TIMEOUT_ERROR = "task_timeout_5m"
+TASK_RUNNING_TIMEOUT_S = int(os.environ.get("FLOW2API_TASK_RUNNING_TIMEOUT_S", "1200"))
+TASK_TIMEOUT_ERROR = "task_timeout_20m"
 TASK_TIMEOUT_ERROR_MSG = (
-    "Timeout: quá 5 phút không hoàn thành, job đã kết thúc."
+    "Timeout: quá 20 phút không hoàn thành, job đã kết thúc."
 )
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))

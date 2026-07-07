@@ -24,8 +24,13 @@ def _lock_for(profile_id: str) -> asyncio.Lock:
     return _clear_locks[pid]
 
 
-async def run_profile_clear(session: Any, *, source: str = "manual") -> dict:
-    """Clear + reload on extension; profile cannot take jobs until cooldown ends."""
+async def run_profile_clear(
+    session: Any,
+    *,
+    source: str = "manual",
+    reload: bool = True,
+) -> dict:
+    """Clear labs.google cookies; optional tab reload; blocks dispatch while running."""
     pid = str(getattr(session, "profile_id", "") or "").strip()
     if not pid or pid.startswith("_"):
         return {"ok": False, "error": "invalid_profile"}
@@ -40,7 +45,7 @@ async def run_profile_clear(session: Any, *, source: str = "manual") -> dict:
         )
         result: dict = {"ok": False, "error": "clear_failed"}
         try:
-            raw = await session.clear_control("now", timeout=60.0)
+            raw = await session.clear_control("now", timeout=60.0, reload=reload)
             result = raw if isinstance(raw, dict) else {"ok": False, "raw": raw}
             if result.get("ok"):
                 logger.info(

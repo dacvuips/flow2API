@@ -221,11 +221,14 @@ class ExtensionSession:
         action: str,
         *,
         interval_sec: int | None = None,
+        reload: bool | None = None,
         timeout: float = 30.0,
     ) -> dict:
         params: dict[str, Any] = {"action": str(action or "").strip().lower()}
         if interval_sec is not None:
             params["intervalSec"] = max(1, min(3600, int(interval_sec)))
+        if reload is not None:
+            params["reload"] = bool(reload)
         resp = await self._send("clear_control", params, timeout=timeout)
         result = resp.get("result") if isinstance(resp.get("result"), dict) else None
         if not result and isinstance(resp.get("data"), dict):
@@ -434,8 +437,20 @@ class ExtensionSession:
             token_age = int(time.time() - self.token_captured_at)
         max_c = get_profile_max_concurrent(self.profile_id)
         dispatch_enabled = is_profile_dispatch_enabled(self.profile_id)
-        credit_allowed = is_profile_credit_allowed(self.profile_id)
-        slots = max(0, max_c - self.active_jobs) if dispatch_enabled else 0
+        from flow2api.services.profile_job_guard import get_profile_job_pause_public
+
+        pause_info = get_profile_job_pause_public(self.profile_id)
+        job_paused = bool(pause_info.get("job_paused"))
+        if job_paused or not dispatch_enabled:
+            slots = 0
+        else:
+            slots = max(0, max_c - self.active_jobs)
+        accepts_new_jobs = bool(
+            self.is_ready()
+            and dispatch_enabled
+            and not job_paused
+            and slots > 0
+        )
         from flow2api.services.system_ops import (
             format_proxy_public,
             is_profile_proxy_attach_enabled,
@@ -461,9 +476,7 @@ class ExtensionSession:
         cs = self.clear_state if isinstance(self.clear_state, dict) else {}
         clear_after_task = bool(cs.get("afterTaskEnabled"))
         clear_running = bool(clear_after_task and clear_enabled)
-        from flow2api.services.profile_job_guard import get_profile_job_pause_public
-
-        pause_info = get_profile_job_pause_public(self.profile_id)
+        credit_allowed = is_profile_credit_allowed(self.profile_id)
         return {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
@@ -481,6 +494,7 @@ class ExtensionSession:
             "active_jobs": self.active_jobs,
             "max_concurrent": max_c,
             "slots_available": slots,
+            "accepts_new_jobs": accepts_new_jobs,
             "assigned_total": self.assigned_total,
             "user": self.user_info or {},
             "proxy_pool_enabled": pool_on,

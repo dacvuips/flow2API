@@ -51,7 +51,14 @@ def get_403_cooldown_remaining(profile_id: str) -> int:
         until = float(_profile_403_cooldown_until.get(pid) or 0)
     if until <= time.time():
         with _LOCK:
+            had = pid in _profile_403_cooldown_until
             _profile_403_cooldown_until.pop(pid, None)
+        if had:
+            events.publish(
+                "profile_job_guard_changed",
+                {"profile_id": pid, "reason": "http_403_cleared"},
+            )
+            events.publish("queue_changed", {"reason": "http_403_cleared", "profile_id": pid})
         return 0
     return max(0, int(until - time.time()) + (1 if until > time.time() else 0))
 
@@ -87,13 +94,32 @@ def get_clear_busy_remaining(profile_id: str) -> int:
         until = float(_profile_clear_busy_until.get(pid) or 0)
     if until <= time.time():
         with _LOCK:
+            had = pid in _profile_clear_busy_until
             _profile_clear_busy_until.pop(pid, None)
+        if had:
+            events.publish(
+                "profile_job_guard_changed",
+                {"profile_id": pid, "reason": "clear_busy_cleared"},
+            )
+            events.publish("queue_changed", {"reason": "clear_busy_cleared", "profile_id": pid})
         return 0
     return max(0, int(until - time.time()) + (1 if until > time.time() else 0))
 
 
 def is_profile_clear_busy(profile_id: str) -> bool:
     return get_clear_busy_remaining(profile_id) > 0
+
+
+def sweep_profile_job_guards() -> None:
+    """Expire in-memory guards and publish events so UI/queue recover."""
+    from flow2api.services.extension_pool import get_extension_pool
+
+    for session in get_extension_pool().list_sessions():
+        pid = str(session.profile_id or "").strip()
+        if not pid or pid.startswith("_"):
+            continue
+        get_403_cooldown_remaining(pid)
+        get_clear_busy_remaining(pid)
 
 
 def is_profile_job_dispatch_blocked(profile_id: str) -> bool:
@@ -107,7 +133,7 @@ def is_profile_job_dispatch_blocked(profile_id: str) -> bool:
 
 
 def _cooldown_min_from_sec(sec: int) -> int:
-    return max(1, min(60, int(round(max(60, int(sec or 60)) / 60))))
+    return max(1, min(60, int(round(max(1, int(sec or 60)) / 60))))
 
 
 def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
