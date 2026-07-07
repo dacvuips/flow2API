@@ -16,6 +16,19 @@ from flow2api.services.request_logs import append_request_log
 
 logger = logging.getLogger(__name__)
 
+
+def _url_requires_center_captcha(url: str) -> bool:
+    """Gen image/video submit endpoints — bắt buộc token từ Captcha Center."""
+    u = str(url or "")
+    if "batchCheckAsync" in u:
+        return False
+    if "batchGenerateImages" in u:
+        return True
+    if "batchAsyncGenerateVideo" in u:
+        return True
+    return False
+
+
 _bound_profile_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "bound_profile_id", default=None
 )
@@ -218,6 +231,17 @@ class ExtensionSession:
             "headers": headers or {},
             "body": body,
         }
+        needs_gen_captcha = _url_requires_center_captcha(url)
+        if needs_gen_captcha and not captcha_action:
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                "Gen image/video bị chặn — thiếu captcha Center (captcha_action)",
+                level="error",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            raise RuntimeError("NO_CAPTCHA_CENTER")
         # Captcha resolution qua broker — Bridge chỉ inject `captchaToken`.
         # Worker profile không tự solve trên tab Flow của mình.
         if captcha_action:
@@ -230,16 +254,6 @@ class ExtensionSession:
                 profile_email=self.email or None,
             )
             token = await self._acquire_captcha_token(captcha_action)
-            if not token:
-                append_request_log(
-                    self.trace_request_id,
-                    "captcha",
-                    "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
-                    level="error",
-                    profile_id=self.profile_id,
-                    profile_email=self.email or None,
-                )
-                raise RuntimeError("NO_CAPTCHA_CENTER")
             params["captchaToken"] = token
             append_request_log(
                 self.trace_request_id,
@@ -249,6 +263,16 @@ class ExtensionSession:
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
             )
+        if needs_gen_captcha and not str(params.get("captchaToken") or "").strip():
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                "Gen image/video bị chặn — không có captchaToken từ Center",
+                level="error",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            raise RuntimeError("NO_CAPTCHA_CENTER")
         resp = await self._send("api_request", params, timeout=timeout)
         if "aisandbox-pa.googleapis.com" in url:
             record_api_call(self.trace_request_id, url, method, body, resp)
@@ -272,13 +296,13 @@ class ExtensionSession:
             raise RuntimeError(str(err))
         return resp
 
-    async def _acquire_captcha_token(self, action: str) -> Optional[str]:
-        """Xin token từ CaptchaBroker. Trả None khi không có center / timeout / lỗi mint."""
+    async def _acquire_captcha_token(self, action: str) -> str:
+        """Xin token từ CaptchaBroker. Raise NO_CAPTCHA_CENTER khi không có token."""
         from flow2api.services.captcha_broker import get_captcha_broker
 
         broker = get_captcha_broker()
         try:
-            return await broker.request_captcha(
+            token = await broker.request_captcha(
                 action=action, bridge_profile_id=self.profile_id, timeout=30.0
             )
         except RuntimeError as exc:
@@ -286,13 +310,41 @@ class ExtensionSession:
                 "captcha broker failed profile=%s action=%s: %s",
                 self.profile_id[:8], action, exc,
             )
-            return None
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
+                level="error",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            raise RuntimeError("NO_CAPTCHA_CENTER") from exc
         except Exception as exc:
             logger.warning(
                 "captcha broker exception profile=%s action=%s: %s",
                 self.profile_id[:8], action, exc,
             )
-            return None
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
+                level="error",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            raise RuntimeError("NO_CAPTCHA_CENTER") from exc
+        token = str(token or "").strip()
+        if not token:
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                "Captcha Center trả token rỗng",
+                level="error",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            raise RuntimeError("NO_CAPTCHA_CENTER")
+        return token
 
     def _request_center_hard_reset(self, reason: str) -> None:
         try:

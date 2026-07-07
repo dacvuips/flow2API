@@ -9,6 +9,8 @@ Captcha Center chạy ở các Chrome profile riêng (labs.google/fx/tools/flow 
 
 Chính sách:
 - LRU + skip cooldown khi chọn center để phục vụ 1 request.
+- Khi có request: đánh thức long-poll mọi center online, chờ center sẵn sàng
+  (cooldown / hard_reset / đăng ký lại sau agent restart) trước khi fail.
 - Combined hard_reset trigger: mỗi 20 solve HOẶC mỗi 10 phút HOẶC khi worker
   báo API 403 (từ Google).
 - Routing: mỗi request có commandId (uuid) — pending Future track theo commandId
@@ -35,6 +37,7 @@ logger = logging.getLogger(__name__)
 POLL_TIMEOUT_S = 25.0            # long-poll: server giữ tối đa 25s nếu không có command
 CENTER_STALE_S = 45.0            # center không heartbeat quá 45s → offline
 DEFAULT_REQUEST_TIMEOUT_S = 30.0 # broker.request_captcha total timeout
+PICK_CENTER_MAX_WAIT_S = 12.0    # chờ center sẵn sàng khi cooldown / chưa poll lại
 HARD_RESET_EVERY_N_SOLVES = 20   # combined trigger: N solves
 HARD_RESET_EVERY_S = 600.0       # combined trigger: mỗi 10 phút
 CENTER_COOLDOWN_AFTER_RESET_S = 5.0  # skip center 5s sau khi hard_reset hoàn tất
@@ -250,6 +253,7 @@ class CaptchaBroker:
         cmd = Command(command_id=f"periodic-{uuid.uuid4().hex[:8]}", method="hard_reset")
         queue.append(cmd)
         st.in_reset = True
+        self._wake_center_poll(st.center_id)
         logger.info(
             "captcha-center %s: enqueue periodic hard_reset (solves=%d, age=%.0fs)",
             st.center_id[:12], st.solve_since_last_reset, time.time() - st.last_hard_reset_at,
@@ -295,6 +299,38 @@ class CaptchaBroker:
 
     # ── Center picker (LRU + skip cooldown) ─────────────────────────────
 
+    def _wake_center_poll(self, center_id: str) -> None:
+        """Đánh thức long-poll của center — trả command ngay thay vì chờ timeout."""
+        ev = self._events.get(center_id)
+        if ev is not None:
+            ev.set()
+
+    def _wake_online_centers(self) -> None:
+        """Request mới → kick mọi center online đang long-poll."""
+        now = time.time()
+        for st in self._centers.values():
+            if st.is_online(now):
+                self._wake_center_poll(st.center_id)
+
+    def _seconds_until_any_ready(self, now: float) -> float | None:
+        """Giây chờ tới khi 1 center online thoát cooldown/in_reset; None nếu không có center."""
+        if not self._centers:
+            return None
+        best: float | None = None
+        for st in self._centers.values():
+            if not st.is_online(now):
+                continue
+            if not st.is_cooldown(now):
+                return 0.0
+            wait_s = max(0.0, st.cooldown_until - now) if now < st.cooldown_until else 0.0
+            if st.in_reset:
+                wait_s = max(wait_s, 1.0)
+            if best is None or wait_s < best:
+                best = wait_s
+        if best is not None:
+            return best
+        return None
+
     def pick_center(self) -> str | None:
         now = time.time()
         candidates: list[CenterState] = []
@@ -310,6 +346,35 @@ class CaptchaBroker:
         candidates.sort(key=lambda s: (s.last_mint_at, s.mint_count))
         return candidates[0].center_id
 
+    async def _pick_center_for_request(self, wait_timeout: float) -> str:
+        """Chọn center sẵn sàng; nếu đang cooldown/chưa poll lại thì đánh thức + chờ."""
+        deadline = time.time() + max(0.5, wait_timeout)
+        self._wake_online_centers()
+        while True:
+            now = time.time()
+            center_id = self.pick_center()
+            if center_id:
+                return center_id
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+            self._wake_online_centers()
+            until_ready = self._seconds_until_any_ready(now)
+            if until_ready is None:
+                sleep_s = min(0.5, remaining)
+            elif until_ready <= 0:
+                sleep_s = min(0.05, remaining)
+            else:
+                sleep_s = min(max(0.05, until_ready), 0.5, remaining)
+            logger.debug(
+                "captcha pick waiting %.2fs (centers=%d online=%d)",
+                sleep_s,
+                len(self._centers),
+                sum(1 for s in self._centers.values() if s.is_online(now)),
+            )
+            await asyncio.sleep(sleep_s)
+        raise RuntimeError("NO_CAPTCHA_CENTER")
+
     # ── Public API: request captcha ─────────────────────────────────────
 
     async def request_captcha(
@@ -321,9 +386,9 @@ class CaptchaBroker:
         """Blocking: gửi command cho center, chờ token. Raise RuntimeError khi fail."""
         if not action:
             raise ValueError("action_required")
-        center_id = self.pick_center()
-        if not center_id:
-            raise RuntimeError("NO_CAPTCHA_CENTER")
+        started = time.time()
+        pick_budget = min(PICK_CENTER_MAX_WAIT_S, max(1.0, timeout * 0.4))
+        center_id = await self._pick_center_for_request(pick_budget)
 
         command_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
@@ -344,18 +409,16 @@ class CaptchaBroker:
             bridge_profile_id=bridge_profile_id or "",
         )
         self._queues[center_id].append(cmd)
-        # Wake long-poll của center này
-        ev = self._events.get(center_id)
-        if ev is not None:
-            ev.set()
+        self._wake_center_poll(center_id)
 
         logger.debug(
             "captcha request %s: action=%s center=%s bridge=%s",
             command_id[:8], action, center_id[:12], bridge_profile_id[:8] if bridge_profile_id else "-",
         )
 
+        mint_timeout = max(5.0, timeout - (time.time() - started))
         try:
-            token = await asyncio.wait_for(fut, timeout=timeout)
+            token = await asyncio.wait_for(fut, timeout=mint_timeout)
             return token
         except asyncio.TimeoutError:
             self._pending.pop(command_id, None)
@@ -381,9 +444,7 @@ class CaptchaBroker:
         cmd = Command(command_id=f"periodic-{uuid.uuid4().hex[:8]}", method="hard_reset")
         queue.append(cmd)
         st.in_reset = True
-        ev = self._events.get(st.center_id)
-        if ev is not None:
-            ev.set()
+        self._wake_center_poll(st.center_id)
         logger.info(
             "captcha-center %s: force hard_reset (reason=%s bridge=%s)",
             st.center_id[:12], reason, bridge_profile_id[:8] if bridge_profile_id else "-",

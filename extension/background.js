@@ -412,6 +412,23 @@ function classifyUrl(url) {
   return 'API';
 }
 
+/** Gen image/video submit — bắt buộc captchaToken từ Captcha Center (agent broker). */
+function requiresCenterCaptcha(url) {
+  if (!url || url.includes('batchCheckAsync')) return false;
+  if (url.includes('batchGenerateImages')) return true;
+  if (url.includes('batchAsyncGenerateVideo')) return true;
+  return false;
+}
+
+function bodyHasRecaptchaToken(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (body.clientContext?.recaptchaContext?.token) return true;
+  if (Array.isArray(body.requests)) {
+    return body.requests.some((req) => req?.clientContext?.recaptchaContext?.token);
+  }
+  return false;
+}
+
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Request Log (last 50 entries) Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
 
 let requestLog = [];
@@ -791,12 +808,11 @@ function sendToAgent(msg) {
 async function handleApiRequest(msg) {
   const { id, params } = msg;
   // `captchaToken` — do Python agent CaptchaBroker cấp sẵn. Bridge chỉ inject.
-  // `captchaAction` — legacy fallback: nếu chưa có Center online, agent gửi
-  //   action xuống, Bridge tự solve trên tab Flow của profile này (như cũ).
   const { url, method, headers, body, captchaAction } = params || {};
   const preSuppliedCaptchaToken = typeof params?.captchaToken === 'string' && params.captchaToken
     ? String(params.captchaToken)
     : null;
+  const mustHaveCenterCaptcha = requiresCenterCaptcha(url);
 
   if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) {
     sendToAgent({ id, status: 400, error: 'INVALID_URL' });
@@ -812,7 +828,7 @@ async function handleApiRequest(msg) {
   }
 
   setState('running');
-  const hasCaptcha = !!(captchaAction || preSuppliedCaptchaToken);
+  const hasCaptcha = !!(mustHaveCenterCaptcha || captchaAction || preSuppliedCaptchaToken);
   if (hasCaptcha) metrics.requestCount++;
 
   addRequestLog({
@@ -861,6 +877,15 @@ async function handleApiRequest(msg) {
     // Không tự solve trên tab Flow của profile worker (tránh burn score trên nhiều tab).
     let captchaToken = preSuppliedCaptchaToken;
     let headerTab = await pickPrimaryFlowTab();
+    if (mustHaveCenterCaptcha && !captchaToken) {
+      console.error('[Flow2API] Blocked gen image/video — missing Center captchaToken');
+      sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_CAPTCHA_CENTER'; }
+      chrome.storage.local.set({ metrics });
+      updateRequestLog(id, { status: 'failed', error: 'NO_CAPTCHA_CENTER' });
+      setState('idle');
+      return;
+    }
     if (captchaAction && !captchaToken) {
       console.error(`[Flow2API] Missing captchaToken from Center for action=${captchaAction}`);
       sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
@@ -900,6 +925,16 @@ async function handleApiRequest(msg) {
           }
         }
       }
+    }
+
+    if (mustHaveCenterCaptcha && finalBody && !bodyHasRecaptchaToken(finalBody)) {
+      console.error('[Flow2API] Blocked gen image/video — captchaToken not injected into body');
+      sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_CAPTCHA_CENTER'; }
+      chrome.storage.local.set({ metrics });
+      updateRequestLog(id, { status: 'failed', error: 'NO_CAPTCHA_CENTER' });
+      setState('idle');
+      return;
     }
 
     if (headerTab?.id) {
