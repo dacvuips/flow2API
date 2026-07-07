@@ -25,12 +25,24 @@
 
   let _captchaInflight = null;
 
+  /** Strip `_grecaptcha*` localStorage pre/post mint — tránh marker tích lũy (hạ score). */
+  function clearGrecaptchaCache() {
+    try {
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith("_grecaptcha"))
+        .forEach((k) => localStorage.removeItem(k));
+    } catch {
+      /* cross-origin storage denied */
+    }
+  }
+
   async function executeCaptcha(pageAction) {
     if (_captchaInflight) return _captchaInflight;
     _captchaInflight = (async () => {
       await waitForGrecaptcha();
+      clearGrecaptchaCache();
       const siteKey = resolveSiteKey();
-      return await new Promise((resolve, reject) => {
+      const token = await new Promise((resolve, reject) => {
         window.grecaptcha.enterprise.ready(async () => {
           try {
             resolve(
@@ -43,6 +55,8 @@
           }
         });
       });
+      clearGrecaptchaCache();
+      return token;
     })();
     try {
       return await _captchaInflight;

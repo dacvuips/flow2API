@@ -61,7 +61,7 @@
 
     .tab-nav {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr;
       gap: 4px;
       margin: 10px 12px 0;
       padding: 4px;
@@ -69,6 +69,91 @@
       border-radius: 12px;
       background: var(--panel-soft);
     }
+
+    .mode-panel { padding: 14px 16px 16px; background: #fff; }
+    .mode-hero {
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel-soft);
+      margin-bottom: 12px;
+    }
+    .mode-hero.center {
+      border-color: #7dd3fc;
+      background: #f0f9ff;
+    }
+    .mode-current { font-weight: 800; font-size: 14px; }
+    .mode-current .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--brand-blue);
+      color: #fff;
+      font-size: 11px;
+      margin-left: 6px;
+    }
+    .mode-current .badge.center { background: #0ea5e9; }
+    .mode-current .badge.bridge { background: #6366f1; }
+    .mode-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+    .mode-radio-group {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .mode-radio {
+      position: relative;
+      cursor: pointer;
+    }
+    .mode-radio input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .mode-radio .card {
+      display: block;
+      padding: 12px 10px;
+      border: 1.5px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      text-align: center;
+    }
+    .mode-radio .card .t { font-weight: 800; font-size: 13px; color: var(--text); }
+    .mode-radio .card .d { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.4; }
+    .mode-radio input:checked + .card {
+      border-color: var(--brand-blue);
+      background: #eff6ff;
+      color: var(--brand-blue);
+    }
+    .mode-radio input:checked + .card .t { color: var(--brand-blue); }
+
+    .center-config { margin-top: 10px; }
+    .center-config label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; margin-top: 10px; }
+    .center-config input[type="text"], .center-config input[type="password"], .center-config input[type="url"] {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 11px;
+      font-family: inherit;
+      font-size: 13px;
+      color: var(--text);
+      background: #fff;
+    }
+    .center-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .center-stats .cs {
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel-soft);
+    }
+    .center-stats .cs .n { font-size: 15px; font-weight: 800; }
+    .center-stats .cs .l { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
 
     .tab-btn {
       border: none;
@@ -276,6 +361,7 @@
     <nav class="tab-nav" role="tablist">
       <button type="button" class="tab-btn active" data-tab="status" role="tab" aria-selected="true">Trạng thái</button>
       <button type="button" class="tab-btn" data-tab="clear" role="tab" aria-selected="false">Clear Data</button>
+      <button type="button" class="tab-btn" data-tab="mode" role="tab" aria-selected="false">Chế độ</button>
     </nav>
 
     <div id="tabStatus" class="tab-panel active" role="tabpanel">
@@ -330,6 +416,65 @@
           <span class="metric-number failed" id="failed-num">0</span>
         </div>
       </section>
+    </div>
+
+    <div id="tabMode" class="tab-panel" role="tabpanel" hidden>
+      <div class="mode-panel">
+        <div class="mode-hero" id="mode-hero">
+          <div class="mode-current">
+            Đang chạy: <span class="badge" id="mode-badge">Bridge</span>
+          </div>
+          <div class="mode-sub" id="mode-sub">Proxy API request từ agent, inject captcha do Center cấp.</div>
+        </div>
+
+        <div class="mode-radio-group">
+          <label class="mode-radio">
+            <input type="radio" name="mode" value="bridge" id="mode-bridge" />
+            <div class="card">
+              <div class="t">Bridge</div>
+              <div class="d">Profile login — proxy API, inject captcha từ Center.</div>
+            </div>
+          </label>
+          <label class="mode-radio">
+            <input type="radio" name="mode" value="center" id="mode-center" />
+            <div class="card">
+              <div class="t">Captcha Center</div>
+              <div class="d">Profile chuyên mint captcha, phục vụ nhiều Bridge.</div>
+            </div>
+          </label>
+        </div>
+
+        <div class="actions" style="margin-bottom: 12px;">
+          <button type="button" class="btn btn-primary" id="btn-mode-apply">Áp dụng &amp; reload</button>
+          <button type="button" class="btn btn-stop" id="btn-mode-cancel">Hủy</button>
+        </div>
+
+        <div id="center-config" class="center-config" hidden>
+          <p class="section-title" style="margin: 0 0 6px;">Cấu hình Captcha Center</p>
+
+          <label for="center-base">Bridge URL</label>
+          <input type="url" id="center-base" placeholder="http://127.0.0.1:1994" autocomplete="off" spellcheck="false" />
+
+          <label for="center-secret">Bridge Secret (X-Center-Secret)</label>
+          <input type="password" id="center-secret" placeholder="đã tự lấy từ agent nếu cùng máy" autocomplete="off" spellcheck="false" />
+
+          <label for="center-label">Label (tuỳ chọn — tên nhận diện)</label>
+          <input type="text" id="center-label" placeholder="vd: captcha-01" autocomplete="off" spellcheck="false" />
+
+          <div class="actions" style="margin-top: 10px;">
+            <button type="button" class="btn btn-primary" id="btn-center-save">Lưu</button>
+            <button type="button" class="btn btn-stop" id="btn-center-test">Test kết nối</button>
+          </div>
+          <p class="hint" id="center-hint" style="margin-top: 10px;">Nếu cùng máy với agent, secret sẽ tự lấy khi mở lần đầu.</p>
+
+          <div class="center-stats">
+            <div class="cs"><div class="n" id="cs-mint">0</div><div class="l">MINT (session)</div></div>
+            <div class="cs"><div class="n" id="cs-last">—</div><div class="l">LAST MINT</div></div>
+            <div class="cs"><div class="n" id="cs-poll">—</div><div class="l">LAST POLL</div></div>
+            <div class="cs"><div class="n" id="cs-online">—</div><div class="l">CENTERS ONLINE</div></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div id="tabClear" class="tab-panel" role="tabpanel" hidden>

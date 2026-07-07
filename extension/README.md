@@ -1,34 +1,70 @@
 # Flow2API Bridge (Chrome MV3)
 
-Local extension that proxies Flow2API agent requests to authenticated labs.google sessions.
+Extension cục bộ — proxy request Flow qua agent Python. Hỗ trợ **2 mode** trong cùng 1 package (chọn ở popup):
 
-## Install
+| Mode | Chrome profile | Vai trò |
+|------|----------------|---------|
+| **Bridge** (mặc định) | Profile worker (đăng nhập Veo) | Bắt Bearer token, proxy API, **inject** `captchaToken` do Center cấp |
+| **Captcha Center** | Profile riêng (1 hoặc nhiều) | Mint reCAPTCHA trên tab Flow, long-poll agent broker |
 
-1. Open `chrome://extensions`.
-2. Enable **Developer mode** (top-right toggle).
-3. Click **Load unpacked** and select this folder.
+Worker **không** tự gọi `grecaptcha` trên tab của mình — tránh burn score trên nhiều profile.
 
-## How it works
+## Cài đặt
 
-- The service worker connects to `ws://127.0.0.1:9223` automatically when the agent is running.
-- On first sign-in at `labs.google/fx/tools/flow` the `Authorization: Bearer ya29.*` token is captured automatically from outgoing request headers.
-- Responses to agent `api_request` commands are sent via HTTP POST to `http://127.0.0.1:8101/api/ext/callback` with an `X-Callback-Secret` header (secret supplied by the agent on connect). WS fallback is used if HTTP fails.
-- A keepalive `ping` is sent every ~24 s; disconnections trigger an automatic reconnect in ~5 s.
-- When an `api_request` includes `captchaAction`, the extension solves a reCAPTCHA Enterprise challenge via the injected MAIN-world script (`injected.js`) running on the Flow tab, then patches the token into the request body before forwarding.
-- Outbound `aisandbox-pa.googleapis.com` calls (image/video generate, poll, upload) reuse headers sniffed from real Flow page traffic (`User-Agent`, `sec-ch-ua*`, `x-client-data`, Referer with project URL, etc.) via `buildFlowApiFetchHeaders` and dynamic DNR rules.
-- `trpc_request` commands are proxied directly to `https://labs.google/` with the captured Bearer token and browser credentials.
+1. Mở `chrome://extensions` → bật **Developer mode** → **Load unpacked** → chọn folder `extension/`.
+2. Lặp lại trên mỗi Chrome profile (worker + center).
+
+## Kiến trúc Captcha Center
+
+```
+Bridge profile (worker)          Python agent (127.0.0.1:1994)
+       │                              │
+       │  WS api_request              │  CaptchaBroker.request_captcha()
+       │  + captchaToken (inject)     │       │
+       │◄─────────────────────────────│       │ long-poll GET /poll
+       │                              │       ▼
+       │                              │  Captcha Center profile(s)
+       │                              │  grecaptcha.enterprise.execute()
+```
+
+- Mỗi request có `commandId` (UUID) — token trả đúng Bridge profile đã gọi, không lẫn.
+- Nhiều Center: broker chọn **LRU** (center lâu chưa mint), bỏ qua center đang cooldown/hard_reset.
+- Timing (parity `veo3-captcha-extension`):
+  - Long-poll: **25s**
+  - Mint timeout: **25s** + retry **20s** (reinject content script)
+  - Hard reset: xóa anchor cookie → `about:blank` **1.5s** → reload Flow → dwell **2.5s**
+  - Hard reset định kỳ: mỗi **20** solve **hoặc** **10 phút**
+  - Cooldown sau reset: **5s**
+  - Center offline nếu không heartbeat **45s**
+  - Broker request timeout: **30s**
+
+## Thiết lập Captcha Center (profile riêng)
+
+1. Chrome profile mới (không cần là profile worker).
+2. Load cùng extension → popup → chọn **Captcha Center** → **Áp dụng** (extension reload).
+3. Mở tab `https://labs.google/fx/tools/flow` — đăng nhập Google (account dùng mint captcha).
+4. Popup Center:
+   - **Bridge URL**: `http://127.0.0.1:1994` (agent loopback)
+   - **Secret**: bấm **Test** để auto-fetch từ agent, hoặc copy từ `python-app/storage/captcha-center.secret`
+   - **Label**: vd `captcha-01`, `captcha-02` (phân biệt nhiều center)
+5. Badge icon **C** xanh dương = đang poll. Xem stats: popup hoặc `GET /api/internal/captcha/stats`.
+
+Có thể chạy **nhiều profile Center** (mỗi profile 1 tab Flow). Giữ **1 tab Flow** / profile Center.
+
+## Thiết lập Bridge (profile worker)
+
+1. Popup → mode **Bridge** (mặc định).
+2. Đăng nhập Veo trên tab Flow.
+3. Agent chạy (`run.bat`) — extension kết nối `ws://127.0.0.1:1609`.
+4. Khi generate cần captcha, agent xin token từ broker → gửi `captchaToken` qua WS → Bridge inject vào body trước khi gọi Google API.
+
+Nếu không có Center online → lỗi `NO_CAPTCHA_CENTER` (không fallback self-solve).
 
 ## Content script + injected script
 
-`content.js` runs at `document_start` on `labs.google/fx/tools/flow*` pages. It injects `injected.js` into the MAIN world so it can reach `window.grecaptcha.enterprise`. The two scripts communicate via `CustomEvent` (`GET_CAPTCHA` / `CAPTCHA_RESULT`).
+`content.js` inject `injected.js` (MAIN world) để gọi `grecaptcha.enterprise.execute`.  
+Chỉ **Captcha Center** dùng luồng này qua long-poll. Bridge chỉ inject token sẵn có.
 
 ## Popup
 
-Click the extension icon to see connection status, token age, request counters, and buttons to open the Flow tab or force a token refresh.
-
-## Out of scope (this version)
-
-- Side panel
-- Agent-side TRPC media URL forwarding listener
-
-See `docs/PLAN.md` for planned additions.
+Connection status, token age, mode Bridge/Center, cấu hình Center, số center online.

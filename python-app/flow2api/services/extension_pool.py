@@ -259,12 +259,33 @@ class ExtensionSession:
             "headers": headers or {},
             "body": body,
         }
+        # Captcha resolution qua broker — Bridge chỉ inject `captchaToken`.
+        # Worker profile không tự solve trên tab Flow của mình.
         if captcha_action:
-            params["captchaAction"] = captcha_action
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                f"Đang giải reCAPTCHA ({captcha_action})",
+                f"Đang xin reCAPTCHA từ Captcha Center ({captcha_action})",
+                level="info",
+                profile_id=self.profile_id,
+                profile_email=self.email or None,
+            )
+            token = await self._acquire_captcha_token(captcha_action)
+            if not token:
+                append_request_log(
+                    self.trace_request_id,
+                    "captcha",
+                    "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
+                    level="error",
+                    profile_id=self.profile_id,
+                    profile_email=self.email or None,
+                )
+                raise RuntimeError("NO_CAPTCHA_CENTER")
+            params["captchaToken"] = token
+            append_request_log(
+                self.trace_request_id,
+                "captcha",
+                f"reCAPTCHA nhận được từ Center (len={len(token)})",
                 level="info",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
@@ -272,6 +293,13 @@ class ExtensionSession:
         resp = await self._send("api_request", params, timeout=timeout)
         if "aisandbox-pa.googleapis.com" in url:
             record_api_call(self.trace_request_id, url, method, body, resp)
+        # Nếu Google trả 403 (score thấp) → yêu cầu 1 center hard_reset
+        try:
+            status_probe = int(resp.get("status") or 0)
+        except (TypeError, ValueError):
+            status_probe = 0
+        if captcha_action and status_probe == 403:
+            self._request_center_hard_reset(reason=f"api_403:{captcha_action}")
         if not raise_on_error:
             return resp
         status = int(resp.get("status") or 0)
@@ -284,6 +312,38 @@ class ExtensionSession:
             err = resp.get("error") or data or f"HTTP_{status}"
             raise RuntimeError(str(err))
         return resp
+
+    async def _acquire_captcha_token(self, action: str) -> Optional[str]:
+        """Xin token từ CaptchaBroker. Trả None khi không có center / timeout / lỗi mint."""
+        from flow2api.services.captcha_broker import get_captcha_broker
+
+        broker = get_captcha_broker()
+        try:
+            return await broker.request_captcha(
+                action=action, bridge_profile_id=self.profile_id, timeout=30.0
+            )
+        except RuntimeError as exc:
+            logger.warning(
+                "captcha broker failed profile=%s action=%s: %s",
+                self.profile_id[:8], action, exc,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "captcha broker exception profile=%s action=%s: %s",
+                self.profile_id[:8], action, exc,
+            )
+            return None
+
+    def _request_center_hard_reset(self, reason: str) -> None:
+        try:
+            from flow2api.services.captcha_broker import get_captcha_broker
+
+            get_captcha_broker().request_hard_reset(
+                bridge_profile_id=self.profile_id, reason=reason
+            )
+        except Exception as exc:
+            logger.debug("request_center_hard_reset failed: %s", exc)
 
     async def trpc_request(self, path: str, body: dict, timeout: float = 60.0) -> dict:
         from flow2api.config import TRPC_BASE

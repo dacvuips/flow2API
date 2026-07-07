@@ -3,7 +3,21 @@
  *
  * Connects to local Python agent via WebSocket (agent runs WS server).
  * Captures Bearer token and proxies API calls through the browser context.
+ *
+ * Modes (chọn ở popup):
+ *  - 'bridge' (default): WS bridge — proxy api_request, inject captchaToken
+ *     (do agent broker cấp từ Captcha Center). Không tự solve trên tab worker.
+ *  - 'center':  Long-poll agent's captcha broker, solve grecaptcha, phục vụ
+ *     token cho các Bridge profile khác. Không WS, không proxy Bridge.
+ * Mode đọc từ chrome.storage.local key 'f2apiExtMode'.
  */
+
+// Nạp Captcha Center loop (chỉ chạy khi mode = 'center' — được gọi trong init()).
+try {
+  importScripts('center-loop.js');
+} catch (e) {
+  console.error('[Flow2API] importScripts(center-loop.js) failed:', e);
+}
 
 const AGENT_WS_URL  = 'ws://127.0.0.1:1609';
 const CALLBACK_URL  = 'http://127.0.0.1:1994/api/ext/callback';
@@ -437,7 +451,26 @@ async function getOrCreateProfileId() {
   return id;
 }
 
+async function getExtensionMode() {
+  const { f2apiExtMode } = await chrome.storage.local.get(['f2apiExtMode']);
+  return f2apiExtMode === 'center' ? 'center' : 'bridge';
+}
+
 async function init() {
+  const mode = await getExtensionMode();
+  console.log('[Flow2API] Extension mode =', mode);
+  if (mode === 'center') {
+    // Center: chỉ chạy long-poll broker, không WS Bridge / không proxy.
+    if (self.__centerLoop?.start) {
+      try {
+        await self.__centerLoop.start();
+      } catch (e) {
+        console.error('[Flow2API] center start failed:', e);
+      }
+    }
+    return;
+  }
+  // Bridge mode (default) — luồng gốc:
   // Note: deliberately not restoring `userInfo` from storage. We used
   // to persist it here, but Google profile fields (name + email) are
   // PII and chrome.storage.local is plaintext + readable by other
@@ -814,7 +847,13 @@ function sendToAgent(msg) {
 
 async function handleApiRequest(msg) {
   const { id, params } = msg;
+  // `captchaToken` — do Python agent CaptchaBroker cấp sẵn. Bridge chỉ inject.
+  // `captchaAction` — legacy fallback: nếu chưa có Center online, agent gửi
+  //   action xuống, Bridge tự solve trên tab Flow của profile này (như cũ).
   const { url, method, headers, body, captchaAction } = params || {};
+  const preSuppliedCaptchaToken = typeof params?.captchaToken === 'string' && params.captchaToken
+    ? String(params.captchaToken)
+    : null;
 
   if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) {
     sendToAgent({ id, status: 400, error: 'INVALID_URL' });
@@ -830,7 +869,7 @@ async function handleApiRequest(msg) {
   }
 
   setState('running');
-  const hasCaptcha = !!captchaAction;
+  const hasCaptcha = !!(captchaAction || preSuppliedCaptchaToken);
   if (hasCaptcha) metrics.requestCount++;
 
   addRequestLog({
@@ -875,34 +914,23 @@ async function handleApiRequest(msg) {
       return;
     }
 
-    // Step 2: Solve captcha if needed
-    let captchaToken = null;
+    // Step 2: Captcha token — Bridge chỉ inject token do Captcha Center cấp (agent broker).
+    // Không tự solve trên tab Flow của profile worker (tránh burn score trên nhiều tab).
+    let captchaToken = preSuppliedCaptchaToken;
     let headerTab = await pickPrimaryFlowTab();
-    if (captchaAction) {
+    if (captchaAction && !captchaToken) {
+      console.error(`[Flow2API] Missing captchaToken from Center for action=${captchaAction}`);
+      sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_CAPTCHA_CENTER'; }
+      chrome.storage.local.set({ metrics });
+      updateRequestLog(id, { status: 'failed', error: 'NO_CAPTCHA_CENTER' });
+      setState('idle');
+      return;
+    }
+    if (captchaToken) {
+      console.log(`[Flow2API] reCAPTCHA received from Center (len=${captchaToken.length})`);
       const pidFromBody = extractProjectIdFromBody(body);
       if (pidFromBody) noteProjectId(pidFromBody);
-      const captchaResult = await solveCaptcha(id, captchaAction);
-      captchaToken = captchaResult?.token || null;
-      if (captchaResult?.tabId) {
-        try {
-          headerTab = await chrome.tabs.get(captchaResult.tabId);
-        } catch {
-          /* keep headerTab */
-        }
-      }
-      if (captchaToken) {
-        console.log(`[Flow2API] reCAPTCHA solved action=${captchaAction} len=${captchaToken.length}`);
-      }
-      if (!captchaToken) {
-        const err = captchaResult?.error || 'CAPTCHA_FAILED';
-        console.error(`[Flow2API] Captcha failed for ${captchaAction}: ${err}`);
-        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
-        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
-        chrome.storage.local.set({ metrics });
-        updateRequestLog(id, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
-        setState('idle');
-        return;
-      }
     }
 
     // Gate #2: last chance before the fetch actually reaches Google.
@@ -1963,6 +1991,5 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 });
 
 console.log('[Flow2API] Extension loaded');
-
-
+void init();
 

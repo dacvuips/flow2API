@@ -26,6 +26,7 @@ from flow2api.db import init_db
 from flow2api.routes.activity import router as activity_router
 from flow2api.routes.admin import router as admin_router
 from flow2api.routes.auth import router as auth_router
+from flow2api.routes.captcha_broker import router as captcha_broker_router
 from flow2api.routes.requests import router as requests_router
 from flow2api.routes.settings import router as settings_router
 from flow2api.routes.system import router as system_router
@@ -172,6 +173,16 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:
         logger.warning("profile media bootstrap failed: %s", exc)
+    try:
+        from flow2api.services.captcha_broker import SECRET_FILE, get_captcha_broker
+
+        broker_secret = get_captcha_broker().secret
+        logger.info(
+            "captcha-center secret sẵn sàng (8-prefix=%s...) — file: %s",
+            broker_secret[:8], SECRET_FILE,
+        )
+    except Exception as exc:
+        logger.warning("captcha-center broker init failed: %s", exc)
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,
@@ -208,6 +219,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(settings_router)
     app.include_router(worker_router)
+    app.include_router(captcha_broker_router)
 
     dashboard = FRONTEND_DIR / "dashboard.html"
     if dashboard.is_file():
