@@ -1523,7 +1523,7 @@ const DEFAULT_CLEAR_STATE = {
 let clearState = { ...DEFAULT_CLEAR_STATE };
 let _autoClearBootstrapping = false;
 
-const CLEAR_COOKIE_OPTS = { cookies: true };
+const CLEAR_SITE_DATA_OPTS = { cookies: true, localStorage: true };
 
 function clampClearSec(sec) {
   return Math.max(1, Math.min(3600, Math.round(Number(sec) || AUTO_CLEAR_INTERVAL_SEC)));
@@ -1696,12 +1696,29 @@ async function sanitizeClearState() {
   await stopLegacyIntervalClear();
 }
 
+async function clearLabsGoogleStorageInTab(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        try { localStorage.clear(); } catch { /* ignore */ }
+        try { sessionStorage.clear(); } catch { /* ignore */ }
+      },
+    });
+  } catch (e) {
+    console.warn('[Flow2API] clear labs.google storage in tab failed:', e?.message || e);
+  }
+}
+
 async function clearProjectCookies(tabId, { reload = false } = {}) {
   const tab = await chrome.tabs.get(tabId);
   if (!canReloadTab(tab)) throw new Error('invalid_tab');
   if (!isFlowProjectUrl(tab.url)) throw new Error('not_flow_project');
 
-  await browsingDataRemove(CLEAR_DATA_ORIGINS, CLEAR_COOKIE_OPTS);
+  await browsingDataRemove(CLEAR_DATA_ORIGINS, CLEAR_SITE_DATA_OPTS);
+  if (isLabsGoogleUrl(tab.url)) {
+    await clearLabsGoogleStorageInTab(tabId);
+  }
   if (reload) {
     await chrome.tabs.reload(tabId);
   }

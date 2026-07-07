@@ -1,4 +1,4 @@
-"""Clear labs.google cookies + reload — blocks profile dispatch while running."""
+"""Clear labs.google cookies + localStorage (+ optional reload) — blocks dispatch while running."""
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +30,7 @@ async def run_profile_clear(
     source: str = "manual",
     reload: bool = True,
 ) -> dict:
-    """Clear labs.google cookies; optional tab reload; blocks dispatch while running."""
+    """Clear labs.google cookies and localStorage; optional tab reload; blocks dispatch while running."""
     pid = str(getattr(session, "profile_id", "") or "").strip()
     if not pid or pid.startswith("_"):
         return {"ok": False, "error": "invalid_profile"}
