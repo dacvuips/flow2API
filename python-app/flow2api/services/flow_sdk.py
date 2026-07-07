@@ -2451,7 +2451,7 @@ async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | 
 
 
 async def video_poll_wait(round_idx: int, *, skip_first_delay: bool = False) -> None:
-    """Video poll timing: 15s before first check, then 10s between checks."""
+    """Video poll timing: 20s before first check, then 10s between checks."""
     if round_idx <= 0:
         if not skip_first_delay:
             await asyncio.sleep(VIDEO_POLL_FIRST_DELAY_S)
