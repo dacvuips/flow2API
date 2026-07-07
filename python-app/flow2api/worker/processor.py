@@ -77,6 +77,10 @@ def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
     return legacy.get(req_type, "")
 
 
+def _variant_count(params: dict[str, Any]) -> int:
+    return max(1, min(int(params.get("variant_count") or 1), 4))
+
+
 class RequestCancelled(RuntimeError):
     """Raised when user stops a queued/running request."""
 
@@ -974,6 +978,7 @@ class WorkerController:
 
         if req_type == "gen_text_video":
             prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
+            vc = _variant_count(params)
             if flow_sdk.is_omni_flash(get_video_quality(params)):
                 duration_s = int(
                     params.get("video_duration_s")
@@ -986,6 +991,7 @@ class WorkerController:
                     prompt=prompt,
                     aspect_ratio=params.get("aspect_ratio", "16:9"),
                     duration_s=duration_s,
+                    variant_count=vc,
                 )
             else:
                 raw = await flow_sdk.gen_text_video(
@@ -994,6 +1000,7 @@ class WorkerController:
                     prompt=prompt,
                     aspect_ratio=params.get("aspect_ratio", "16:9"),
                     video_quality=get_video_quality(params, "fast"),
+                    variant_count=vc,
                 )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1029,6 +1036,7 @@ class WorkerController:
             or params.get("omni_duration_s")
             or flow_sdk.OMNI_COMPONENT_DURATION_DEFAULT
         )
+        vc = _variant_count(params)
 
         if not self._has_video_input_media(params):
             raw = await flow_sdk.gen_omni_text_video(
@@ -1037,6 +1045,7 @@ class WorkerController:
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 duration_s=duration_s,
+                variant_count=vc,
             )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1059,6 +1068,7 @@ class WorkerController:
                     reference_media_ids=ref_ids,
                     source_video_media_id=video_id,
                     end_frame_index=flow_sdk.OMNI_COMPONENT_WITH_VIDEO_END_FRAME,
+                    variant_count=vc,
                 )
             else:
                 raw = await flow_sdk.gen_omni_reference_video(
@@ -1068,6 +1078,7 @@ class WorkerController:
                     aspect_ratio=aspect_ratio,
                     reference_media_ids=ref_ids,
                     duration_s=duration_s,
+                    variant_count=vc,
                 )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1094,6 +1105,7 @@ class WorkerController:
             aspect_ratio=aspect_ratio,
             start_media_id=start_id,
             duration_s=duration_s,
+            variant_count=vc,
         )
         await self._poll_video(rid, raw, project_id)
 
@@ -1110,6 +1122,7 @@ class WorkerController:
         prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
         video_quality = get_video_quality(params, "fast")
+        vc = _variant_count(params)
 
         if not self._has_video_input_media(params):
             raw = await flow_sdk.gen_text_video(
@@ -1118,6 +1131,7 @@ class WorkerController:
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 video_quality=video_quality,
+                variant_count=vc,
             )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1133,6 +1147,7 @@ class WorkerController:
                 aspect_ratio=aspect_ratio,
                 video_quality=video_quality,
                 reference_media_ids=ref_ids,
+                variant_count=vc,
             )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1158,6 +1173,7 @@ class WorkerController:
                 video_quality=video_quality,
                 start_media_id=start_id,
                 end_media_id=end_id,
+                variant_count=vc,
             )
         else:
             start_id = await self._resolve_start_media_id(
@@ -1170,6 +1186,7 @@ class WorkerController:
                 aspect_ratio=aspect_ratio,
                 video_quality=video_quality,
                 start_media_id=start_id,
+                variant_count=vc,
             )
         await self._poll_video(rid, raw, project_id)
 

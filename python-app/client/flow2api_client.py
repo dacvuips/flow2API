@@ -44,9 +44,9 @@ class Flow2APIClient:
         }
         if req_type == "gen_image":
             params["image_model"] = image_model
-            params["variant_count"] = variant_count
         else:
             params["video_quality"] = video_quality
+        params["variant_count"] = variant_count
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(
                 f"{self.base_url}/api/requests",

@@ -215,7 +215,27 @@ def _is_video_edit_url(url: str) -> bool:
     return "batchAsyncGenerateVideoEditVideo" in str(url or "")
 
 
-def _video_edit_request_body(project_id: str, tier: str, request_item: dict) -> dict:
+def _clamp_variant_count(variant_count: int) -> int:
+    return max(1, min(int(variant_count or 1), 4))
+
+
+def _video_request_variants(request_item: dict, variant_count: int = 1) -> list[dict]:
+    n = _clamp_variant_count(variant_count)
+    base = json.loads(json.dumps(request_item))
+    base_seed = base.get("seed")
+    if base_seed is None:
+        base_seed = random.randint(1, 99_999)
+    items: list[dict] = []
+    for i in range(n):
+        item = json.loads(json.dumps(base))
+        item["seed"] = (int(base_seed) + i * 17) % 1_000_000 or random.randint(1, 99_999)
+        items.append(item)
+    return items
+
+
+def _video_edit_request_body(
+    project_id: str, tier: str, request_item: dict, *, variant_count: int = 1
+) -> dict:
     """Omni edit / V2V — must not include useV2ModelConfig (API rejects it)."""
     return {
         "mediaGenerationContext": {
@@ -223,7 +243,7 @@ def _video_edit_request_body(project_id: str, tier: str, request_item: dict) -> 
             "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
         },
         "clientContext": _client_context(project_id, tier),
-        "requests": [request_item],
+        "requests": _video_request_variants(request_item, variant_count),
     }
 
 
@@ -236,7 +256,12 @@ def _sanitize_video_submit_body(url: str, body: dict) -> dict:
 
 
 def _video_request_body(
-    project_id: str, tier: str, request_item: dict, *, use_v2: bool = True
+    project_id: str,
+    tier: str,
+    request_item: dict,
+    *,
+    use_v2: bool = True,
+    variant_count: int = 1,
 ) -> dict:
     """Flow web v2 video submit (i2v / r2v / t2v lower priority)."""
     body: dict[str, Any] = {
@@ -245,7 +270,7 @@ def _video_request_body(
             "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
         },
         "clientContext": _client_context(project_id, tier),
-        "requests": [request_item],
+        "requests": _video_request_variants(request_item, variant_count),
     }
     if use_v2:
         body["useV2ModelConfig"] = True
@@ -270,11 +295,13 @@ def _refresh_video_request_body_session(body: dict, client: FlowClient) -> dict:
     return out
 
 
-def _t2v_request_body(project_id: str, tier: str, request_item: dict) -> dict:
+def _t2v_request_body(
+    project_id: str, tier: str, request_item: dict, *, variant_count: int = 1
+) -> dict:
     """Classic text-to-video (lite / fast / quality — non lower-priority)."""
     return {
         "clientContext": _client_context(project_id, tier),
-        "requests": [request_item],
+        "requests": _video_request_variants(request_item, variant_count),
     }
 
 
@@ -1088,6 +1115,7 @@ async def gen_omni_frame_video(
     aspect_ratio: str,
     start_media_id: str,
     duration_s: int = 4,
+    variant_count: int = 1,
 ) -> dict:
     """Omni Flash Khung hình — startImage only, abra_i2v_{N}s."""
     tier = _require_tier(client)
@@ -1100,7 +1128,7 @@ async def gen_omni_frame_video(
         "metadata": {},
         "startImage": {"mediaId": start_media_id},
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_START_PATH), body, model_key=model_key
     )
@@ -1115,6 +1143,7 @@ async def gen_omni_edit_video(
     reference_media_ids: list[str],
     source_video_media_id: str,
     end_frame_index: int = OMNI_COMPONENT_WITH_VIDEO_END_FRAME,
+    variant_count: int = 1,
 ) -> dict:
     """Omni Flash Thành phần V2V — abra_edit + videoInput (optional referenceImages)."""
     video_id = str(source_video_media_id or "").strip()
@@ -1139,7 +1168,7 @@ async def gen_omni_edit_video(
             {"mediaId": mid, "imageUsageType": "IMAGE_USAGE_TYPE_ASSET"}
             for mid in reference_media_ids
         ]
-    body = _video_edit_request_body(project_id, tier, request_item)
+    body = _video_edit_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_EDIT_PATH), body, model_key=OMNI_EDIT_MODEL_KEY
     )
@@ -1153,6 +1182,7 @@ async def gen_omni_reference_video(
     aspect_ratio: str,
     reference_media_ids: list[str],
     duration_s: int = OMNI_COMPONENT_DURATION_DEFAULT,
+    variant_count: int = 1,
 ) -> dict:
     """Omni Flash Thành phần (ảnh only) — abra_t2v_{N}s + referenceImages."""
     if not reference_media_ids:
@@ -1170,7 +1200,7 @@ async def gen_omni_reference_video(
             for mid in reference_media_ids
         ],
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_REF_PATH), body, model_key=model_key
     )
@@ -1183,6 +1213,7 @@ async def gen_omni_text_video(
     prompt: str,
     aspect_ratio: str,
     duration_s: int = OMNI_COMPONENT_DURATION_DEFAULT,
+    variant_count: int = 1,
 ) -> dict:
     """Omni Flash text-only — abra_t2v_{N}s on batchAsyncGenerateVideoText."""
     tier = _require_tier(client)
@@ -1194,7 +1225,7 @@ async def gen_omni_text_video(
         "videoModelKey": model_key,
         "metadata": {},
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_T2V_PATH), body, model_key=model_key
     )
@@ -1207,6 +1238,7 @@ async def gen_text_video(
     prompt: str,
     aspect_ratio: str,
     video_quality: str,
+    variant_count: int = 1,
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("t2v", tier, aspect_ratio, video_quality)
@@ -1220,7 +1252,7 @@ async def gen_text_video(
             "videoModelKey": model_key,
             "metadata": {},
         }
-        body = _video_request_body(project_id, tier, request_item)
+        body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     else:
         request_item = {
             "aspectRatio": aspect,
@@ -1228,7 +1260,7 @@ async def gen_text_video(
             "textInput": {"prompt": prompt},
             "videoModelKey": model_key,
         }
-        body = _t2v_request_body(project_id, tier, request_item)
+        body = _t2v_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_T2V_PATH), body, model_key=model_key
     )
@@ -1242,6 +1274,7 @@ async def gen_video_start_image(
     aspect_ratio: str,
     video_quality: str,
     start_media_id: str,
+    variant_count: int = 1,
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("i2v", tier, aspect_ratio, video_quality)
@@ -1253,7 +1286,7 @@ async def gen_video_start_image(
         "startImage": {"mediaId": start_media_id},
         "metadata": {},
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_START_PATH), body, model_key=model_key
     )
@@ -1268,6 +1301,7 @@ async def gen_video_start_end_image(
     video_quality: str,
     start_media_id: str,
     end_media_id: str,
+    variant_count: int = 1,
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("i2v_fl", tier, aspect_ratio, video_quality)
@@ -1280,7 +1314,7 @@ async def gen_video_start_end_image(
         "endImage": {"mediaId": end_media_id},
         "metadata": {},
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_START_END_PATH), body, model_key=model_key
     )
@@ -1294,6 +1328,7 @@ async def gen_multi_image_video(
     aspect_ratio: str,
     video_quality: str,
     reference_media_ids: list[str],
+    variant_count: int = 1,
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("r2v", tier, aspect_ratio, video_quality)
@@ -1308,7 +1343,7 @@ async def gen_multi_image_video(
         ],
         "metadata": {},
     }
-    body = _video_request_body(project_id, tier, request_item)
+    body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_REF_PATH), body, model_key=model_key
     )
