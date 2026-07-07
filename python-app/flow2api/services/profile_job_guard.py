@@ -22,6 +22,12 @@ def get_profile_error_cooldown_sec(profile_id: str) -> int:
     return get_profile_error_cooldown_sec(_pid(profile_id))
 
 
+def get_profile_error_cooldown_min(profile_id: str) -> int:
+    from flow2api.services.worker_settings import get_profile_error_cooldown_min
+
+    return get_profile_error_cooldown_min(_pid(profile_id))
+
+
 def start_profile_403_cooldown(profile_id: str) -> float:
     """Pause dispatch on profile for configured seconds; return unix until."""
     pid = _pid(profile_id)
@@ -138,6 +144,23 @@ def _cooldown_min_from_sec(sec: int) -> int:
 
 def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
     pid = _pid(profile_id)
+    cd_min = get_profile_error_cooldown_min(pid)
+    cd_sec = cd_min * 60
+    remaining_403 = get_403_cooldown_remaining(pid)
+    if remaining_403 > 0:
+        with _LOCK:
+            until = float(_profile_403_cooldown_until.get(pid) or 0)
+        clear_remaining = get_clear_busy_remaining(pid)
+        return {
+            "job_paused": True,
+            "job_pause_reason": "http_403",
+            "job_pause_until": until,
+            "job_pause_remaining_s": remaining_403,
+            "job_pause_remaining_min": max(1, int((remaining_403 + 59) / 60)),
+            "job_pause_clear_remaining_s": clear_remaining or None,
+            "profile_error_cooldown_sec": cd_sec,
+            "profile_error_cooldown_min": cd_min,
+        }
     clear_remaining = get_clear_busy_remaining(pid)
     if clear_remaining > 0:
         with _LOCK:
@@ -148,27 +171,9 @@ def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
             "job_pause_until": until,
             "job_pause_remaining_s": clear_remaining,
             "job_pause_remaining_min": max(1, int((clear_remaining + 59) / 60)),
-            "profile_error_cooldown_sec": get_profile_error_cooldown_sec(pid),
-            "profile_error_cooldown_min": _cooldown_min_from_sec(
-                get_profile_error_cooldown_sec(pid)
-            ),
+            "profile_error_cooldown_sec": cd_sec,
+            "profile_error_cooldown_min": cd_min,
         }
-    remaining = get_403_cooldown_remaining(pid)
-    if remaining > 0:
-        with _LOCK:
-            until = float(_profile_403_cooldown_until.get(pid) or 0)
-        return {
-            "job_paused": True,
-            "job_pause_reason": "http_403",
-            "job_pause_until": until,
-            "job_pause_remaining_s": remaining,
-            "job_pause_remaining_min": max(1, int((remaining + 59) / 60)),
-            "profile_error_cooldown_sec": get_profile_error_cooldown_sec(pid),
-            "profile_error_cooldown_min": _cooldown_min_from_sec(
-                get_profile_error_cooldown_sec(pid)
-            ),
-        }
-    cd_sec = get_profile_error_cooldown_sec(pid)
     return {
         "job_paused": False,
         "job_pause_reason": None,
@@ -176,5 +181,5 @@ def get_profile_job_pause_public(profile_id: str) -> dict[str, Any]:
         "job_pause_remaining_s": None,
         "job_pause_remaining_min": None,
         "profile_error_cooldown_sec": cd_sec,
-        "profile_error_cooldown_min": _cooldown_min_from_sec(cd_sec),
+        "profile_error_cooldown_min": cd_min,
     }

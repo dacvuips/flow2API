@@ -16,6 +16,16 @@ _MAX_CONCURRENT_CAP = 100
 _PROFILE_MAX_CAP = 8
 
 
+def _cooldown_min_from_legacy_sec(sec: int) -> int:
+    """Migrate old profile_error_cooldown_sec values (seconds or mistaken minutes)."""
+    s = int(sec or 0)
+    if s <= 0:
+        return 10
+    if s >= 60:
+        return max(1, min(60, round(s / 60)))
+    return max(1, min(60, s))
+
+
 @dataclass
 class WorkerSettings:
     max_concurrent: int = 1
@@ -28,8 +38,8 @@ class WorkerSettings:
     profile_video_allowed: list[str] = field(default_factory=list)
     profile_clear_disabled: list[str] = field(default_factory=list)
     profile_clear_interval: dict[str, int] = field(default_factory=dict)
-    profile_default_error_cooldown_sec: int = 600
-    profile_error_cooldown_sec: dict[str, int] = field(default_factory=dict)
+    profile_default_error_cooldown_min: int = 10
+    profile_error_cooldown_min: dict[str, int] = field(default_factory=dict)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -72,21 +82,13 @@ class WorkerSettings:
                 if not pid or str(pid).startswith("_"):
                     continue
                 clear_interval[str(pid)] = max(1, min(3600, int(val or 5)))
-        default_cooldown = max(
-            1,
-            min(3600, int(self.profile_default_error_cooldown_sec or 600)),
-        )
-        if default_cooldown == 60:
-            default_cooldown = 600
-        error_cooldown: dict[str, int] = {}
-        if isinstance(self.profile_error_cooldown_sec, dict):
-            for pid, val in self.profile_error_cooldown_sec.items():
+        default_min = max(1, min(60, int(self.profile_default_error_cooldown_min or 10)))
+        error_cooldown_min: dict[str, int] = {}
+        if isinstance(self.profile_error_cooldown_min, dict):
+            for pid, val in self.profile_error_cooldown_min.items():
                 if not pid or str(pid).startswith("_"):
                     continue
-                v = int(val or default_cooldown)
-                if 0 < v < 60:
-                    v *= 60
-                error_cooldown[str(pid)] = max(60, min(3600, v))
+                error_cooldown_min[str(pid)] = max(1, min(60, int(val or default_min)))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -98,8 +100,8 @@ class WorkerSettings:
             profile_video_allowed=sorted(set(video_allowed)),
             profile_clear_disabled=sorted(set(clear_disabled)),
             profile_clear_interval=clear_interval,
-            profile_default_error_cooldown_sec=default_cooldown,
-            profile_error_cooldown_sec=error_cooldown,
+            profile_default_error_cooldown_min=default_min,
+            profile_error_cooldown_min=error_cooldown_min,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,8 +117,8 @@ class WorkerSettings:
             "profile_video_allowed": list(n.profile_video_allowed),
             "profile_clear_disabled": list(n.profile_clear_disabled),
             "profile_clear_interval": dict(n.profile_clear_interval),
-            "profile_default_error_cooldown_sec": n.profile_default_error_cooldown_sec,
-            "profile_error_cooldown_sec": dict(n.profile_error_cooldown_sec),
+            "profile_default_error_cooldown_min": n.profile_default_error_cooldown_min,
+            "profile_error_cooldown_min": dict(n.profile_error_cooldown_min),
         }
 
 
@@ -168,9 +170,20 @@ def _load_file() -> WorkerSettings | None:
     clear_interval = raw.get("profile_clear_interval") or {}
     if not isinstance(clear_interval, dict):
         clear_interval = {}
-    error_cooldown = raw.get("profile_error_cooldown_sec") or {}
-    if not isinstance(error_cooldown, dict):
-        error_cooldown = {}
+    error_cooldown_min = raw.get("profile_error_cooldown_min") or {}
+    if not isinstance(error_cooldown_min, dict):
+        error_cooldown_min = {}
+    legacy_sec = raw.get("profile_error_cooldown_sec") or {}
+    if isinstance(legacy_sec, dict):
+        for pid, val in legacy_sec.items():
+            key = str(pid)
+            if key and key not in error_cooldown_min:
+                error_cooldown_min[key] = _cooldown_min_from_legacy_sec(int(val))
+    default_min = int(raw.get("profile_default_error_cooldown_min") or 0)
+    if default_min <= 0:
+        default_min = _cooldown_min_from_legacy_sec(
+            int(raw.get("profile_default_error_cooldown_sec", 600))
+        )
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
@@ -182,10 +195,8 @@ def _load_file() -> WorkerSettings | None:
         profile_video_allowed=[str(x) for x in video_allowed],
         profile_clear_disabled=[str(x) for x in clear_disabled],
         profile_clear_interval={str(k): int(v) for k, v in clear_interval.items()},
-        profile_default_error_cooldown_sec=int(
-            raw.get("profile_default_error_cooldown_sec", 600)
-        ),
-        profile_error_cooldown_sec={str(k): int(v) for k, v in error_cooldown.items()},
+        profile_default_error_cooldown_min=default_min,
+        profile_error_cooldown_min={str(k): int(v) for k, v in error_cooldown_min.items()},
     ).normalized()
 
 
@@ -289,30 +300,39 @@ def set_profile_credit_allowed(profile_id: str, allowed: bool) -> WorkerSettings
     return save_worker_settings(profile_credit_allowed=allowed_ids)
 
 
-def get_profile_error_cooldown_sec(profile_id: str) -> int:
+def get_profile_error_cooldown_min(profile_id: str) -> int:
     from flow2api.config import PROFILE_DEFAULT_ERROR_COOLDOWN_S
 
     pid = str(profile_id or "").strip()
     settings = get_worker_settings()
     default = max(
         1,
-        min(3600, int(settings.profile_default_error_cooldown_sec or PROFILE_DEFAULT_ERROR_COOLDOWN_S)),
+        min(
+            60,
+            int(settings.profile_default_error_cooldown_min or round(PROFILE_DEFAULT_ERROR_COOLDOWN_S / 60)),
+        ),
     )
-    if pid in settings.profile_error_cooldown_sec:
-        val = int(settings.profile_error_cooldown_sec[pid])
-        # Legacy: some builds stored minutes (1–59) instead of seconds.
-        if 0 < val < 60:
-            val *= 60
-        return max(60, min(3600, val))
+    if pid in settings.profile_error_cooldown_min:
+        return max(1, min(60, int(settings.profile_error_cooldown_min[pid])))
     return default
 
 
-def set_profile_error_cooldown_sec(profile_id: str, cooldown_sec: int) -> WorkerSettings:
+def get_profile_error_cooldown_sec(profile_id: str) -> int:
+    return get_profile_error_cooldown_min(profile_id) * 60
+
+
+def set_profile_error_cooldown_min(profile_id: str, cooldown_min: int) -> WorkerSettings:
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
         raise ValueError("invalid_profile_id")
+    minutes = max(1, min(60, int(cooldown_min)))
+    return save_worker_settings(profile_error_cooldown_min={pid: minutes})
+
+
+def set_profile_error_cooldown_sec(profile_id: str, cooldown_sec: int) -> WorkerSettings:
     sec = max(60, min(3600, int(cooldown_sec)))
-    return save_worker_settings(profile_error_cooldown_sec={pid: sec})
+    minutes = max(1, min(60, round(sec / 60)))
+    return set_profile_error_cooldown_min(profile_id, minutes)
 
 
 def save_worker_settings(**fields: Any) -> WorkerSettings:
@@ -387,22 +407,22 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                     merged_clear[str(pid)] = int(val)
             data["profile_clear_interval"] = merged_clear
         if (
-            "profile_default_error_cooldown_sec" in fields
-            and fields["profile_default_error_cooldown_sec"] is not None
+            "profile_default_error_cooldown_min" in fields
+            and fields["profile_default_error_cooldown_min"] is not None
         ):
-            data["profile_default_error_cooldown_sec"] = int(
-                fields["profile_default_error_cooldown_sec"]
+            data["profile_default_error_cooldown_min"] = max(
+                1, min(60, int(fields["profile_default_error_cooldown_min"]))
             )
-        if "profile_error_cooldown_sec" in fields and isinstance(
-            fields["profile_error_cooldown_sec"], dict
+        if "profile_error_cooldown_min" in fields and isinstance(
+            fields["profile_error_cooldown_min"], dict
         ):
-            merged_cd = dict(data.get("profile_error_cooldown_sec") or {})
-            for pid, val in fields["profile_error_cooldown_sec"].items():
+            merged_cd = dict(data.get("profile_error_cooldown_min") or {})
+            for pid, val in fields["profile_error_cooldown_min"].items():
                 if val is None:
                     merged_cd.pop(str(pid), None)
                 else:
-                    merged_cd[str(pid)] = int(val)
-            data["profile_error_cooldown_sec"] = merged_cd
+                    merged_cd[str(pid)] = max(1, min(60, int(val)))
+            data["profile_error_cooldown_min"] = merged_cd
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)
 
@@ -461,7 +481,7 @@ def all_known_profile_ids() -> list[str]:
     ids.update(settings.profile_clear_disabled)
     ids.update(settings.profile_clear_interval.keys())
     ids.update(settings.profile_credit_allowed)
-    ids.update(settings.profile_error_cooldown_sec.keys())
+    ids.update(settings.profile_error_cooldown_min.keys())
     try:
         from flow2api.services.extension_pool import get_extension_pool
 

@@ -16,6 +16,7 @@ from flow2api.services.worker_settings import (
     set_profile_clear_settings,
     set_profile_credit_allowed,
     set_profile_dispatch_enabled,
+    set_profile_error_cooldown_min,
     set_profile_error_cooldown_sec,
     set_profile_media_allowed,
 )
@@ -306,15 +307,19 @@ async def update_profile_job_guard(
     if not pool.get(profile_id):
         raise HTTPException(404, "profile_not_found")
     if body.error_cooldown_min is not None:
+        try:
+            saved = set_profile_error_cooldown_min(profile_id, body.error_cooldown_min)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid_profile_id") from exc
         cooldown_sec = int(body.error_cooldown_min) * 60
     elif body.error_cooldown_sec is not None:
+        try:
+            saved = set_profile_error_cooldown_sec(profile_id, body.error_cooldown_sec)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid_profile_id") from exc
         cooldown_sec = int(body.error_cooldown_sec)
     else:
         raise HTTPException(400, "missing_job_guard_fields")
-    try:
-        saved = set_profile_error_cooldown_sec(profile_id, cooldown_sec)
-    except ValueError as exc:
-        raise HTTPException(400, "invalid_profile_id") from exc
     events.publish(
         "profile_job_guard_changed",
         {
