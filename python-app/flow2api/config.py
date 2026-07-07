@@ -39,10 +39,15 @@ RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
 PROFILE_DEFAULT_ERROR_COOLDOWN_S = int(
     os.environ.get("FLOW2API_PROFILE_DEFAULT_ERROR_COOLDOWN_S", "60")
 )
-HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
-HTTP_404_POLICY_ERROR_MSG = (
-    "Vui lòng kiểm tra lại prompt và ảnh đã vi phạm chinh sách!"
+PROFILE_POST_CLEAR_WAIT_S = int(
+    os.environ.get("FLOW2API_PROFILE_POST_CLEAR_WAIT_S", "10")
 )
+HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
+POLICY_REJECTION_ERROR_MSG = (
+    "Google refused to create the image/video because it violates the content policy. "
+    "Please replace the content or images."
+)
+HTTP_404_POLICY_ERROR_MSG = POLICY_REJECTION_ERROR_MSG
 WORKER_MAX_CONCURRENT = int(os.environ.get("FLOW2API_MAX_CONCURRENT", "1"))
 WORKER_TASK_STAGGER_S = float(os.environ.get("FLOW2API_TASK_STAGGER_S", "0"))
 ACTIVITY_LIST_LIMIT = int(os.environ.get("FLOW2API_ACTIVITY_LIST_LIMIT", "100"))

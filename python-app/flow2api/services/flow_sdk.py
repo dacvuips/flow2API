@@ -21,6 +21,7 @@ import httpx
 from flow2api.config import (
     GOOGLE_API_KEY,
     GOOGLE_FLOW_API,
+    POLICY_REJECTION_ERROR_MSG,
     POLL_INTERVAL_S,
     RECAPTCHA_RETRY_MAX,
     VIDEOS_DIR,
@@ -1004,7 +1005,6 @@ async def upsample_video(
             retryable = (
                 is_recaptcha_error(msg)
                 or is_transient_flow_error(msg)
-                or is_invalid_argument_retry_failure(exc, msg)
             )
             if retryable and attempt < max_attempts - 1:
                 delay = _recaptcha_retry_delay(attempt)
@@ -1496,6 +1496,20 @@ def is_http_403_failure(
     return False
 
 
+def is_policy_rejection_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """HTTP 404 / NOT_FOUND, INVALID_ARGUMENT, prominent-people filter — no retry."""
+    probe = exc if exc is not None else RuntimeError(str(msg or ""))
+    if is_prominent_people_filter_failure(exc, msg, api_trace):
+        return True
+    if is_invalid_argument_retry_failure(exc, msg, api_trace):
+        return True
+    return is_http_404_failure(probe, msg, api_trace)
+
+
 def compact_api_response(resp: Any, label: str = "") -> dict:
     """Shrink extension callback for logs / task result (keep structure, drop huge blobs)."""
     if not isinstance(resp, dict):
@@ -1758,27 +1772,6 @@ async def _video_submit_request(
                 client,
                 error_step,
                 f"transient retry {attempt + 1}: {last_err} — wait {delay}s",
-            )
-            await asyncio.sleep(delay)
-            body = _sanitize_video_submit_body(
-                url, _refresh_video_request_body_session(body, client)
-            )
-            continue
-        if (
-            is_invalid_argument_retry_failure(None, last_err, attempts)
-            or _payload_has_invalid_argument_retry(last_resp)
-        ) and attempt < max_attempts - 1:
-            if "useV2ModelConfig" in str(last_err or ""):
-                body = _sanitize_video_submit_body(url, body)
-                logger.warning(
-                    "video submit stripped useV2ModelConfig for edit endpoint (attempt %s)",
-                    attempt + 1,
-                )
-            delay = _recaptcha_retry_delay(attempt)
-            log_task_event(
-                client,
-                error_step,
-                f"INVALID_ARGUMENT retry {attempt + 1}/{max_attempts}: {last_err} — wait {delay}s",
             )
             await asyncio.sleep(delay)
             body = _sanitize_video_submit_body(
@@ -2275,6 +2268,8 @@ def sanitize_public_error(
     request_type: str = "",
 ) -> str:
     """Map raw Google Flow codes to short user-facing labels."""
+    if is_policy_rejection_failure(exc, msg):
+        return POLICY_REJECTION_ERROR_MSG
     mapped = veo_upsample_recreate_source_public_error(
         msg,
         exc,
@@ -2282,8 +2277,6 @@ def sanitize_public_error(
     )
     if mapped:
         return mapped
-    if _payload_has_prominent_people_filter(msg):
-        return "content_filter"
     return str(msg or "").strip()
 
 

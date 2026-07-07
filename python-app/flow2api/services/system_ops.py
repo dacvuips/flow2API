@@ -557,11 +557,8 @@ async def push_proxy_to_extensions(*, defer_if_busy: bool = True) -> None:
 
 
 async def sync_profile_clear_settings(session: Any) -> dict | None:
-    """Apply dashboard clear-data settings to one extension session."""
-    from flow2api.services.worker_settings import (
-        get_profile_clear_interval_sec,
-        is_profile_clear_enabled,
-    )
+    """Enable/disable clear-after-task (no periodic timer)."""
+    from flow2api.services.worker_settings import is_profile_clear_enabled
 
     if not getattr(session, "connected", False):
         return None
@@ -569,10 +566,9 @@ async def sync_profile_clear_settings(session: Any) -> dict | None:
     if not pid or pid.startswith("_"):
         return None
     enabled = is_profile_clear_enabled(pid)
-    interval = get_profile_clear_interval_sec(pid)
     try:
         if enabled:
-            return await session.clear_control("start", interval_sec=interval)
+            return await session.clear_control("start")
         return await session.clear_control("stop")
     except Exception as exc:
         logger.warning("sync clear settings failed %s: %s", pid[:12], exc)
@@ -580,7 +576,9 @@ async def sync_profile_clear_settings(session: Any) -> dict | None:
 
 
 async def apply_profile_clear_now(session: Any) -> dict:
-    return await session.clear_control("now", timeout=45.0)
+    from flow2api.services.profile_clear import run_profile_clear
+
+    return await run_profile_clear(session, source="manual")
 
 
 def _extension_push_config() -> dict[str, Any]:

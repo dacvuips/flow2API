@@ -206,13 +206,15 @@ class ExtensionSession:
         state = payload.get("state")
         if isinstance(state, dict):
             self.clear_state = dict(state)
-        elif payload.get("running") is not None:
-            self.clear_state = {
-                "running": bool(payload.get("running")),
-                "intervalSec": int(payload.get("intervalSec") or 0),
-                "clearCount": int(payload.get("clearCount") or 0),
-                "secondsUntilNext": payload.get("secondsUntilNext"),
-            }
+            return
+        merged: dict[str, Any] = dict(self.clear_state or {})
+        if payload.get("afterTaskEnabled") is not None:
+            merged["afterTaskEnabled"] = bool(payload.get("afterTaskEnabled"))
+        if payload.get("running") is not None and "afterTaskEnabled" not in payload:
+            merged["afterTaskEnabled"] = bool(payload.get("running"))
+        if payload.get("clearCount") is not None:
+            merged["clearCount"] = int(payload.get("clearCount") or 0)
+        self.clear_state = merged
 
     async def clear_control(
         self,
@@ -457,7 +459,8 @@ class ExtensionSession:
         clear_enabled = is_profile_clear_enabled(self.profile_id)
         clear_interval = get_profile_clear_interval_sec(self.profile_id)
         cs = self.clear_state if isinstance(self.clear_state, dict) else {}
-        clear_running = bool(cs.get("running"))
+        clear_after_task = bool(cs.get("afterTaskEnabled"))
+        clear_running = bool(clear_after_task and clear_enabled)
         from flow2api.services.profile_job_guard import get_profile_job_pause_public
 
         pause_info = get_profile_job_pause_public(self.profile_id)
@@ -485,6 +488,7 @@ class ExtensionSession:
             "proxy_pending_apply": proxy_pending,
             "proxy_assigned": format_proxy_public(assigned_url).get("proxy_display") or "",
             "clear_enabled": clear_enabled,
+            "clear_after_task": clear_after_task and clear_enabled,
             "clear_running": clear_running,
             "clear_interval_sec": int(cs.get("intervalSec") or clear_interval),
             "clear_count": int(cs.get("clearCount") or 0),

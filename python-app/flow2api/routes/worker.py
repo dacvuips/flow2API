@@ -290,7 +290,7 @@ async def update_profile_clear(
         **saved.to_dict(),
         "profiles": pool.list_public(),
         "clear_result": clear_result,
-        "message": f"Đã {state} Clear Data cho profile",
+        "message": f"Đã {state} clear sau task thành công cho profile",
         "ok": True,
     }
 
@@ -350,7 +350,7 @@ async def clear_profile_now(
     events.publish("profile_clear_changed", {"profile_id": profile_id, "manual": True})
     return {
         "ok": True,
-        "message": "Đã xóa cookies labs.google trên tab Flow project",
+        "message": "Đã clear cookies, reload tab — chờ 10s trước job mới",
         "clear_result": result,
         "profiles": pool.list_public(),
     }

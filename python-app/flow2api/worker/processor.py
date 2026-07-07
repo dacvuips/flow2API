@@ -8,10 +8,10 @@ from datetime import datetime
 from typing import Any
 
 from flow2api.config import (
-    HTTP_404_MAX_ATTEMPTS,
-    HTTP_404_POLICY_ERROR_MSG,
     IMAGE_POLL_MAX,
+    POLICY_REJECTION_ERROR_MSG,
     POLL_INTERVAL_S,
+    PROFILE_POST_CLEAR_WAIT_S,
     RECAPTCHA_RETRY_MAX,
     TASK_RUNNING_TIMEOUT_S,
     TASK_TIMEOUT_ERROR,
@@ -30,8 +30,7 @@ from flow2api.services.flow_sdk import (
     is_extension_disconnect_error,
     is_extension_timeout_error,
     is_http_403_failure,
-    is_http_404_failure,
-    is_invalid_argument_retry_failure,
+    is_policy_rejection_failure,
     is_prominent_people_filter_failure,
     is_trpc_401_failure,
     is_upload_image_internal_failure,
@@ -528,6 +527,37 @@ class WorkerController:
         events.publish("request_finished", {"id": rid, "status": "queued"})
         return params
 
+    async def _clear_after_success(self, profile_id: str, rid: str) -> None:
+        session = get_extension_pool().get(profile_id)
+        if not session or not session.connected:
+            return
+        from flow2api.services.profile_clear import run_profile_clear
+
+        append_request_log(
+            rid,
+            "worker",
+            "Clear sau task thành công — bắt đầu",
+            level="info",
+            profile_id=profile_id,
+        )
+        result = await run_profile_clear(session, source="after_task")
+        if result.get("ok"):
+            append_request_log(
+                rid,
+                "worker",
+                f"Clear xong — chờ {PROFILE_POST_CLEAR_WAIT_S}s trước job mới",
+                level="info",
+                profile_id=profile_id,
+            )
+        else:
+            append_request_log(
+                rid,
+                "worker",
+                f"Clear thất bại: {result.get('error') or result.get('message') or 'unknown'}",
+                level="warn",
+                profile_id=profile_id,
+            )
+
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -674,36 +704,8 @@ class WorkerController:
                     profile_email=str(retry_params.get("profile_email") or "") or None,
                 )
                 return
-            get_media_404_retry = int(retry_params.get("get_media_404_retry_count") or 0)
-            if is_http_404_failure(exc, msg, api_trace):
-                if (get_media_404_retry + 1) < HTTP_404_MAX_ATTEMPTS:
-                    retry_params["get_media_404_retry_count"] = get_media_404_retry + 1
-                    row_prompt = str((cur.prompt if cur else "") or "")
-                    retry_params = prepare_params_for_worker_requeue(
-                        retry_params,
-                        rid,
-                        prompt=row_prompt,
-                    )
-                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                    append_request_log(
-                        rid,
-                        "worker",
-                        (
-                            f"HTTP 404 — requeue lần "
-                            f"{get_media_404_retry + 1}/{HTTP_404_MAX_ATTEMPTS} "
-                            f"(same task id, inputs restored)"
-                        ),
-                        level="warn",
-                    )
-                    logger.warning(
-                        "HTTP 404 retry %s/%s rid=%s — inputs restored, profile=%s",
-                        get_media_404_retry + 1,
-                        HTTP_404_MAX_ATTEMPTS,
-                        rid[:8],
-                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                    )
-                    return
-                msg = HTTP_404_POLICY_ERROR_MSG
+            if is_policy_rejection_failure(exc, msg, api_trace):
+                msg = POLICY_REJECTION_ERROR_MSG
             upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
             if (
                 is_upload_image_internal_failure(exc, msg, api_trace)
@@ -754,42 +756,6 @@ class WorkerController:
                 logger.warning(
                     "extension_disconnected retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                     extension_disconnect_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            prominent_people_retry = int(retry_params.get("prominent_people_retry_count") or 0)
-            if (
-                is_prominent_people_filter_failure(exc, msg, api_trace)
-                and prominent_people_retry < RECAPTCHA_RETRY_MAX
-            ):
-                delay_s = flow_sdk.recaptcha_retry_delay(prominent_people_retry)
-                retry_params["prominent_people_retry_count"] = prominent_people_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "prominent_people filter retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    prominent_people_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            invalid_argument_retry = int(retry_params.get("invalid_argument_retry_count") or 0)
-            if (
-                is_invalid_argument_retry_failure(exc, msg, api_trace)
-                and invalid_argument_retry < RECAPTCHA_RETRY_MAX
-            ):
-                delay_s = flow_sdk.recaptcha_retry_delay(invalid_argument_retry)
-                retry_params["invalid_argument_retry_count"] = invalid_argument_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "INVALID_ARGUMENT / PUBLIC_ERROR_MINOR retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    invalid_argument_retry + 1,
                     RECAPTCHA_RETRY_MAX,
                     rid[:8],
                     delay_s,
@@ -909,7 +875,17 @@ class WorkerController:
         finally:
             client.trace_request_id = None
             unbind_task_profile()
+            cur_final = activity.get_request(rid)
+            task_succeeded = bool(cur_final and cur_final.status == "done")
             pool.job_finished(profile_id)
+            if task_succeeded and profile_id:
+                from flow2api.services.worker_settings import is_profile_clear_enabled
+
+                if is_profile_clear_enabled(profile_id):
+                    asyncio.create_task(
+                        self._clear_after_success(profile_id, rid),
+                        name=f"clear-after-{rid[:8]}",
+                    )
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:
