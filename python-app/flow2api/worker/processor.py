@@ -16,6 +16,7 @@ from flow2api.config import (
     TASK_RUNNING_TIMEOUT_S,
     TASK_TIMEOUT_ERROR,
     TASK_TIMEOUT_ERROR_MSG,
+    VIDEO_POLL_INTERVAL_S,
     VIDEO_POLL_MAX,
     VIDEO_POLL_MEDIA_MAX,
     WORKER_NUDGE_STUCK_S,
@@ -1340,13 +1341,16 @@ class WorkerController:
         transient_streak = 0
         for round_idx in range(VIDEO_POLL_MAX):
             self._raise_if_cancelled(rid)
+            await flow_sdk.video_poll_wait(round_idx)
             poll = await flow_sdk.check_async_operations(client, current_ops)
             transient = poll.get("_transient_error")
             if transient and not poll.get("operations"):
                 if flow_sdk.is_transient_flow_error(str(transient)):
                     transient_streak += 1
                     logger.warning("video poll transient (%s): %s", transient_streak, transient)
-                    await asyncio.sleep(min(30, POLL_INTERVAL_S * min(transient_streak, 6)))
+                    await asyncio.sleep(
+                        min(30, VIDEO_POLL_INTERVAL_S * min(transient_streak, 6))
+                    )
                     if media_ids and poll_project_id and transient_streak % 3 == 0:
                         urls, media = await flow_sdk.poll_video_by_media(
                             client,
@@ -1354,6 +1358,7 @@ class WorkerController:
                             media_ids,
                             max_rounds=5,
                             should_abort=self._abort_hook(rid),
+                            skip_first_delay=True,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="media_poll")
@@ -1365,6 +1370,7 @@ class WorkerController:
                             max_rounds=5,
                             project_id=poll_project_id,
                             should_abort=self._abort_hook(rid),
+                            skip_first_delay=True,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="get_media")
@@ -1384,6 +1390,7 @@ class WorkerController:
                             media_ids,
                             max_rounds=15,
                             should_abort=self._abort_hook(rid),
+                            skip_first_delay=True,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="media_poll")
@@ -1402,6 +1409,7 @@ class WorkerController:
                             max_rounds=10,
                             project_id=poll_project_id,
                             should_abort=self._abort_hook(rid),
+                            skip_first_delay=True,
                         )
                         if urls:
                             await _finish(urls, media, recovered_from="get_media")
@@ -1421,6 +1429,7 @@ class WorkerController:
                         media_ids,
                         max_rounds=3,
                         should_abort=self._abort_hook(rid),
+                        skip_first_delay=True,
                     )
                     if urls:
                         await _finish(urls, media, recovered_from="media_poll")
@@ -1439,13 +1448,13 @@ class WorkerController:
                         max_rounds=3,
                         project_id=poll_project_id,
                         should_abort=self._abort_hook(rid),
+                        skip_first_delay=True,
                     )
                     if urls:
                         await _finish(urls, media, recovered_from="get_media")
                         return
                 except GetMedia404Error:
                     raise
-            await asyncio.sleep(POLL_INTERVAL_S)
 
         if media_ids and poll_project_id:
             try:
@@ -1455,6 +1464,7 @@ class WorkerController:
                     media_ids,
                     max_rounds=30,
                     should_abort=self._abort_hook(rid),
+                    skip_first_delay=True,
                 )
                 if urls:
                     await _finish(urls, media, recovered_from="media_poll")
@@ -1473,6 +1483,7 @@ class WorkerController:
                     max_rounds=30,
                     project_id=poll_project_id,
                     should_abort=self._abort_hook(rid),
+                    skip_first_delay=True,
                 )
                 if urls:
                     await _finish(urls, media, recovered_from="get_media")

@@ -1513,8 +1513,7 @@ function broadcastStatus() {
 
 const CLEAR_ALARM = 'f2api-auto-clear';
 const AUTO_CLEAR_INTERVAL_SEC = 5;
-const CLEAR_COOKIE_ORIGINS = ['https://labs.google'];
-const CLEAR_LOCAL_STORAGE_ORIGINS = ['https://labs.google'];
+const CLEAR_LABS_GOOGLE_COOKIE_DOMAINS = ['labs.google', '.labs.google'];
 
 const DEFAULT_CLEAR_STATE = {
   afterTaskEnabled: true,
@@ -1523,9 +1522,6 @@ const DEFAULT_CLEAR_STATE = {
 
 let clearState = { ...DEFAULT_CLEAR_STATE };
 let _autoClearBootstrapping = false;
-
-const CLEAR_SITE_DATA_OPTS = { cookies: true };
-const CLEAR_LOCAL_STORAGE_OPTS = { localStorage: true };
 
 function clampClearSec(sec) {
   return Math.max(1, Math.min(3600, Math.round(Number(sec) || AUTO_CLEAR_INTERVAL_SEC)));
@@ -1577,18 +1573,6 @@ async function resolveClearTargetTab(tabId) {
     }
   }
   return findFlowTabForClear();
-}
-
-function browsingDataRemove(origins, options) {
-  return new Promise((resolve, reject) => {
-    chrome.browsingData.remove({ origins }, options, () => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve();
-      }
-    });
-  });
 }
 
 async function getActiveTab() {
@@ -1651,7 +1635,7 @@ function getPublicClearState() {
     intervalSec: 0,
     clearCount: clearState.clearCount || 0,
     tabId: null,
-    origin: `${CLEAR_COOKIE_ORIGINS.join(', ')} (cookies + localStorage)`,
+    origin: 'https://labs.google (cookies + localStorage only; không xóa google.com)',
     cachedProjectId: _cachedProjectId,
     secondsUntilNext: null,
   };
@@ -1698,6 +1682,58 @@ async function sanitizeClearState() {
   await stopLegacyIntervalClear();
 }
 
+function isLabsGoogleCookieDomain(domain) {
+  const d = String(domain || '').replace(/^\./, '').toLowerCase();
+  return d === 'labs.google';
+}
+
+function cookieRemovalUrl(cookie) {
+  const host = String(cookie.domain || '').replace(/^\./, '');
+  const scheme = cookie.secure ? 'https' : 'http';
+  const path = cookie.path || '/';
+  return `${scheme}://${host}${path}`;
+}
+
+function cookiesGetAll(details) {
+  return new Promise((resolve) => {
+    chrome.cookies.getAll(details, (cookies) => resolve(cookies || []));
+  });
+}
+
+function cookieRemove(details) {
+  return new Promise((resolve, reject) => {
+    chrome.cookies.remove(details, (removed) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(removed);
+      }
+    });
+  });
+}
+
+/** Chỉ xóa cookie domain labs.google — không dùng browsingData (sẽ xóa cả .google.com). */
+async function clearLabsGoogleCookiesOnly() {
+  const seen = new Set();
+  let removed = 0;
+  for (const domain of CLEAR_LABS_GOOGLE_COOKIE_DOMAINS) {
+    const cookies = await cookiesGetAll({ domain });
+    for (const cookie of cookies) {
+      if (!isLabsGoogleCookieDomain(cookie.domain)) continue;
+      const key = `${cookie.storeId}|${cookie.name}|${cookie.domain}|${cookie.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      await cookieRemove({
+        url: cookieRemovalUrl(cookie),
+        name: cookie.name,
+        storeId: cookie.storeId,
+      });
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 async function clearLabsGoogleStorageInTab(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -1717,15 +1753,17 @@ async function clearProjectCookies(tabId, { reload = false } = {}) {
   if (!canReloadTab(tab)) throw new Error('invalid_tab');
   if (!isFlowProjectUrl(tab.url)) throw new Error('not_flow_project');
 
-  await browsingDataRemove(CLEAR_COOKIE_ORIGINS, CLEAR_SITE_DATA_OPTS);
-  await browsingDataRemove(CLEAR_LOCAL_STORAGE_ORIGINS, CLEAR_LOCAL_STORAGE_OPTS);
+  const cookiesRemoved = await clearLabsGoogleCookiesOnly();
   if (isLabsGoogleUrl(tab.url)) {
     await clearLabsGoogleStorageInTab(tabId);
   }
   if (reload) {
     await chrome.tabs.reload(tabId);
   }
-  return `${CLEAR_COOKIE_ORIGINS.join(', ')} cookies + localStorage`;
+  console.log(
+    `[Flow2API] clear labs.google only: cookies=${cookiesRemoved}, localStorage=tab script`,
+  );
+  return 'https://labs.google (cookies + localStorage only)';
 }
 
 async function performClearTick() {

@@ -30,7 +30,7 @@ async def run_profile_clear(
     source: str = "manual",
     reload: bool = True,
 ) -> dict:
-    """Clear labs.google cookies and localStorage; optional tab reload; blocks dispatch while running."""
+    """Clear only labs.google cookies/localStorage (not google.com registrable domain)."""
     pid = str(getattr(session, "profile_id", "") or "").strip()
     if not pid or pid.startswith("_"):
         return {"ok": False, "error": "invalid_profile"}

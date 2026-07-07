@@ -24,6 +24,8 @@ from flow2api.config import (
     POLICY_REJECTION_ERROR_MSG,
     POLL_INTERVAL_S,
     RECAPTCHA_RETRY_MAX,
+    VIDEO_POLL_FIRST_DELAY_S,
+    VIDEO_POLL_INTERVAL_S,
     VIDEOS_DIR,
 )
 from flow2api.services.flow_client import FlowClient
@@ -2448,6 +2450,15 @@ async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | 
     return _save_encoded_video(media_id, encoded) if encoded else None
 
 
+async def video_poll_wait(round_idx: int, *, skip_first_delay: bool = False) -> None:
+    """Video poll timing: 15s before first check, then 10s between checks."""
+    if round_idx <= 0:
+        if not skip_first_delay:
+            await asyncio.sleep(VIDEO_POLL_FIRST_DELAY_S)
+    else:
+        await asyncio.sleep(VIDEO_POLL_INTERVAL_S)
+
+
 async def poll_video_by_media(
     client: FlowClient,
     project_id: str,
@@ -2458,6 +2469,7 @@ async def poll_video_by_media(
     on_round=None,
     interleave_get_media: bool = True,
     requeue_on_get_media_404: bool = False,
+    skip_first_delay: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Poll batchCheckAsyncVideoGenerationStatus with media[{name, projectId}]."""
     pending = [mid for mid in dict.fromkeys(media_ids) if mid]
@@ -2474,6 +2486,7 @@ async def poll_video_by_media(
         remaining = [mid for mid in pending if mid not in completed]
         if not remaining:
             break
+        await video_poll_wait(round_idx, skip_first_delay=skip_first_delay)
 
         poll = await check_async_media(client, project_id, remaining)
         poll_snapshots.append(
@@ -2493,7 +2506,9 @@ async def poll_video_by_media(
         if transient and not poll.get("media") and not poll.get("operations"):
             if is_transient_flow_error(str(transient)):
                 transient_streak += 1
-                await asyncio.sleep(min(30, POLL_INTERVAL_S * min(transient_streak, 6)))
+                await asyncio.sleep(
+                    min(30, VIDEO_POLL_INTERVAL_S * min(transient_streak, 6))
+                )
                 continue
             raise FlowApiError(
                 str(transient),
@@ -2564,7 +2579,6 @@ async def poll_video_by_media(
 
         if round_idx % 10 == 9:
             logger.info("media poll round %s/%s done=%s", round_idx + 1, max_rounds, len(completed))
-        await asyncio.sleep(POLL_INTERVAL_S)
 
     if completed and await _resolve_all_media_urls(client, completed, pending):
         return list(completed.values()), list(completed.keys())
@@ -2678,6 +2692,7 @@ async def poll_workflow_videos(
     project_id: str | None = None,
     should_abort=None,
     on_round=None,
+    skip_first_delay: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Poll Lower Priority / workflow models (batch status + get_media, requeue on 404)."""
     media_ids = list(
@@ -2703,6 +2718,7 @@ async def poll_workflow_videos(
             should_abort=should_abort,
             on_round=on_round,
             requeue_on_get_media_404=True,
+            skip_first_delay=skip_first_delay,
         )
 
     pending = {mid for mid in media_ids if mid}
@@ -2711,6 +2727,9 @@ async def poll_workflow_videos(
     for round_idx in range(max_rounds):
         if should_abort:
             should_abort()
+        if len(completed) >= len(pending) and pending:
+            return list(completed.values()), list(completed.keys())
+        await video_poll_wait(round_idx, skip_first_delay=skip_first_delay)
         for mid in list(pending):
             if _media_url_is_resolved(completed.get(mid, ""), mid):
                 continue
@@ -2728,7 +2747,6 @@ async def poll_workflow_videos(
 
         if len(completed) >= len(pending) and pending:
             return list(completed.values()), list(completed.keys())
-        await asyncio.sleep(POLL_INTERVAL_S)
 
     if completed:
         return list(completed.values()), list(completed.keys())

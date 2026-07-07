@@ -32,6 +32,8 @@ ADMIN_PASSWORD = os.environ.get("FLOW2API_ADMIN_PASSWORD", "admin")
 ADMIN_SESSION_COOKIE = "flow2api_admin_session"
 
 POLL_INTERVAL_S = float(os.environ.get("FLOW2API_POLL_INTERVAL", "2.5"))
+VIDEO_POLL_FIRST_DELAY_S = float(os.environ.get("FLOW2API_VIDEO_POLL_FIRST_DELAY", "15"))
+VIDEO_POLL_INTERVAL_S = float(os.environ.get("FLOW2API_VIDEO_POLL_INTERVAL", "10"))
 IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
 VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
