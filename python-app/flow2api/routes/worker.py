@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from flow2api.services import activity
@@ -323,3 +323,53 @@ async def profile_refresh_token(profile_id: str, _=Depends(_auth_key_id)):
         "profiles": pool.list_public(),
         "ok": True,
     }
+
+
+@router.get("/profiles/sessions/export")
+async def export_profile_sessions(_=Depends(_auth_key_id)):
+    """Export all profile tokens/cookies (+ expiry) as JSON backup."""
+    from flow2api.services.flow_profile_service import export_all_profile_sessions
+
+    return export_all_profile_sessions()
+
+
+@router.get("/profiles/{profile_id}/session/export")
+async def export_one_profile_session(profile_id: str, _=Depends(_auth_key_id)):
+    from flow2api.services.flow_profile_service import export_profile_session
+
+    data = export_profile_session(profile_id)
+    if not data:
+        raise HTTPException(404, "profile_not_found")
+    return data
+
+
+@router.post("/profiles/sessions/import")
+async def import_profile_sessions_route(request: Request, _=Depends(_auth_key_id)):
+    """Import one or many profile sessions (token/cookies/expiry)."""
+    from flow2api.services.flow_profile_service import import_profile_sessions
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+    result = import_profile_sessions(payload)
+    pool = get_extension_pool()
+    pool.hydrate_db_profiles()
+    return {**result, "profiles": pool.list_public()}
+
+
+@router.post("/profiles/{profile_id}/session/import")
+async def import_one_profile_session(
+    profile_id: str, body: dict = Body(default_factory=dict), _=Depends(_auth_key_id)
+):
+    from flow2api.services.flow_profile_service import import_profile_session
+
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid_payload")
+    result = import_profile_session(body, target_profile_id=profile_id)
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("error") or "import_failed"))
+    pool = get_extension_pool()
+    pool.hydrate_db_profiles()
+    return {**result, "profiles": pool.list_public()}
+

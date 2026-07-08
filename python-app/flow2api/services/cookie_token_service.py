@@ -36,7 +36,7 @@ async def refresh_access_token_from_cookies(
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-US,en;q=0.9",
         "cache-control": "max-age=0",
-        "cookie": cookie_header,
+        "Cookie": cookie_header,
         "referer": "https://labs.google/fx/en/tools/flow",
         "upgrade-insecure-requests": "1",
     }

@@ -227,6 +227,7 @@ class ExtensionSession:
 
         hdrs = dict(headers or {})
         token = get_stored_access_token(self.profile_id)
+        offline = not self.connected
         if refresh:
             meta = token_public_fields(
                 self.profile_id,
@@ -234,12 +235,28 @@ class ExtensionSession:
                 extension_online=self.connected,
             )
             rem = meta.get("token_remaining_seconds")
-            needs_refresh = not token or (rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S)
+            needs_refresh = (
+                not token
+                or offline
+                or (rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S)
+            )
             if needs_refresh:
                 result = await self.refresh_flow_token(force=True)
+                if not result.get("ok") and offline:
+                    err = str(result.get("error") or "TOKEN_REFRESH_FAILED")
+                    raise RuntimeError(
+                        "offline_auth_expired: Cookies/token trong DB không còn hợp lệ — "
+                        "mở Chrome profile, bấm Get Connection Status để sync lại, rồi thử gen."
+                        f" ({err})"
+                    )
                 if result.get("ok"):
                     token = get_stored_access_token(self.profile_id)
         if not token:
+            if offline:
+                raise RuntimeError(
+                    "offline_auth_expired: Không có access token trong DB — "
+                    "mở Chrome profile và bấm Get Connection Status."
+                )
             raise RuntimeError("NO_FLOW_KEY")
         hdrs["Authorization"] = f"Bearer {token}"
         return hdrs
@@ -474,6 +491,13 @@ class ExtensionSession:
                     status_probe = int(resp.get("status") or 0)
                 except (TypeError, ValueError):
                     status_probe = 0
+            elif not self.connected:
+                err = str(refresh.get("error") or "TOKEN_REFRESH_FAILED")
+                raise RuntimeError(
+                    "offline_auth_expired: Google từ chối token — cookies DB đã hết hạn. "
+                    "Mở Chrome profile → Get Connection Status → thử gen lại."
+                    f" ({err})"
+                )
         # Nếu Google trả 403 (score thấp) → yêu cầu 1 center hard_reset
         if captcha_action and status_probe == 403:
             self._request_center_hard_reset(reason=f"api_403:{captcha_action}")
@@ -802,7 +826,12 @@ class ExtensionSession:
             extension_online=self.connected,
         )
         rem = meta.get("token_remaining_seconds")
-        if self.flow_key and rem is not None and rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S:
+        if (
+            self.flow_key
+            and self.connected
+            and rem is not None
+            and rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
+        ):
             return True
         result = await self.refresh_flow_token(force=True)
         return bool(result.get("ok") and self.flow_key)

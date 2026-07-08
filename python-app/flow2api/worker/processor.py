@@ -887,7 +887,14 @@ class WorkerController:
         client = get_flow_client()
         if not client.connected and not client.has_direct_lane():
             raise RuntimeError("extension_not_connected")
-        if not client.flow_key:
+        if not client.connected and client.has_direct_lane():
+            refreshed = await client.ensure_token_fresh()
+            if not refreshed or not client.flow_key:
+                raise RuntimeError(
+                    "offline_auth_expired: Profile offline — không refresh được token từ cookies DB. "
+                    "Mở Chrome profile và bấm Get Connection Status."
+                )
+        elif not client.flow_key:
             refreshed = await client.ensure_token_fresh()
             if not refreshed or not client.flow_key:
                 raise RuntimeError("no_flow_token")

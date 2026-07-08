@@ -500,6 +500,155 @@ def profile_direct_lane_ready(profile_id: str) -> bool:
 
 
 
+
+def get_access_token_for_export(profile_id: str) -> Optional[str]:
+    """Decrypt ya29 for backup/export even if marked expired."""
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None
+    with SessionLocal() as db:
+        row = db.get(FlowProfile, pid)
+        if not row or not row.access_token_enc:
+            return None
+        try:
+            return decrypt_token(row.access_token_enc)
+        except Exception as exc:
+            logger.warning("export decrypt flow token failed profile=%s: %s", pid[:12], exc)
+            return None
+
+
+def export_profile_session(profile_id: str) -> Optional[dict[str, Any]]:
+    from flow2api.services.cookie_service import get_profile_cookies_raw, has_stored_cookies
+
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None
+    row = get_profile_row(pid)
+    if not row:
+        return None
+    token = get_access_token_for_export(pid)
+    cookies = get_profile_cookies_raw(pid)
+    return {
+        "profile_id": pid,
+        "profile_label": row.profile_label or "",
+        "email": row.email or "",
+        "access_token": token,
+        "access_token_expires_at": (
+            row.access_token_expires_at.isoformat() + "Z" if row.access_token_expires_at else None
+        ),
+        "token_captured_at": (
+            row.token_captured_at.isoformat() + "Z" if row.token_captured_at else None
+        ),
+        "cookies": cookies,
+        "cookies_captured_at": (
+            row.cookies_captured_at.isoformat() + "Z"
+            if getattr(row, "cookies_captured_at", None)
+            else None
+        ),
+        "paygate_tier": row.paygate_tier,
+        "has_access_token": bool(token),
+        "has_cookies": has_stored_cookies(pid),
+    }
+
+
+def export_all_profile_sessions() -> dict[str, Any]:
+    from datetime import datetime
+
+    profiles = []
+    for row in list_all_profile_rows():
+        pid = str(row.profile_id or "").strip()
+        if not pid or pid.startswith("_"):
+            continue
+        item = export_profile_session(pid)
+        if item:
+            profiles.append(item)
+    return {
+        "format": "flow2api-profile-sessions",
+        "version": 1,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "count": len(profiles),
+        "profiles": profiles,
+    }
+
+
+def import_profile_session(payload: dict[str, Any], *, target_profile_id: str = "") -> dict[str, Any]:
+    from flow2api.services.cookie_service import save_profile_cookies
+
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "invalid_payload"}
+    pid = str(target_profile_id or payload.get("profile_id") or "").strip()
+    if not pid:
+        email = str(payload.get("email") or "").strip().lower()
+        if email:
+            for row in list_all_profile_rows():
+                if str(row.email or "").strip().lower() == email:
+                    pid = str(row.profile_id)
+                    break
+    if not pid:
+        return {"ok": False, "error": "missing_profile_id"}
+
+    token = str(payload.get("access_token") or payload.get("flowKey") or "").strip()
+    cookies = payload.get("cookies")
+    label = str(payload.get("profile_label") or payload.get("display_name") or "").strip()
+    email = str(payload.get("email") or "").strip()
+    tier = payload.get("paygate_tier")
+    expires_at = (
+        payload.get("access_token_expires_at")
+        or payload.get("expiresAt")
+        or payload.get("expires_at")
+    )
+
+    ensure_profile_row(pid, profile_label=label, email=email)
+    if token:
+        save_access_token(
+            pid,
+            token,
+            profile_label=label,
+            email=email,
+            paygate_tier=str(tier) if tier else None,
+            expires_at=expires_at,
+        )
+    elif label or email or tier:
+        update_profile_meta(
+            pid,
+            profile_label=label,
+            email=email,
+            paygate_tier=str(tier) if tier else None,
+        )
+    if cookies is not None and cookies != "":
+        save_profile_cookies(pid, cookies)
+
+    return {
+        "ok": True,
+        "profile_id": pid,
+        "imported_token": bool(token),
+        "imported_cookies": cookies is not None and cookies != "",
+    }
+
+
+def import_profile_sessions(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+        items = payload["profiles"]
+    elif isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = [payload]
+    else:
+        return {"ok": False, "error": "invalid_payload", "imported": 0, "results": []}
+
+    results = []
+    ok_n = 0
+    for item in items:
+        if not isinstance(item, dict):
+            results.append({"ok": False, "error": "invalid_item"})
+            continue
+        r = import_profile_session(item)
+        results.append(r)
+        if r.get("ok"):
+            ok_n += 1
+    return {"ok": ok_n > 0, "imported": ok_n, "total": len(items), "results": results}
+
+
 def token_public_fields(
 
     profile_id: str,
