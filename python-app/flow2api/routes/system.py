@@ -188,7 +188,7 @@ async def serve_media(media_id: str):
             return FileResponse(path, media_type="video/mp4")
 
         client = get_flow_client()
-        if not client.connected:
+        if not client.connected and not client.has_direct_lane():
             raise HTTPException(503, "extension_not_connected")
         try:
             resp = await asyncio.wait_for(client.get_media(media_id), timeout=60)
@@ -265,7 +265,7 @@ async def flow_upload_media(
         if body.profile_id
         else get_flow_client()
     )
-    if not client.connected:
+    if not client.connected and not client.has_direct_lane():
         raise HTTPException(503, "extension_not_connected")
     project_id = str(body.project_id or "").strip()
     if not project_id:

@@ -1,0 +1,653 @@
+"""Persist Flow access tokens per Chrome profile (parity Veo3Studio profile.accessToken)."""
+
+from __future__ import annotations
+
+
+
+import logging
+
+from datetime import datetime, timedelta, timezone
+
+from typing import Any, Optional
+
+
+
+from flow2api.config import (
+
+    FLOW_ACCESS_TOKEN_FALLBACK_TTL_S,
+
+    FLOW_ACCESS_TOKEN_MAX_TTL_S,
+
+    FLOW_ACCESS_TOKEN_TTL_S,
+
+)
+
+from flow2api.db.models import FlowProfile, SessionLocal
+
+from flow2api.services.token_cipher import decrypt_token, encrypt_token
+
+
+
+logger = logging.getLogger(__name__)
+
+
+
+_AUTH_STATUS_MARGIN_S = 60
+
+
+
+
+
+def _utcnow() -> datetime:
+
+    return datetime.utcnow()
+
+
+
+
+
+def _parse_expires_at(value: Any) -> Optional[datetime]:
+
+    if value is None or value == "":
+
+        return None
+
+    if isinstance(value, datetime):
+
+        dt = value
+
+    elif isinstance(value, (int, float)):
+
+        ts = float(value)
+
+        if ts > 1e12:
+
+            ts /= 1000.0
+
+        dt = datetime.utcfromtimestamp(ts)
+
+    else:
+
+        raw = str(value).strip()
+
+        if not raw:
+
+            return None
+
+        if raw.endswith("Z"):
+
+            raw = raw[:-1] + "+00:00"
+
+        try:
+
+            dt = datetime.fromisoformat(raw)
+
+        except ValueError:
+
+            return None
+
+    if dt.tzinfo is not None:
+
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return dt
+
+
+
+
+
+def _resolve_expires_at(
+
+    expires_at: Optional[datetime],
+
+    captured_at: datetime,
+
+) -> datetime:
+
+    """Normalize expiry like Veo3Studio cookieTokenService (API expires or fallback TTL)."""
+
+    now = _utcnow()
+
+    max_future = now + timedelta(seconds=max(60, FLOW_ACCESS_TOKEN_MAX_TTL_S))
+
+    fallback = captured_at + timedelta(seconds=max(60, FLOW_ACCESS_TOKEN_FALLBACK_TTL_S))
+
+    ttl_fallback = captured_at + timedelta(seconds=max(60, FLOW_ACCESS_TOKEN_TTL_S))
+
+    if expires_at:
+
+        if expires_at <= now or expires_at > max_future:
+
+            logger.info(
+
+                "flow token expiry invalid (%s) — using fallback TTL",
+
+                expires_at.isoformat(),
+
+            )
+
+            return fallback
+
+        return expires_at
+
+    return ttl_fallback
+
+
+
+
+
+def _remaining_seconds(expires_at: Optional[datetime], now: Optional[datetime] = None) -> Optional[int]:
+
+    if not expires_at:
+
+        return None
+
+    now = now or _utcnow()
+
+    return max(0, int((expires_at - now).total_seconds()))
+
+
+
+
+
+def _token_status(
+
+    *,
+
+    has_token: bool,
+
+    expires_at: Optional[datetime],
+
+    live_present: bool,
+
+    extension_online: bool = False,
+
+    now: Optional[datetime] = None,
+
+) -> str:
+
+    if not has_token:
+
+        if not extension_online:
+
+            return "no-session"
+
+        return "missing"
+
+    rem = _remaining_seconds(expires_at, now)
+
+    if rem is not None and rem <= 0:
+
+        return "expired"
+
+    if rem is not None and rem <= _AUTH_STATUS_MARGIN_S:
+
+        return "stale"
+
+    return "fresh"
+
+
+
+
+
+def get_profile_row(profile_id: str) -> Optional[FlowProfile]:
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return None
+
+    with SessionLocal() as db:
+
+        return db.get(FlowProfile, pid)
+
+
+
+
+
+def ensure_profile_row(profile_id: str, *, profile_label: str = "", email: str = "") -> None:
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row:
+
+            row = FlowProfile(profile_id=pid)
+
+            db.add(row)
+
+        if profile_label and profile_label != row.profile_label:
+
+            row.profile_label = profile_label
+
+        if email and email != row.email:
+
+            row.email = email
+
+        row.updated_at = _utcnow()
+
+        db.commit()
+
+
+
+
+
+def save_access_token(
+
+    profile_id: str,
+
+    access_token: str,
+
+    *,
+
+    profile_label: str = "",
+
+    email: str = "",
+
+    paygate_tier: Optional[str] = None,
+
+    captured_at: Optional[datetime] = None,
+
+    expires_at: Optional[datetime] = None,
+
+) -> None:
+
+    pid = str(profile_id or "").strip()
+
+    token = str(access_token or "").strip()
+
+    if not pid or not token:
+
+        return
+
+    captured = captured_at or _utcnow()
+
+    parsed_expires = _parse_expires_at(expires_at) if expires_at is not None else None
+
+    expires = _resolve_expires_at(parsed_expires, captured)
+
+    enc = encrypt_token(token)
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row:
+
+            row = FlowProfile(profile_id=pid)
+
+            db.add(row)
+
+        row.access_token_enc = enc
+
+        row.token_captured_at = captured
+
+        row.access_token_expires_at = expires
+
+        if profile_label:
+
+            row.profile_label = profile_label
+
+        if email:
+
+            row.email = email
+
+        if paygate_tier:
+
+            row.paygate_tier = paygate_tier
+
+        row.updated_at = _utcnow()
+
+        db.commit()
+
+    logger.info(
+
+        "flow token saved profile=%s expires=%s",
+
+        pid[:12],
+
+        expires.isoformat(),
+
+    )
+
+
+
+
+
+def update_profile_meta(
+
+    profile_id: str,
+
+    *,
+
+    profile_label: str = "",
+
+    email: str = "",
+
+    paygate_tier: Optional[str] = None,
+
+) -> None:
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row:
+
+            row = FlowProfile(profile_id=pid)
+
+            db.add(row)
+
+        if profile_label:
+
+            row.profile_label = profile_label
+
+        if email:
+
+            row.email = email
+
+        if paygate_tier:
+
+            row.paygate_tier = paygate_tier
+
+        row.updated_at = _utcnow()
+
+        db.commit()
+
+
+
+
+
+def clear_access_token(profile_id: str) -> None:
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row:
+
+            return
+
+        row.access_token_enc = None
+
+        row.token_captured_at = None
+
+        row.access_token_expires_at = None
+
+        row.cookies_enc = None
+
+        row.cookies_captured_at = None
+
+        row.updated_at = _utcnow()
+
+        db.commit()
+
+
+
+
+
+def clear_all_access_tokens() -> None:
+
+    with SessionLocal() as db:
+
+        rows = db.query(FlowProfile).all()
+
+        for row in rows:
+
+            row.access_token_enc = None
+
+            row.token_captured_at = None
+
+            row.access_token_expires_at = None
+
+            row.cookies_enc = None
+
+            row.cookies_captured_at = None
+
+            row.updated_at = _utcnow()
+
+        db.commit()
+
+
+
+
+
+def get_stored_access_token(profile_id: str) -> Optional[str]:
+
+    """Return decrypted ya29 if present and not expired (Veo3Studio getAccessTokenFromProfile)."""
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return None
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row or not row.access_token_enc:
+
+            return None
+
+        if row.access_token_expires_at and row.access_token_expires_at <= _utcnow():
+
+            return None
+
+        try:
+
+            return decrypt_token(row.access_token_enc)
+
+        except Exception as exc:
+
+            logger.warning("decrypt flow token failed profile=%s: %s", pid[:12], exc)
+
+            return None
+
+
+
+
+
+def list_all_profile_rows() -> list[FlowProfile]:
+
+    with SessionLocal() as db:
+
+        return list(db.query(FlowProfile).all())
+
+
+
+
+
+def profile_direct_lane_ready(profile_id: str) -> bool:
+
+    from flow2api.config import FLOW_DIRECT_HTTP_ENABLED
+
+    from flow2api.services.cookie_service import has_stored_cookies
+
+    if not FLOW_DIRECT_HTTP_ENABLED:
+
+        return False
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return False
+
+    return has_stored_cookies(pid) and bool(get_stored_access_token(pid))
+
+
+
+
+
+def token_public_fields(
+
+    profile_id: str,
+
+    *,
+
+    live_flow_key_present: bool = False,
+
+    extension_online: bool = False,
+
+) -> dict[str, Any]:
+
+    row = get_profile_row(profile_id)
+
+    now = _utcnow()
+
+    has_token = bool(row and row.access_token_enc)
+
+    expires_at = row.access_token_expires_at if row else None
+
+    captured_at = row.token_captured_at if row else None
+
+    remaining = _remaining_seconds(expires_at, now) if has_token else None
+
+    status = _token_status(
+
+        has_token=has_token,
+
+        expires_at=expires_at,
+
+        live_present=live_flow_key_present,
+
+        extension_online=extension_online,
+
+        now=now,
+
+    )
+
+    hours_left = round(remaining / 3600, 1) if remaining is not None and remaining > 0 else None
+
+    from flow2api.services.cookie_service import has_stored_cookies
+
+    cookies_ok = has_stored_cookies(profile_id)
+
+    direct_ready = profile_direct_lane_ready(profile_id)
+
+    return {
+
+        "access_token_expires_at": expires_at.isoformat() + "Z" if expires_at else None,
+
+        "token_captured_at": captured_at.isoformat() + "Z" if captured_at else None,
+
+        "token_remaining_seconds": remaining,
+
+        "token_hours_left": hours_left,
+
+        "token_status": status,
+
+        "stored_flow_key_present": has_token and (remaining or 0) > 0,
+
+        "stored_cookies_present": cookies_ok,
+
+        "direct_lane_ready": direct_ready,
+
+        "extension_online": extension_online,
+
+    }
+
+
+
+
+
+def profile_auth_status(
+
+    profile_id: str,
+
+    *,
+
+    live_flow_key_present: bool = False,
+
+    extension_online: bool = False,
+
+) -> dict[str, Any]:
+
+    """Pre-flight auth check (parity Veo3Studio GET /api/profiles/:id/auth-status)."""
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return {"status": "unknown", "error": "missing_profile_id"}
+
+    if not get_profile_row(pid) and not extension_online:
+
+        return {"status": "unknown", "error": "profile_not_found"}
+
+    meta = token_public_fields(
+
+        pid,
+
+        live_flow_key_present=live_flow_key_present,
+
+        extension_online=extension_online,
+
+    )
+
+    status = str(meta.get("token_status") or "unknown")
+
+    return {
+
+        "status": status,
+
+        "extension_online": extension_online,
+
+        "live_flow_key_present": live_flow_key_present,
+
+        "stored_flow_key_present": meta.get("stored_flow_key_present"),
+
+        "token_expires_at": meta.get("access_token_expires_at"),
+
+        "token_remaining_seconds": meta.get("token_remaining_seconds"),
+
+        "token_hours_left": meta.get("token_hours_left"),
+
+    }
+
+
+
+
+
+def enrich_public_profile(public: dict[str, Any]) -> dict[str, Any]:
+
+    pid = str(public.get("profile_id") or "").strip()
+
+    if not pid:
+
+        return public
+
+    meta = token_public_fields(
+
+        pid,
+
+        live_flow_key_present=bool(public.get("browser_flow_key_present")),
+
+        extension_online=bool(public.get("online")),
+
+    )
+
+    return {**public, **meta}
+
+

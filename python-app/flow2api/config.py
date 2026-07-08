@@ -38,6 +38,28 @@ IMAGE_POLL_MAX = int(os.environ.get("FLOW2API_IMAGE_POLL_MAX", "90"))
 VIDEO_POLL_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MAX", "240"))
 VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
+# Flow ya29 token TTL in DB (Veo3Studio cookieTokenService defaults).
+FLOW_ACCESS_TOKEN_TTL_S = int(os.environ.get("FLOW2API_FLOW_TOKEN_TTL_S", str(55 * 60)))
+FLOW_ACCESS_TOKEN_FALLBACK_TTL_S = int(
+    os.environ.get("FLOW2API_FLOW_TOKEN_FALLBACK_TTL_S", str(5 * 60 * 60))
+)
+FLOW_ACCESS_TOKEN_MAX_TTL_S = int(
+    os.environ.get("FLOW2API_FLOW_TOKEN_MAX_TTL_S", str(24 * 60 * 60))
+)
+# Refresh stored token when remaining <= this (Veo3Studio 5 min window).
+FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S = int(
+    os.environ.get("FLOW2API_FLOW_TOKEN_REFRESH_BEFORE_S", str(5 * 60))
+)
+# Direct HTTP lane (parity Veo3Studio googleFetch) — gen without Chrome extension proxy.
+FLOW_DIRECT_HTTP_ENABLED = os.environ.get("FLOW2API_DIRECT_HTTP", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+FLOW_HTTP_IMPERSONATE = os.environ.get("FLOW2API_HTTP_IMPERSONATE", "chrome131")
+FLOW_HTTP_CHROME_MAJOR = int(os.environ.get("FLOW2API_CHROME_MAJOR", "131"))
+FLOW_HTTP_USER_AGENT = os.environ.get("FLOW2API_HTTP_USER_AGENT", "").strip()
 HTTP_404_MAX_ATTEMPTS = int(os.environ.get("FLOW2API_HTTP_404_MAX_ATTEMPTS", "3"))
 POLICY_REJECTION_ERROR_MSG = (
     "Google refused to create the image/video because it violates the content policy. "

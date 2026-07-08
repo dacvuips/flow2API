@@ -242,3 +242,84 @@ async def update_profile_media(
         "profiles": pool.list_public(),
         "ok": True,
     }
+
+
+@router.get("/profiles/{profile_id}/auth-status")
+async def profile_auth_status(profile_id: str, _=Depends(_auth_key_id)):
+    from flow2api.services.flow_profile_service import profile_auth_status as auth_status
+
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        pool.hydrate_db_profiles()
+        session = pool.get(profile_id)
+    if not session:
+        return auth_status(profile_id, live_flow_key_present=False, extension_online=False)
+    return auth_status(
+        profile_id,
+        live_flow_key_present=session.browser_flow_key_present,
+        extension_online=session.connected,
+    )
+
+
+@router.post("/profiles/{profile_id}/test-connection")
+async def profile_test_connection(profile_id: str, _=Depends(_auth_key_id)):
+    from flow2api.services.cookie_service import has_stored_cookies
+
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        pool.hydrate_db_profiles()
+        session = pool.get(profile_id)
+    if not session:
+        raise HTTPException(404, "profile_not_found")
+    if not session.connected and not has_stored_cookies(profile_id):
+        raise HTTPException(400, "extension_offline")
+    result = await session.test_connection()
+    if not result.get("success"):
+        raise HTTPException(400, str(result.get("error") or "TOKEN_REFRESH_FAILED"))
+    return {
+        **result,
+        "profiles": pool.list_public(),
+        "ok": True,
+    }
+
+
+@router.post("/profiles/{profile_id}/open-flow")
+async def profile_open_flow(profile_id: str, _=Depends(_auth_key_id)):
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        raise HTTPException(404, "profile_not_found")
+    if not session.connected:
+        raise HTTPException(400, "extension_offline")
+    result = await session.open_flow_tab()
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("error") or "OPEN_FLOW_TAB_FAILED"))
+    return {**result, "ok": True}
+
+
+@router.post("/profiles/{profile_id}/refresh-token")
+async def profile_refresh_token(profile_id: str, _=Depends(_auth_key_id)):
+    from flow2api.services.cookie_service import has_stored_cookies
+
+    pool = get_extension_pool()
+    session = pool.get(profile_id)
+    if not session:
+        pool.hydrate_db_profiles()
+        session = pool.get(profile_id)
+    if not session:
+        raise HTTPException(404, "profile_not_found")
+    if not session.connected and not has_stored_cookies(profile_id):
+        raise HTTPException(400, "extension_offline")
+    result = await session.refresh_flow_token(force=True)
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("error") or "TOKEN_REFRESH_FAILED"))
+    meta = session.to_public_dict()
+    return {
+        "success": True,
+        "message": "Access token refreshed successfully!",
+        "expires_at": meta.get("access_token_expires_at"),
+        "profiles": pool.list_public(),
+        "ok": True,
+    }

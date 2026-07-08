@@ -62,6 +62,26 @@ class AdminSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class FlowProfile(Base):
+    """Per Chrome profile — persisted Flow access token (ya29), parity Veo3Studio profile.accessToken."""
+
+    __tablename__ = "flow_profiles"
+
+    profile_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    profile_label: Mapped[str] = mapped_column(String(255), default="")
+    email: Mapped[str] = mapped_column(String(255), default="")
+    access_token_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    token_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    access_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cookies_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cookies_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    paygate_tier: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -80,3 +100,8 @@ def init_db() -> None:
         key_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(api_keys)")).fetchall()}
         if "token_enc" not in key_cols:
             conn.execute(text("ALTER TABLE api_keys ADD COLUMN token_enc TEXT"))
+        fp_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(flow_profiles)")).fetchall()}
+        if fp_cols and "cookies_enc" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_enc TEXT"))
+        if fp_cols and "cookies_captured_at" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_captured_at DATETIME"))

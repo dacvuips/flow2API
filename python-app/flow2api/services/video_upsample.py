@@ -182,7 +182,7 @@ async def execute_upsample_video_on_client(
         await asyncio.sleep(0.8)
         await client.fetch_paygate_tier()
     try:
-        await client.refresh_flow_token()
+        await client.refresh_flow_token(force=True)
     except Exception:
         pass
 
@@ -236,7 +236,7 @@ async def run_upsample_video(
             ) from exc
         raise
 
-    if not client.connected:
+    if not client.connected and not client.has_direct_lane():
         raise HTTPException(503, "extension_not_connected")
     if not client.flow_key:
         raise HTTPException(503, "no_flow_token")

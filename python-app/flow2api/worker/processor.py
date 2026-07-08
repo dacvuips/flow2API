@@ -885,10 +885,12 @@ class WorkerController:
             return
         params = json.loads(row.params_json or "{}")
         client = get_flow_client()
-        if not client.connected:
+        if not client.connected and not client.has_direct_lane():
             raise RuntimeError("extension_not_connected")
         if not client.flow_key:
-            raise RuntimeError("no_flow_token")
+            refreshed = await client.ensure_token_fresh()
+            if not refreshed or not client.flow_key:
+                raise RuntimeError("no_flow_token")
         if not client.paygate_tier:
             await client.fetch_paygate_tier()
 

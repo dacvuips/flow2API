@@ -29,6 +29,26 @@ def _url_requires_center_captcha(url: str) -> bool:
     return False
 
 
+def _inject_captcha_into_body(body: Any, captcha_token: str) -> Any:
+    if not body or not captcha_token or not isinstance(body, dict):
+        return body
+    import copy
+
+    final = copy.deepcopy(body)
+    ctx = final.get("clientContext")
+    if isinstance(ctx, dict) and isinstance(ctx.get("recaptchaContext"), dict):
+        ctx["recaptchaContext"]["token"] = captcha_token
+    reqs = final.get("requests")
+    if isinstance(reqs, list):
+        for req in reqs:
+            if not isinstance(req, dict):
+                continue
+            rctx = req.get("clientContext")
+            if isinstance(rctx, dict) and isinstance(rctx.get("recaptchaContext"), dict):
+                rctx["recaptchaContext"]["token"] = captcha_token
+    return final
+
+
 _bound_profile_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "bound_profile_id", default=None
 )
@@ -50,7 +70,7 @@ class ExtensionSession:
         # tell the extension exactly which fetch()es to abort. Populated /
         # cleaned by _send.
         self._trace_pending: dict[str, set[str]] = {}
-        self.flow_key: Optional[str] = None
+        self._browser_flow_key: Optional[str] = None
         self.token_captured_at: Optional[float] = None
         self.user_info: Optional[dict] = None
         self.paygate_tier: Optional[str] = None
@@ -85,7 +105,25 @@ class ExtensionSession:
             return self.profile_label
         return self.profile_id[:12]
 
+    @property
+    def flow_key(self) -> Optional[str]:
+        """ya29 from DB — nguồn token khi generate (parity Veo3Studio Profile.accessToken)."""
+        from flow2api.services.flow_profile_service import get_stored_access_token
+
+        return get_stored_access_token(self.profile_id)
+
+    @property
+    def browser_flow_key_present(self) -> bool:
+        return bool(self._browser_flow_key)
+
+    def has_direct_lane(self) -> bool:
+        from flow2api.services.flow_profile_service import profile_direct_lane_ready
+
+        return profile_direct_lane_ready(self.profile_id)
+
     def is_ready(self) -> bool:
+        if self.has_direct_lane():
+            return True
         return self.connected and bool(self.flow_key)
 
     def attach_ws(self, ws: Any) -> None:
@@ -118,8 +156,21 @@ class ExtensionSession:
     async def handle_message(self, data: dict) -> None:
         msg_type = data.get("type")
         if msg_type == "token_captured":
-            self.flow_key = data.get("flowKey")
+            self._browser_flow_key = data.get("flowKey")
             self.token_captured_at = time.time()
+            token = str(self._browser_flow_key or "").strip()
+            if token:
+                from flow2api.services.flow_profile_service import save_access_token
+
+                expires_raw = data.get("expiresAt") or data.get("accessTokenExpires")
+                save_access_token(
+                    self.profile_id,
+                    token,
+                    profile_label=self.profile_label,
+                    email=self.email,
+                    paygate_tier=self.paygate_tier,
+                    expires_at=expires_raw,
+                )
             asyncio.create_task(self.fetch_paygate_tier())
             return
         if msg_type == "user_info":
@@ -128,6 +179,16 @@ class ExtensionSession:
                 email = self.user_info.get("email")
                 if email:
                     self.profile_label = str(email)
+            email = str((self.user_info or {}).get("email") or "")
+            if email:
+                from flow2api.services.flow_profile_service import update_profile_meta
+
+                update_profile_meta(
+                    self.profile_id,
+                    profile_label=self.profile_label,
+                    email=email,
+                    paygate_tier=self.paygate_tier,
+                )
             return
         if msg_type in ("pong", "heartbeat"):
             return
@@ -137,11 +198,117 @@ class ExtensionSession:
                 self.profile_label = str(label)
             if data.get("flowKeyPresent") and not self.flow_key:
                 asyncio.create_task(self.fetch_paygate_tier())
+            asyncio.create_task(self.request_cookies_sync())
+            return
+        if msg_type == "cookies_synced":
+            cookies = data.get("cookies")
+            if cookies:
+                from flow2api.services.cookie_service import save_profile_cookies
+
+                save_profile_cookies(self.profile_id, cookies)
             return
 
         req_id = data.get("id")
         if req_id and req_id in self._pending and not self._pending[req_id].done():
             self._pending[req_id].set_result(data)
+
+    async def _with_auth_headers(
+        self,
+        headers: Optional[dict] = None,
+        *,
+        refresh: bool = True,
+    ) -> dict[str, Any]:
+        """Attach Bearer token from DB (refresh via extension if stale/missing)."""
+        from flow2api.config import FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
+        from flow2api.services.flow_profile_service import (
+            get_stored_access_token,
+            token_public_fields,
+        )
+
+        hdrs = dict(headers or {})
+        token = get_stored_access_token(self.profile_id)
+        if refresh:
+            meta = token_public_fields(
+                self.profile_id,
+                live_flow_key_present=self.browser_flow_key_present,
+                extension_online=self.connected,
+            )
+            rem = meta.get("token_remaining_seconds")
+            needs_refresh = not token or (rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S)
+            if needs_refresh:
+                result = await self.refresh_flow_token(force=True)
+                if result.get("ok"):
+                    token = get_stored_access_token(self.profile_id)
+        if not token:
+            raise RuntimeError("NO_FLOW_KEY")
+        hdrs["Authorization"] = f"Bearer {token}"
+        return hdrs
+
+    async def request_cookies_sync(self) -> None:
+        if self._ws:
+            try:
+                await self.send_json({"type": "sync_cookies"})
+            except Exception as exc:
+                logger.debug("request_cookies_sync failed profile=%s: %s", self.profile_id[:8], exc)
+
+    def _use_direct_http(self) -> bool:
+        return self.has_direct_lane()
+
+    async def _direct_api_request(
+        self,
+        *,
+        url: str,
+        method: str,
+        headers: Optional[dict],
+        body: Any,
+        captcha_token: Optional[str] = None,
+        timeout: float = 180.0,
+    ) -> dict:
+        from flow2api.services.flow_http_client import google_fetch
+
+        final_body = body
+        if captcha_token and isinstance(body, dict):
+            final_body = _inject_captcha_into_body(body, captcha_token)
+        auth_headers = await self._with_auth_headers(headers, refresh=True)
+        return await google_fetch(
+            profile_id=self.profile_id,
+            url=url,
+            method=method,
+            headers=auth_headers,
+            body=final_body,
+            timeout=timeout,
+        )
+
+    async def _dispatch_api_request(
+        self,
+        *,
+        url: str,
+        method: str,
+        headers: Optional[dict],
+        body: Any,
+        captcha_token: Optional[str] = None,
+        timeout: float = 180.0,
+    ) -> dict:
+        if self._use_direct_http():
+            return await self._direct_api_request(
+                url=url,
+                method=method,
+                headers=headers,
+                body=body,
+                captcha_token=captcha_token,
+                timeout=timeout,
+            )
+        if not self._ws:
+            raise RuntimeError("extension_not_connected")
+        params: dict[str, Any] = {
+            "url": url,
+            "method": method,
+            "headers": await self._with_auth_headers(headers),
+            "body": body,
+        }
+        if captcha_token:
+            params["captchaToken"] = captcha_token
+        return await self._send("api_request", params, timeout=timeout)
 
     def resolve_callback(self, payload: dict) -> bool:
         req_id = payload.get("id")
@@ -273,14 +440,41 @@ class ExtensionSession:
                 profile_email=self.email or None,
             )
             raise RuntimeError("NO_CAPTCHA_CENTER")
-        resp = await self._send("api_request", params, timeout=timeout)
+        params["headers"] = await self._with_auth_headers(headers)
+        captcha_tok = str(params.get("captchaToken") or "").strip() or None
+        resp = await self._dispatch_api_request(
+            url=url,
+            method=method,
+            headers=params["headers"],
+            body=body,
+            captcha_token=captcha_tok,
+            timeout=timeout,
+        )
         if "aisandbox-pa.googleapis.com" in url:
             record_api_call(self.trace_request_id, url, method, body, resp)
-        # Nếu Google trả 403 (score thấp) → yêu cầu 1 center hard_reset
         try:
             status_probe = int(resp.get("status") or 0)
         except (TypeError, ValueError):
             status_probe = 0
+        if status_probe == 401 and raise_on_error:
+            refresh = await self.refresh_flow_token(force=True)
+            if refresh.get("ok"):
+                captcha_tok = str(params.get("captchaToken") or "").strip() or None
+                resp = await self._dispatch_api_request(
+                    url=url,
+                    method=method,
+                    headers=await self._with_auth_headers(headers, refresh=False),
+                    body=body,
+                    captcha_token=captcha_tok,
+                    timeout=timeout,
+                )
+                if "aisandbox-pa.googleapis.com" in url:
+                    record_api_call(self.trace_request_id, url, method, body, resp)
+                try:
+                    status_probe = int(resp.get("status") or 0)
+                except (TypeError, ValueError):
+                    status_probe = 0
+        # Nếu Google trả 403 (score thấp) → yêu cầu 1 center hard_reset
         if captcha_action and status_probe == 403:
             self._request_center_hard_reset(reason=f"api_403:{captcha_action}")
         if not raise_on_error:
@@ -360,11 +554,26 @@ class ExtensionSession:
         from flow2api.config import TRPC_BASE
 
         url = f"{TRPC_BASE}/{path.lstrip('/')}"
-        resp = await self._send(
-            "trpc_request",
-            {"url": url, "method": "POST", "headers": {"content-type": "application/json"}, "body": body},
-            timeout=timeout,
-        )
+        auth_headers = await self._with_auth_headers({"content-type": "application/json"})
+        if self._use_direct_http():
+            from flow2api.services.flow_http_client import google_fetch
+
+            resp = await google_fetch(
+                profile_id=self.profile_id,
+                url=url,
+                method="POST",
+                headers=auth_headers,
+                body=body,
+                timeout=timeout,
+            )
+        else:
+            if not self._ws:
+                raise RuntimeError("extension_not_connected")
+            resp = await self._send(
+                "trpc_request",
+                {"url": url, "method": "POST", "headers": auth_headers, "body": body},
+                timeout=timeout,
+            )
         status = int(resp.get("status") or 0)
         level = "error" if status >= 400 or resp.get("error") else "info"
         append_request_log(
@@ -393,19 +602,36 @@ class ExtensionSession:
         timeout: float = 30.0,
     ) -> dict:
         url = "https://labs.google/fx/api/upload-video?action=start"
-        resp = await self._send(
-            "trpc_request",
+        auth_headers = await self._with_auth_headers(
             {
-                "url": url,
-                "method": "POST",
-                "headers": {
-                    "X-Upload-Project-Id": project_id,
-                    "X-Upload-Content-Type": content_type,
-                    "X-Upload-Content-Length": str(content_length),
-                },
-            },
-            timeout=timeout,
+                "X-Upload-Project-Id": project_id,
+                "X-Upload-Content-Type": content_type,
+                "X-Upload-Content-Length": str(content_length),
+            }
         )
+        if self._use_direct_http():
+            from flow2api.services.flow_http_client import google_fetch
+
+            resp = await google_fetch(
+                profile_id=self.profile_id,
+                url=url,
+                method="POST",
+                headers=auth_headers,
+                body=None,
+                timeout=timeout,
+            )
+        else:
+            if not self._ws:
+                raise RuntimeError("extension_not_connected")
+            resp = await self._send(
+                "trpc_request",
+                {
+                    "url": url,
+                    "method": "POST",
+                    "headers": auth_headers,
+                },
+                timeout=timeout,
+            )
         status = int(resp.get("status") or 0)
         level = "error" if status >= 400 or resp.get("error") else "info"
         append_request_log(
@@ -438,7 +664,7 @@ class ExtensionSession:
         params: dict[str, Any] = {
             "url": url,
             "method": method,
-            "headers": headers or {},
+            "headers": await self._with_auth_headers(headers),
         }
         if body:
             params["bodyBase64"] = base64.b64encode(body).decode("ascii")
@@ -472,26 +698,114 @@ class ExtensionSession:
             tier = data.get("userPaygateTier")
             if tier:
                 self.paygate_tier = tier
+                from flow2api.services.flow_profile_service import update_profile_meta
+
+                update_profile_meta(
+                    self.profile_id,
+                    profile_label=self.profile_label,
+                    email=self.email,
+                    paygate_tier=tier,
+                )
             return tier
         except Exception as exc:
             logger.warning("fetch_paygate_tier failed profile=%s: %s", self.profile_id[:8], exc)
             return None
 
-    async def refresh_flow_token(self) -> bool:
+    async def refresh_flow_token(self, *, force: bool = False) -> dict[str, Any]:
+        from flow2api.services.cookie_service import has_stored_cookies
+        from flow2api.services.cookie_token_service import refresh_access_token_from_cookies
+
+        if has_stored_cookies(self.profile_id):
+            cookie_result = await refresh_access_token_from_cookies(self.profile_id, force=force)
+            if cookie_result.get("ok"):
+                token = str(cookie_result.get("flowKey") or "").strip()
+                if token:
+                    self._browser_flow_key = token
+                    self.token_captured_at = time.time()
+                return cookie_result
+            if not self._ws:
+                return cookie_result
+
         if not self._ws:
-            return False
+            return {"ok": False, "error": "extension_not_connected"}
         req_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         await self._ws.send(json.dumps({"type": "refresh_token", "id": req_id}))
         try:
-            resp = await asyncio.wait_for(fut, timeout=15)
-            return bool(resp.get("status") == 200 and resp.get("data", {}).get("ok"))
-        except Exception:
-            return False
+            resp = await asyncio.wait_for(fut, timeout=20)
+            data = resp.get("data") or {}
+            ok = bool(resp.get("status") == 200 and data.get("ok"))
+            token = str(data.get("flowKey") or "").strip()
+            if ok and token:
+                self._browser_flow_key = token
+                self.token_captured_at = time.time()
+                from flow2api.services.flow_profile_service import save_access_token
+
+                save_access_token(
+                    self.profile_id,
+                    token,
+                    profile_label=self.profile_label,
+                    email=self.email,
+                    paygate_tier=self.paygate_tier,
+                    expires_at=data.get("expiresAt"),
+                )
+            return {**data, "ok": ok}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
         finally:
             self._pending.pop(req_id, None)
+
+    async def open_flow_tab(self) -> dict[str, Any]:
+        if not self._ws:
+            return {"ok": False, "error": "extension_not_connected"}
+        req_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req_id] = fut
+        await self._ws.send(json.dumps({"type": "open_flow_tab", "id": req_id}))
+        try:
+            resp = await asyncio.wait_for(fut, timeout=15)
+            data = resp.get("data") or {}
+            ok = bool(resp.get("status") == 200 and data.get("ok"))
+            return {**data, "ok": ok, "error": resp.get("error")}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self._pending.pop(req_id, None)
+
+    async def test_connection(self) -> dict[str, Any]:
+        """Refresh ya29 via auth/session and persist (Veo3Studio POST /profiles/:id/test)."""
+        result = await self.refresh_flow_token(force=True)
+        if not result.get("ok"):
+            return {
+                "success": False,
+                "error": result.get("error") or "TOKEN_REFRESH_FAILED",
+            }
+        meta = self.to_public_dict()
+        return {
+            "success": True,
+            "message": "Connection successful! Access token retrieved and cached.",
+            "expires_at": meta.get("access_token_expires_at"),
+            "token_status": meta.get("token_status"),
+            "method": result.get("method"),
+        }
+
+    async def ensure_token_fresh(self) -> bool:
+        from flow2api.config import FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
+        from flow2api.services.flow_profile_service import token_public_fields
+
+        meta = token_public_fields(
+            self.profile_id,
+            live_flow_key_present=self.browser_flow_key_present,
+            extension_online=self.connected,
+        )
+        rem = meta.get("token_remaining_seconds")
+        if self.flow_key and rem is not None and rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S:
+            return True
+        result = await self.refresh_flow_token(force=True)
+        return bool(result.get("ok") and self.flow_key)
 
     def to_public_dict(self) -> dict[str, Any]:
         from flow2api.services.worker_settings import (
@@ -536,7 +850,7 @@ class ExtensionSession:
             self.pending_proxy_url is not None and self.active_jobs > 0 and pool_eligible
         )
         credit_allowed = is_profile_credit_allowed(self.profile_id)
-        return {
+        public = {
             "profile_id": self.profile_id,
             "profile_label": self.profile_label,
             "display_name": self.display_name(),
@@ -548,6 +862,9 @@ class ExtensionSession:
             "image_allowed": is_profile_image_allowed(self.profile_id),
             "video_allowed": is_profile_video_allowed(self.profile_id),
             "flow_key_present": bool(self.flow_key),
+            "browser_flow_key_present": self.browser_flow_key_present,
+            "direct_lane_ready": self.has_direct_lane(),
+            "offline_gen_ready": self.has_direct_lane() and not self.connected,
             "token_age_s": token_age,
             "paygate_tier": self.paygate_tier,
             "active_jobs": self.active_jobs,
@@ -562,6 +879,9 @@ class ExtensionSession:
             "proxy_assigned": format_proxy_public(assigned_url).get("proxy_display") or "",
             **proxy_fields,
         }
+        from flow2api.services.flow_profile_service import enrich_public_profile
+
+        return enrich_public_profile(public)
 
 
 class ExtensionPool:
@@ -571,6 +891,29 @@ class ExtensionPool:
         self._ws_to_profile: dict[int, str] = {}
         self._rr_index: int = 0
         self._lock = asyncio.Lock()
+        self.hydrate_db_profiles()
+
+    def hydrate_db_profiles(self) -> None:
+        """Restore profile sessions from DB so direct-lane gen works without Chrome WS."""
+        from flow2api.services.flow_profile_service import list_all_profile_rows
+
+        for row in list_all_profile_rows():
+            pid = str(row.profile_id or "").strip()
+            if not pid or pid.startswith("_"):
+                continue
+            session = self._sessions.get(pid)
+            label = str(row.profile_label or row.email or pid[:8])
+            if not session:
+                session = ExtensionSession(pid, label)
+                self._sessions[pid] = session
+            elif label and session.profile_label in ("", pid[:8]):
+                session.profile_label = label
+            if row.email:
+                session.user_info = session.user_info or {}
+                if isinstance(session.user_info, dict):
+                    session.user_info.setdefault("email", row.email)
+            if row.paygate_tier:
+                session.paygate_tier = row.paygate_tier
 
     def bind_profile(self, profile_id: str) -> None:
         _bound_profile_id.set(profile_id)
@@ -582,7 +925,14 @@ class ExtensionPool:
         return _bound_profile_id.get()
 
     def get(self, profile_id: str) -> Optional[ExtensionSession]:
-        return self._sessions.get(profile_id)
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return None
+        session = self._sessions.get(pid)
+        if not session:
+            self.hydrate_db_profiles()
+            session = self._sessions.get(pid)
+        return session
 
     def get_bound(self) -> Optional[ExtensionSession]:
         pid = _bound_profile_id.get()
@@ -609,6 +959,16 @@ class ExtensionPool:
     def ready_count(self) -> int:
         return len(self.ready_sessions())
 
+    def direct_lane_count(self) -> int:
+        return sum(1 for s in self._sessions.values() if s.has_direct_lane())
+
+    def offline_gen_count(self) -> int:
+        return sum(
+            1
+            for s in self._sessions.values()
+            if s.has_direct_lane() and not s.connected and not s.profile_id.startswith("_")
+        )
+
     def list_public(self) -> list[dict[str, Any]]:
         items = [
             s.to_public_dict()
@@ -633,6 +993,9 @@ class ExtensionPool:
                 self._sessions[pid] = session
             elif profile_label:
                 session.profile_label = profile_label
+            from flow2api.services.flow_profile_service import ensure_profile_row
+
+            ensure_profile_row(pid, profile_label=session.profile_label)
             stale_ws_ids = [
                 wid for wid, mapped_pid in self._ws_to_profile.items()
                 if mapped_pid == pid and wid != id(ws)
@@ -659,6 +1022,7 @@ class ExtensionPool:
             await push_proxy_to_session(session)
         except Exception:
             pass
+        asyncio.create_task(session.request_cookies_sync())
         events.publish("profile_connected", {"profile_id": pid, "display_name": session.display_name()})
         append_request_log(
             None,
@@ -942,11 +1306,14 @@ class ExtensionPool:
                     logger.warning("broadcast to %s failed: %s", session.profile_id[:8], exc)
 
     def clear_all_credentials(self) -> None:
+        from flow2api.services.flow_profile_service import clear_all_access_tokens
+
+        clear_all_access_tokens()
         for session in self._sessions.values():
             if session.profile_id.startswith("_"):
                 continue
             session.user_info = None
-            session.flow_key = None
+            session._browser_flow_key = None
 
 
 _pool: Optional[ExtensionPool] = None

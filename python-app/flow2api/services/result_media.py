@@ -116,7 +116,7 @@ async def _media_id_image_to_base64(media_id: str) -> Optional[str]:
     from flow2api.services.flow_sdk import parse_get_media_image
 
     client = get_flow_client()
-    if not client.connected:
+    if not client.is_ready():
         return None
     try:
         resp = await client.get_media(media_id)

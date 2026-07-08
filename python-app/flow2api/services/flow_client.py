@@ -19,7 +19,7 @@ def get_flow_client() -> ExtensionSession:
     """Session đang bind cho worker task, hoặc profile ready đầu tiên."""
     pool = get_extension_pool()
     bound = pool.get_bound()
-    if bound and bound.connected:
+    if bound and bound.is_ready():
         return bound
     return _first_ready_or_offline(pool)
 

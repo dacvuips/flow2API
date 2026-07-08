@@ -5,7 +5,7 @@ import asyncio
 import time
 from typing import Any
 
-from flow2api.config import HEALTH_CACHE_TTL_S
+from flow2api.config import HEALTH_CACHE_TTL_S, FLOW_DIRECT_HTTP_ENABLED
 from flow2api.services import activity
 from flow2api.services.extension_pool import get_extension_pool
 from flow2api.services.worker_settings import get_worker_settings
@@ -32,6 +32,8 @@ def _build_health_sync() -> dict[str, Any]:
             "scheduler_alive": worker.scheduler_alive(),
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
+            "profiles_direct_lane": pool.direct_lane_count(),
+            "profiles_offline_gen": pool.offline_gen_count(),
         },
         "profiles": profiles,
         "extension": {
@@ -40,12 +42,18 @@ def _build_health_sync() -> dict[str, Any]:
             "token_age_s": first_ready.to_public_dict().get("token_age_s") if first_ready else None,
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
+            "profiles_direct_lane": pool.direct_lane_count(),
+            "profiles_offline_gen": pool.offline_gen_count(),
         },
         "extension_connected": pool.any_connected(),
+        "direct_http_enabled": FLOW_DIRECT_HTTP_ENABLED,
+        "profiles_offline_gen": pool.offline_gen_count(),
         "ws_stats": {
             "connected": pool.any_connected(),
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
+            "profiles_direct_lane": pool.direct_lane_count(),
+            "profiles_offline_gen": pool.offline_gen_count(),
             "accounts": profiles,
         },
         "queue": stats,

@@ -121,7 +121,7 @@ async def run_upsample_image(
         if str(exc) == "profile_not_ready":
             raise HTTPException(503, "profile_not_ready") from exc
         raise
-    if not client.connected:
+    if not client.connected and not client.has_direct_lane():
         raise HTTPException(503, "extension_not_connected")
     if not client.flow_key:
         raise HTTPException(503, "no_flow_token")

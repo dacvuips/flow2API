@@ -379,7 +379,12 @@ async function buildFlowApiFetchHeaders(agentHeaders = {}, tabHint = null) {
     out[lower] = String(v);
   }
 
-  if (flowKey) out.authorization = `Bearer ${flowKey}`;
+  const agentAuth = out.authorization || agentHeaders?.authorization || agentHeaders?.Authorization;
+  if (agentAuth) {
+    out.authorization = String(agentAuth);
+  } else if (flowKey) {
+    out.authorization = `Bearer ${flowKey}`;
+  }
   return out;
 }
 
@@ -546,9 +551,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     // side has a defensive dedupe too, but quiet at the source first.
     if (tokenChanged) {
       console.log('[Flow2API] Bearer token captured');
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-      }
+      pushTokenToAgent(token, metrics.tokenExpiresAt || null);
       // Resolve the user's identity (email/name/picture) once per token Ă¢â‚¬â€
       // saves the popup + AccountPanel from showing "Connected via
       // extension" placeholders. The token already has the userinfo.email
@@ -622,7 +625,7 @@ function connectToAgent() {
 
     // Resend token immediately so agent can start without waiting for a capture
     if (flowKey) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+      pushTokenToAgent(flowKey, metrics.tokenExpiresAt || null);
     }
     // Replay cached userinfo so the agent's AccountPanel populates on
     // reconnect without waiting for the next token rotation. If we
@@ -632,6 +635,7 @@ function connectToAgent() {
     } else if (flowKey) {
       fetchAndPushUserInfo(flowKey);
     }
+    pushCookiesToAgent();
   };
 
   ws.onmessage = async ({ data }) => {
@@ -653,18 +657,60 @@ function connectToAgent() {
         console.log('[Flow2API] logout requested by agent');
         cachedUserInfo = null;
         flowKey = null;
-      } else if (msg.type === 'refresh_token') {
-        const ok = await ensureFreshFlowToken('server_request', true);
+      } else if (msg.type === 'sync_cookies') {
+        const cookies = await exportProfileCookiesForSync();
+        if (cookies.length) {
+          ws.send(JSON.stringify({ type: 'cookies_synced', cookies }));
+        }
         sendToAgent({
           id: msg.id,
-          status: ok ? 200 : 503,
-          data: {
+          status: 200,
+          data: { ok: true, count: cookies.length },
+        });
+      } else if (msg.type === 'refresh_token') {
+        let result = await refreshTokenViaAuthSession(true);
+        if (!result.ok) {
+          const ok = await ensureFreshFlowToken('server_request', true);
+          result = {
             ok,
             flowKeyPresent: !!flowKey,
+            method: ok ? 'credits_fallback' : 'failed',
+            expiresAt: metrics.tokenExpiresAt || null,
+            flowKey: flowKey || null,
             tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
-          },
-          error: ok ? undefined : 'TOKEN_REFRESH_FAILED',
+            error: ok ? undefined : (result.error || 'TOKEN_REFRESH_FAILED'),
+          };
+        }
+        sendToAgent({
+          id: msg.id,
+          status: result.ok ? 200 : 503,
+          data: result,
+          error: result.ok ? undefined : (result.error || 'TOKEN_REFRESH_FAILED'),
         });
+      } else if (msg.type === 'open_flow_tab') {
+        try {
+          const tabs = await chrome.tabs.query({ url: flowUrls });
+          let tabId = null;
+          if (tabs.length && tabs[0]?.id) {
+            await chrome.tabs.update(tabs[0].id, { active: true });
+            tabId = tabs[0].id;
+          } else {
+            const tab = await openFlowTabResilient(true);
+            tabId = tab?.id ?? null;
+          }
+          sendToAgent({
+            id: msg.id,
+            status: 200,
+            data: { ok: true, tabId },
+          });
+        } catch (e) {
+          sendToAgent({
+            id: msg.id,
+            status: 503,
+            data: { ok: false },
+            error: e?.message || 'OPEN_FLOW_TAB_FAILED',
+          });
+        }
       } else if (msg.type === 'please_resend_userinfo') {
         // Agent's /api/auth/scan asks us to re-fetch userinfo when
         // its own cache is empty (e.g. agent restarted, or user
@@ -840,10 +886,12 @@ async function handleApiRequest(msg) {
   });
 
   try {
-    // Step 0: Fail fast if we have no bearer token. Avoids burning a reCAPTCHA
-    // solve (rate-limited + single-use) only to discover later that we can't
-    // send the request.
-    if (!flowKey) {
+    const agentHeaders = headers || {};
+    const agentAuth = agentHeaders.authorization || agentHeaders.Authorization;
+    const usingDbToken = !!(agentAuth && String(agentAuth).match(/^Bearer\s+/i));
+
+    // Step 0: Fail fast if we have no bearer token (DB token from agent, or legacy browser capture).
+    if (!usingDbToken && !flowKey) {
       sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
       chrome.storage.local.set({ metrics });
@@ -852,15 +900,17 @@ async function handleApiRequest(msg) {
       return;
     }
 
-    // Step 1: Proactively refresh stale Flow token before burning captcha.
-    const freshEnough = await ensureFreshFlowToken('api_request');
-    if (!freshEnough || !flowKey) {
-      sendToAgent({ id, status: 503, error: 'TOKEN_REFRESH_FAILED' });
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'TOKEN_REFRESH_FAILED'; }
-      chrome.storage.local.set({ metrics });
-      updateRequestLog(id, { status: 'failed', error: 'TOKEN_REFRESH_FAILED' });
-      setState('idle');
-      return;
+    // Step 1: Chỉ refresh token trên browser khi agent không gửi token từ DB.
+    if (!usingDbToken) {
+      const freshEnough = await ensureFreshFlowToken('api_request');
+      if (!freshEnough || !flowKey) {
+        sendToAgent({ id, status: 503, error: 'TOKEN_REFRESH_FAILED' });
+        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'TOKEN_REFRESH_FAILED'; }
+        chrome.storage.local.set({ metrics });
+        updateRequestLog(id, { status: 'failed', error: 'TOKEN_REFRESH_FAILED' });
+        setState('idle');
+        return;
+      }
     }
 
     // Gate #1: bail before spending a captcha solve if agent already
@@ -967,7 +1017,7 @@ async function handleApiRequest(msg) {
       signal:      controller.signal,
     });
 
-    if (response.status === 401) {
+    if (response.status === 401 && !usingDbToken) {
       console.warn('[Flow2API] API_401 - refreshing token and retrying once');
       const refreshed = await ensureFreshFlowToken('api_401_retry', true);
       if (refreshed && flowKey && !isRequestAborted(id)) {
@@ -1210,11 +1260,138 @@ async function runFlowWatchdog() {
   }
 }
 
+function pushTokenToAgent(token, expiresAtIso) {
+  if (!token || ws?.readyState !== WebSocket.OPEN) return;
+  const payload = { type: 'token_captured', flowKey: token };
+  if (expiresAtIso) payload.expiresAt = expiresAtIso;
+  ws.send(JSON.stringify(payload));
+  pushCookiesToAgent();
+}
+
+const COOKIE_SYNC_DOMAINS = [
+  'labs.google',
+  '.labs.google',
+  '.google.com',
+  'google.com',
+  'accounts.google.com',
+  '.accounts.google.com',
+];
+
+async function exportProfileCookiesForSync() {
+  const seen = new Set();
+  const cookies = [];
+  for (const domain of COOKIE_SYNC_DOMAINS) {
+    try {
+      const list = await chrome.cookies.getAll({ domain });
+      for (const c of list) {
+        const key = `${c.name}|${c.domain}|${c.path || '/'}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        cookies.push({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || '/',
+        });
+      }
+    } catch (e) {
+      console.warn('[Flow2API] cookie export failed for', domain, e?.message || e);
+    }
+  }
+  return cookies;
+}
+
+async function pushCookiesToAgent() {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  try {
+    const cookies = await exportProfileCookiesForSync();
+    if (!cookies.length) return;
+    ws.send(JSON.stringify({ type: 'cookies_synced', cookies }));
+  } catch (e) {
+    console.warn('[Flow2API] pushCookiesToAgent failed:', e?.message || e);
+  }
+}
+
+async function refreshTokenViaAuthSession(forceOpen = false) {
+  let tabs = await chrome.tabs.query({ url: flowUrls });
+  if (!tabs.length) {
+    if (_openingFlowTab) {
+      return { ok: false, error: 'FLOW_TAB_OPENING', flowKeyPresent: !!flowKey };
+    }
+    _openingFlowTab = true;
+    try {
+      await openFlowTabResilient(forceOpen);
+      await sleep(3000);
+      tabs = await chrome.tabs.query({ url: flowUrls });
+    } catch (e) {
+      return { ok: false, error: e?.message || 'OPEN_FLOW_TAB_FAILED', flowKeyPresent: !!flowKey };
+    } finally {
+      _openingFlowTab = false;
+    }
+  }
+  const target = tabs.find((tab) => tab?.id && !tab.discarded) || null;
+  if (!target?.id) {
+    return { ok: false, error: 'NO_FLOW_TAB', flowKeyPresent: !!flowKey };
+  }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: target.id },
+      func: async () => {
+        const resp = await fetch('https://labs.google/fx/api/auth/session', {
+          credentials: 'include',
+          headers: { accept: 'application/json' },
+        });
+        let body = null;
+        try {
+          body = await resp.json();
+        } catch {
+          body = null;
+        }
+        return { ok: resp.ok, status: resp.status, body };
+      },
+    });
+    const result = results?.[0]?.result;
+    const body = result?.body;
+    if (!result?.ok || !body || Array.isArray(body) || !body.access_token) {
+      return {
+        ok: false,
+        error: 'AUTH_SESSION_EMPTY',
+        flowKeyPresent: !!flowKey,
+        status: result?.status,
+      };
+    }
+    const expiresAtIso = body.expires ? new Date(body.expires).toISOString() : null;
+    flowKey = body.access_token;
+    metrics.tokenCapturedAt = Date.now();
+    metrics.tokenExpiresAt = expiresAtIso;
+    chrome.storage.local.set({ flowKey, metrics });
+    pushTokenToAgent(flowKey, expiresAtIso);
+    fetchAndPushUserInfo(flowKey);
+    return {
+      ok: true,
+      flowKeyPresent: true,
+      method: 'auth_session',
+      expiresAt: expiresAtIso,
+      flowKey,
+      tokenAge: 0,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e?.message || 'AUTH_SESSION_ERROR',
+      flowKeyPresent: !!flowKey,
+    };
+  }
+}
+
 async function ensureFreshFlowToken(reason = 'request', force = false) {
   const beforeToken = flowKey;
   const beforeCapturedAt = metrics.tokenCapturedAt || 0;
   const age = beforeCapturedAt ? Date.now() - beforeCapturedAt : Infinity;
   if (!force && flowKey && age < TOKEN_SOFT_MAX_AGE_MS) return true;
+
+  const sessionResult = await refreshTokenViaAuthSession(false);
+  if (sessionResult.ok) return true;
 
   const triggered = await captureTokenFromFlowTab();
   if (!triggered) return !!flowKey;
@@ -1222,7 +1399,7 @@ async function ensureFreshFlowToken(reason = 'request', force = false) {
   const deadline = Date.now() + TOKEN_REFRESH_WAIT_MS;
   while (Date.now() < deadline) {
     if (flowKey && (flowKey !== beforeToken || (metrics.tokenCapturedAt || 0) > beforeCapturedAt)) {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+      pushTokenToAgent(flowKey, metrics.tokenExpiresAt || null);
       return true;
     }
     await sleep(250);
@@ -1388,8 +1565,14 @@ async function handleTrpcRequest(msg) {
 
   setState('running');
 
+  const agentAuth = headers?.authorization || headers?.Authorization;
+  if (!agentAuth && !flowKey) {
+    sendToAgent({ id, error: 'NO_FLOW_KEY' });
+    return;
+  }
+
   const fetchHeaders = { ...headers };
-  if (flowKey) {
+  if (!agentAuth && flowKey) {
     fetchHeaders['authorization'] = `Bearer ${flowKey}`;
   }
   const hasBody = body !== undefined && body !== null;
@@ -1446,7 +1629,9 @@ async function handleRawRequest(msg) {
     sendToAgent({ id, status: 400, error: 'INVALID_RAW_URL' });
     return;
   }
-  if (!flowKey) {
+
+  const agentAuth = headers?.authorization || headers?.Authorization;
+  if (!agentAuth && !flowKey) {
     sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
     return;
   }

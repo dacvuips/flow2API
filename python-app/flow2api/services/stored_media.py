@@ -187,7 +187,7 @@ async def _video_bytes_from_source(url: str, media_id: str = "") -> Optional[byt
         from flow2api.services.flow_sdk import try_fetch_media_video_url
 
         client = get_flow_client()
-        if client.connected:
+        if client.is_ready():
             try:
                 fetched = await try_fetch_media_video_url(client, mid)
             except Exception as exc:
@@ -221,7 +221,7 @@ async def _image_bytes_from_source(url: str, media_id: str = "") -> Optional[tup
         from flow2api.services.flow_sdk import parse_get_media_image
 
         client = get_flow_client()
-        if client.connected:
+        if client.is_ready():
             try:
                 resp = await client.get_media(mid)
                 remote, raw, mime = parse_get_media_image(resp if isinstance(resp, dict) else {})
