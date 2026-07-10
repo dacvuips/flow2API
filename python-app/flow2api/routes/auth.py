@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from flow2api.services.api_auth import auth_key_id, bearer_token
 from flow2api.services.auth_keys import lookup_api_key
 from flow2api.services.extension_pool import get_extension_pool
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
-def _bearer(authorization: str | None = Header(default=None)) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "missing_bearer_token")
-    return authorization.split(" ", 1)[1].strip()
-
-
 @router.get("/key")
-async def key_info(token: str = Depends(_bearer)):
+async def key_info(token: str = Depends(bearer_token)):
     from datetime import datetime
 
     row = lookup_api_key(token)
@@ -41,7 +36,7 @@ async def key_info(token: str = Depends(_bearer)):
 
 
 @router.get("/me")
-async def auth_me(_: str = Depends(_bearer)):
+async def auth_me(_: int = Depends(auth_key_id)):
     pool = get_extension_pool()
     ready = pool.ready_sessions()
     first = ready[0] if ready else None
@@ -56,7 +51,7 @@ async def auth_me(_: str = Depends(_bearer)):
 
 
 @router.get("/accounts")
-async def auth_accounts(_: str = Depends(_bearer)):
+async def auth_accounts(_: int = Depends(auth_key_id)):
     pool = get_extension_pool()
     accounts = []
     for item in pool.list_public():
@@ -85,14 +80,14 @@ async def auth_accounts(_: str = Depends(_bearer)):
 
 
 @router.post("/scan")
-async def auth_scan(_: str = Depends(_bearer)):
+async def auth_scan(_: int = Depends(auth_key_id)):
     pool = get_extension_pool()
     await pool.broadcast({"type": "please_resend_userinfo"})
     return {"ok": True, "profiles": pool.online_count()}
 
 
 @router.post("/logout")
-async def auth_logout(_: str = Depends(_bearer)):
+async def auth_logout(_: int = Depends(auth_key_id)):
     pool = get_extension_pool()
     pool.clear_all_credentials()
     await pool.broadcast({"type": "logout"})

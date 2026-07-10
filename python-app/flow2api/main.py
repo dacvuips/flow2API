@@ -8,8 +8,14 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from flow2api.services.api_auth import (
+    path_requires_api_key,
+    resolve_api_key_id,
+    token_from_request,
+)
 
 from flow2api.config import (
     ACTIVITY_LIST_LIMIT,
@@ -210,6 +216,17 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def _learn_public_base_url(request, call_next):
         learn_public_base_url_from_headers(request.headers)
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def _require_api_key(request, call_next):
+        path = request.url.path
+        if not path_requires_api_key(path):
+            return await call_next(request)
+        token = token_from_request(request)
+        if not resolve_api_key_id(token):
+            detail = "missing_bearer_token" if not token else "invalid_api_key"
+            return JSONResponse(status_code=401, content={"detail": detail})
         return await call_next(request)
 
     app.include_router(requests_router)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from flow2api.config import (
     ACTIVITY_LIST_LIMIT,
@@ -13,6 +13,7 @@ from flow2api.config import (
     PURGE_INTERVAL_S,
 )
 from flow2api.services import activity
+from flow2api.services.api_auth import auth_key_id
 from flow2api.services.result_media import with_base64_media
 from flow2api.services.task_counters import reset_counters
 from flow2api.services.task_retention import purge_storage
@@ -61,19 +62,13 @@ async def _list_activity_payload(
     return payload
 
 
-def _bearer(authorization: str | None = Header(default=None)) -> str:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "missing_bearer_token")
-    return authorization.split(" ", 1)[1].strip()
-
-
 @router.get("")
 async def list_activity(
     page: int = Query(1, ge=1),
     page_size: int = Query(ACTIVITY_PAGE_SIZE, ge=1, le=100),
     summary: bool = False,
     status: str | None = Query(None, description="all|queued|running|done|failed|active"),
-    _: str = Depends(_bearer),
+    _: int = Depends(auth_key_id),
 ):
     try:
         status_filter = activity.parse_status_filter(status)
@@ -90,7 +85,7 @@ async def list_activity(
 
 
 @router.post("/kpi/reset")
-async def reset_kpi_counters(_: str = Depends(_bearer)):
+async def reset_kpi_counters(_: int = Depends(auth_key_id)):
     counters = reset_counters()
     return {"ok": True, "summary": counters.to_dict()}
 
@@ -99,7 +94,7 @@ async def reset_kpi_counters(_: str = Depends(_bearer)):
 async def get_activity(
     request_id: str,
     compact: bool = False,
-    _: str = Depends(_bearer),
+    _: int = Depends(auth_key_id),
 ):
     timeout = max(10.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2)
 

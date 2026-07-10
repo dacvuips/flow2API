@@ -6,6 +6,7 @@ from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from flow2api.services import activity
+from flow2api.services.api_auth import auth_key_id
 from flow2api.services.auth_keys import get_api_key_by_token
 from flow2api.services.dashboard_events import events
 from flow2api.services.extension_pool import get_extension_pool
@@ -81,7 +82,7 @@ def _settings_payload() -> dict[str, Any]:
 
 
 @router.get("/settings")
-async def read_worker_settings():
+async def read_worker_settings(_: int = Depends(auth_key_id)):
     return _settings_payload()
 
 

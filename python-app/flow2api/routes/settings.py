@@ -5,10 +5,11 @@ import time
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from flow2api.services import system_ops
+from flow2api.services.api_auth import auth_key_id
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -37,12 +38,12 @@ class AutostartBody(BaseModel):
 
 
 @router.get("/config")
-async def get_config():
+async def get_config(_: int = Depends(auth_key_id)):
     return system_ops.public_config()
 
 
 @router.post("/telegram")
-async def save_telegram(body: TelegramBody):
+async def save_telegram(body: TelegramBody, _: int = Depends(auth_key_id)):
     cfg = system_ops.load_config()
     tg = dict(cfg.get("telegram") or {})
     data = body.model_dump(exclude_none=True)
@@ -54,20 +55,20 @@ async def save_telegram(body: TelegramBody):
 
 
 @router.post("/telegram/test")
-async def test_telegram():
+async def test_telegram(_: int = Depends(auth_key_id)):
     ok = system_ops.telegram_send("✅ Flow2API Telegram đã kết nối.")
     return {"ok": ok, "message": "Đã gửi tin nhắn test" if ok else "Gửi thất bại — kiểm tra token/chat id"}
 
 
 @router.post("/proxy")
-async def save_proxy(body: ProxyBody):
+async def save_proxy(body: ProxyBody, _: int = Depends(auth_key_id)):
     pool = system_ops.parse_proxy_pool(body.proxies)
     saved = system_ops.save_config({"proxy_pool": pool})
     return {"ok": True, "count": len(pool), "proxy_pool": saved.get("proxy_pool")}
 
 
 @router.post("/proxy/enabled")
-async def set_proxy_enabled(body: ProxyEnabledBody):
+async def set_proxy_enabled(body: ProxyEnabledBody, _: int = Depends(auth_key_id)):
     saved = system_ops.save_config({"proxy_pool_enabled": body.enabled})
     await system_ops.push_proxy_to_extensions()
     state = "bật gắn proxy vào profile" if body.enabled else "tắt gắn proxy (đã gỡ khỏi Chrome)"
@@ -79,7 +80,7 @@ async def set_proxy_enabled(body: ProxyEnabledBody):
 
 
 @router.post("/proxy/rotate")
-async def set_proxy_rotate(body: ProxyRotateBody):
+async def set_proxy_rotate(body: ProxyRotateBody, _: int = Depends(auth_key_id)):
     cfg = system_ops.load_config()
     patch: dict[str, Any] = {}
     if body.enabled is not None:
@@ -108,7 +109,7 @@ async def set_proxy_rotate(body: ProxyRotateBody):
 
 
 @router.post("/proxy/rotate-now")
-async def rotate_proxy_now():
+async def rotate_proxy_now(_: int = Depends(auth_key_id)):
     from flow2api.services.dashboard_events import events
     from flow2api.services.extension_pool import get_extension_pool
 
@@ -123,30 +124,30 @@ async def rotate_proxy_now():
 
 
 @router.get("/autostart")
-async def get_autostart():
+async def get_autostart(_: int = Depends(auth_key_id)):
     return system_ops.get_windows_autostart()
 
 
 @router.post("/autostart")
-async def set_autostart(body: AutostartBody):
+async def set_autostart(body: AutostartBody, _: int = Depends(auth_key_id)):
     return system_ops.set_windows_autostart(body.enabled)
 
 
 @router.get("/profiles")
-async def list_profiles():
+async def list_profiles(_: int = Depends(auth_key_id)):
     return {"profiles": system_ops.list_chrome_profiles()}
 
 
 @router.post("/system/force-refresh")
-async def system_force_refresh():
+async def system_force_refresh(_: int = Depends(auth_key_id)):
     return await system_ops.force_refresh_all()
 
 
 @router.post("/system/launch-profiles")
-async def system_launch_profiles():
+async def system_launch_profiles(_: int = Depends(auth_key_id)):
     return system_ops.launch_all_profiles()
 
 
 @router.post("/system/close-chrome")
-async def system_close_chrome():
+async def system_close_chrome(_: int = Depends(auth_key_id)):
     return system_ops.close_all_chrome()
