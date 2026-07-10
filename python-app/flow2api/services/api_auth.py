@@ -45,15 +45,16 @@ def path_requires_api_key(path: str) -> bool:
         return False
     if path.startswith("/api/internal/captcha/"):
         return False
-    protected_prefixes = (
-        "/api/",
+    # Stored output files use request_id in the URL (shareable links for clients/browsers).
+    stored_media_prefixes = (
         "/video/",
         "/image/",
         "/outputs/",
         "/inputs/",
-        "/media/",
     )
-    return any(path.startswith(prefix) for prefix in protected_prefixes)
+    if any(path.startswith(prefix) for prefix in stored_media_prefixes):
+        return False
+    return path.startswith("/api/") or path.startswith("/media/")
 
 
 def bearer_token(authorization: str | None = Header(default=None)) -> str:
