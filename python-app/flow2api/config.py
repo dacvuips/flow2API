@@ -90,11 +90,27 @@ _PUBLIC_BASE_URL_DEFAULT = os.environ.get(
 ).strip().rstrip("/")
 _learned_public_base_url: str = ""
 
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "[::1]"})
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"})
+
+
+def _hostname_without_port(host: str) -> str:
+    """Strip :port from Host / X-Forwarded-Host (keep [ipv6] form)."""
+    h = str(host or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        end = h.find("]")
+        if end != -1:
+            return h[: end + 1]
+        return h
+    # hostname:port or ipv4:port — not bare ipv6 (no brackets, multiple colons).
+    if h.count(":") == 1:
+        return h.rsplit(":", 1)[0]
+    return h
 
 
 def _is_public_hostname(host: str) -> bool:
-    h = str(host or "").strip().lower()
+    h = _hostname_without_port(host)
     if not h or h in _LOCAL_HOSTS:
         return False
     if h.endswith(".localhost"):
