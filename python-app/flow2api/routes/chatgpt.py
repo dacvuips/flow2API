@@ -7,7 +7,7 @@ import logging
 from typing import Any, AsyncIterator, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -119,6 +119,37 @@ def _try_pick_ws_session(profile_id: str | None = None) -> ExtensionSession | No
     return None
 
 
+def _format_asset_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "file_id": item.get("file_id") or item.get("fileId"),
+        "file_name": item.get("file_name") or item.get("fileName"),
+        "mime_type": item.get("mime_type") or item.get("mimeType"),
+        "kind": item.get("kind") or "file",
+        "width": item.get("width") or 0,
+        "height": item.get("height") or 0,
+        "size_bytes": item.get("size_bytes") or item.get("sizeBytes") or item.get("file_size") or 0,
+        "asset_pointer": item.get("asset_pointer") or item.get("assetPointer"),
+        "sandbox_path": item.get("sandbox_path") or item.get("sandboxPath"),
+        "source": item.get("source"),
+        "download_url": item.get("download_url") or item.get("downloadUrl"),
+        "data": item.get("data"),
+        "error": item.get("error"),
+    }
+
+
+def _format_uploaded_image(img: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "file_id": img.get("fileId") or img.get("file_id"),
+        "file_name": img.get("fileName") or img.get("file_name"),
+        "mime_type": img.get("mimeType") or img.get("mime_type"),
+        "file_size": img.get("fileSize") or img.get("file_size"),
+        "width": img.get("width"),
+        "height": img.get("height"),
+        "library_file_id": img.get("libraryFileId") or img.get("library_file_id"),
+        "download_url": img.get("downloadUrl") or img.get("download_url"),
+    }
+
+
 def _format_web_result(
     result: dict[str, Any],
     *,
@@ -131,7 +162,26 @@ def _format_web_result(
     if not result.get("ok"):
         detail = result.get("error") or "chatgpt_send_failed"
         raise HTTPException(502, str(detail))
+
+    uploaded = result.get("uploadedImages") or result.get("uploaded_images")
+    if not isinstance(uploaded, list):
+        uploaded = []
+
     images = result.get("images") if isinstance(result.get("images"), list) else []
+    files = result.get("files") if isinstance(result.get("files"), list) else []
+
+    # Old extension returned upload metadata under "images" (fileId/fileName, no kind/url).
+    if not uploaded and images:
+        sample = images[0] if isinstance(images[0], dict) else {}
+        if (
+            (sample.get("fileId") or sample.get("file_id"))
+            and not sample.get("kind")
+            and not sample.get("download_url")
+            and not sample.get("data")
+        ):
+            uploaded = images
+            images = []
+
     return {
         "ok": True,
         "mode": "web",
@@ -139,24 +189,26 @@ def _format_web_result(
         "text": result.get("text") or "",
         "endpoint": result.get("endpoint") or endpoint,
         "model": result.get("model") or model,
-        "conversation_id": result.get("conversationId"),
-        "message_id": result.get("messageId"),
+        "conversation_id": result.get("conversationId") or result.get("conversation_id"),
+        "message_id": result.get("messageId") or result.get("message_id"),
         "profile_id": profile_id,
         "profile_label": profile_label,
+        "uploaded_images": [
+            _format_uploaded_image(img)
+            for img in uploaded
+            if isinstance(img, dict)
+        ],
         "images": [
-            {
-                "file_id": img.get("fileId") or img.get("file_id"),
-                "file_name": img.get("fileName") or img.get("file_name"),
-                "mime_type": img.get("mimeType") or img.get("mime_type"),
-                "file_size": img.get("fileSize") or img.get("file_size"),
-                "width": img.get("width"),
-                "height": img.get("height"),
-                "library_file_id": img.get("libraryFileId") or img.get("library_file_id"),
-            }
+            _format_asset_item(img)
             for img in images
             if isinstance(img, dict)
         ],
-        "requirements_error": result.get("requirementsError"),
+        "files": [
+            _format_asset_item(f)
+            for f in files
+            if isinstance(f, dict)
+        ],
+        "requirements_error": result.get("requirementsError") or result.get("requirements_error"),
     }
 
 
@@ -217,6 +269,95 @@ async def run_web_chat(
 
     result = await broker.submit(params, timeout=240.0)
     return _format_web_result(result, endpoint=endpoint, model=model, via="http")
+
+
+async def _run_public_chat_job(job_id: str, kwargs: dict[str, Any]) -> None:
+    broker = get_chatgpt_broker()
+    broker.mark_public_running(job_id)
+    try:
+        result = await run_web_chat(**kwargs)
+        broker.finish_public_job(job_id, result=result)
+    except HTTPException as exc:
+        detail = exc.detail
+        if not isinstance(detail, str):
+            detail = str(detail)
+        broker.finish_public_job(job_id, error=detail)
+    except Exception as exc:
+        logger.exception("chatgpt public job %s failed", job_id[:8])
+        broker.finish_public_job(job_id, error=str(exc) or "chatgpt_job_failed")
+
+
+def enqueue_web_chat(
+    *,
+    prompt: str = "",
+    model: str | None = None,
+    endpoint: str | None = None,
+    profile_id: str | None = None,
+    conversation_id: str | None = None,
+    parent_message_id: str | None = None,
+    images: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Enqueue chat job and return immediately (Cloudflare-safe)."""
+    prompt = (prompt or "").strip()
+    norm_images = _normalize_images(images)
+    if not prompt and not norm_images:
+        raise HTTPException(400, "empty_prompt")
+
+    kwargs = {
+        "prompt": prompt,
+        "model": model,
+        "endpoint": endpoint,
+        "profile_id": profile_id,
+        "conversation_id": conversation_id,
+        "parent_message_id": parent_message_id,
+        "images": images,
+    }
+    broker = get_chatgpt_broker()
+    job = broker.create_public_job(
+        {
+            "prompt": prompt,
+            "model": (model or "").strip() or DEFAULT_WEB_MODEL,
+            "endpoint": (endpoint or "").strip() or DEFAULT_WEB_ENDPOINT,
+            "profile_id": profile_id,
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_message_id,
+            "images": norm_images,
+        }
+    )
+    task = asyncio.create_task(_run_public_chat_job(job.job_id, kwargs))
+    broker.track_public_task(job.job_id, task)
+    logger.info("chatgpt public job queued %s", job.job_id[:8])
+    return {
+        "ok": True,
+        "id": job.job_id,
+        "status": "queued",
+        "poll_url": f"/api/v1/chatgpt/chat/{job.job_id}",
+    }
+
+
+def public_job_payload(job_id: str) -> dict[str, Any]:
+    broker = get_chatgpt_broker()
+    job = broker.get_public_job(job_id)
+    if not job:
+        raise HTTPException(404, "chatgpt_job_not_found")
+    payload = job.to_dict(include_result=True)
+    payload["ok"] = job.status != "failed"
+    if job.status == "done" and isinstance(job.result, dict):
+        # Flatten common fields for convenient poll clients
+        for key in (
+            "text",
+            "images",
+            "files",
+            "conversation_id",
+            "message_id",
+            "model",
+            "endpoint",
+            "via",
+            "uploaded_images",
+        ):
+            if key in job.result and key not in payload:
+                payload[key] = job.result[key]
+    return payload
 
 
 async def web_status_payload(profile_id: str | None = None) -> dict[str, Any]:
@@ -477,14 +618,29 @@ async def chatgpt_v1_status(
 
 
 @v1_router.post("/chat")
-async def chatgpt_v1_chat(body: PublicChatBody, _: int = Depends(auth_key_id)):
+async def chatgpt_v1_chat(
+    body: PublicChatBody,
+    async_mode: bool = Query(
+        True,
+        alias="async",
+        description="Mặc định true: trả job id ngay rồi poll GET /chat/{id} (tránh Cloudflare 524). "
+        "false = chờ xong trong 1 request (chỉ dùng local / không qua Cloudflare).",
+    ),
+    _: int = Depends(auth_key_id),
+):
     """
-    Gửi tin nhắn ChatGPT (sync) qua session Chrome extension.
+    Gửi tin nhắn ChatGPT qua session Chrome extension.
+
+    Mặc định **async** (khuyên dùng qua `flow2.viettheo.site`):
+    - POST trả `{id, status:"queued", poll_url}`
+    - Poll `GET /api/v1/chatgpt/chat/{id}` đến `done` / `failed`
+
+    Sync: `?async=false` — chờ kết quả trong cùng request (dễ 524 qua Cloudflare).
 
     Multi-turn: gửi lại `conversation_id` + `parent_message_id` (= `message_id` lần trước).
     Ảnh: truyền `images[].data` dạng data URL hoặc base64.
     """
-    return await run_web_chat(
+    kwargs = dict(
         prompt=body.prompt,
         model=body.model,
         endpoint=body.endpoint,
@@ -493,3 +649,12 @@ async def chatgpt_v1_chat(body: PublicChatBody, _: int = Depends(auth_key_id)):
         parent_message_id=body.parent_message_id,
         images=list(body.images or []),
     )
+    if async_mode:
+        return enqueue_web_chat(**kwargs)
+    return await run_web_chat(**kwargs)
+
+
+@v1_router.get("/chat/{job_id}")
+async def chatgpt_v1_chat_job(job_id: str, _: int = Depends(auth_key_id)):
+    """Poll trạng thái job ChatGPT async (`queued` | `running` | `done` | `failed`)."""
+    return public_job_payload(job_id)

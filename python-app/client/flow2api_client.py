@@ -272,12 +272,22 @@ class Flow2APIClient:
         profile_id: Optional[str] = None,
         images: Optional[list[dict[str, Any]]] = None,
         endpoint: Optional[str] = None,
+        async_mode: bool = True,
+        wait: bool = True,
+        poll_interval: float = 2.0,
+        max_wait: float = 600.0,
     ) -> dict:
         """
-        Gửi chat ChatGPT (sync) qua web session trên Chrome extension.
+        Gửi chat ChatGPT qua web session trên Chrome extension.
+
+        Mặc định async=True (an toàn với Cloudflare): POST trả job id, rồi poll.
+        wait=True: chờ đến done/failed rồi trả result (giống sync từ phía caller).
+        wait=False: trả ngay {"id","status","poll_url"} — caller tự poll.
 
         images: [{"data": "data:image/jpeg;base64,...", "file_name": "a.jpg"}]
         Multi-turn: truyền lại conversation_id + parent_message_id (= message_id trước).
+
+        Response (khi done) gồm text, images[] (ảnh assistant), files[] (file tải được).
         """
         body: dict[str, Any] = {"prompt": prompt, "model": model}
         if conversation_id:
@@ -290,11 +300,52 @@ class Flow2APIClient:
             body["endpoint"] = endpoint
         if images:
             body["images"] = images
-        with httpx.Client(timeout=self.timeout) as client:
+        params = {"async": "true" if async_mode else "false"}
+        with httpx.Client(timeout=self.timeout if not async_mode else 60.0) as client:
             r = client.post(
                 f"{self.base_url}/api/v1/chatgpt/chat",
                 headers=self._headers(),
+                params=params,
                 json=body,
             )
             r.raise_for_status()
+            data = r.json()
+        if not async_mode or not wait:
+            return data
+        job_id = data.get("id")
+        if not job_id:
+            return data
+        return self.chatgpt_chat_wait(job_id, poll_interval=poll_interval, max_wait=max_wait)
+
+    def chatgpt_chat_job(self, job_id: str) -> dict:
+        """Poll 1 lần trạng thái job ChatGPT async."""
+        with httpx.Client(timeout=30.0) as client:
+            r = client.get(
+                f"{self.base_url}/api/v1/chatgpt/chat/{job_id}",
+                headers=self._headers(),
+            )
+            r.raise_for_status()
             return r.json()
+
+    def chatgpt_chat_wait(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 2.0,
+        max_wait: float = 600.0,
+    ) -> dict:
+        """Poll đến done/failed rồi trả payload (có flatten text/images/files)."""
+        import time
+
+        deadline = time.time() + max(1.0, max_wait)
+        last: dict = {}
+        while time.time() < deadline:
+            last = self.chatgpt_chat_job(job_id)
+            status = str(last.get("status") or "").lower()
+            if status == "done":
+                return last.get("result") or last
+            if status == "failed":
+                err = last.get("error") or "chatgpt_job_failed"
+                raise RuntimeError(err)
+            time.sleep(max(0.5, poll_interval))
+        raise TimeoutError(f"chatgpt_job_timeout:{job_id}")

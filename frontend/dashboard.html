@@ -128,6 +128,11 @@ body.generate-active #p-generate.pane.on .mini-pop{z-index:9999!important;box-sh
 .cgpt-thumb{position:relative;width:56px;height:56px;border-radius:10px;overflow:hidden;border:1px solid var(--border);background:#fff}
 .cgpt-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .cgpt-thumb button{position:absolute;top:2px;right:2px;width:18px;height:18px;border:0;border-radius:50%;background:rgba(15,23,42,.72);color:#fff;font:800 11px 'Fira Sans';cursor:pointer;line-height:1}
+.cgpt-result-media{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}
+.cgpt-result-media img{max-width:220px;max-height:160px;border-radius:10px;border:1px solid var(--border);display:block;background:#fff}
+.cgpt-file-list{display:flex;flex-direction:column;gap:6px;margin:0 0 10px}
+.cgpt-file-link{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:10px;border:1px solid var(--border);background:var(--surface2);color:var(--accent);font:700 12px 'Fira Sans';text-decoration:none;max-width:100%;word-break:break-all}
+.cgpt-file-link:hover{background:#fff}
 #p-chatgpt.pane.on{display:block!important}
 @media(max-width:640px){.cgpt-shell{height:min(78vh,680px);min-height:420px}.cgpt-top{flex-direction:column;align-items:flex-start}}
 .settings-field{margin-bottom:14px}
@@ -301,7 +306,7 @@ body.auth-locked{overflow:hidden}
       <div id="builderChatgptFields" style="display:none">
         <div class="builder-field"><label>Đầu vào</label><div class="choice-grid two"><button class="choice on" data-b="cgptSource" data-v="text"><b>Text</b></button><button class="choice" data-b="cgptSource" data-v="image"><b>Text + Ảnh</b></button></div></div>
         <div class="builder-field"><label>Model</label><select class="builder-select" id="builderCgptModel"><option value="gpt-5-5">gpt-5-5</option><option value="gpt-5">gpt-5</option><option value="auto">auto</option></select></div>
-        <div class="cfg-d" style="margin-top:8px">API đồng bộ qua session chatgpt.com trên Chrome extension. Auth: Bearer API key (giống /api/requests).</div>
+        <div class="cfg-d" style="margin-top:8px">Mặc định <b>async + poll</b> (tránh Cloudflare 524): POST <code>/api/v1/chatgpt/chat?async=true</code> → nhận <code>id</code> → poll <code>GET /api/v1/chatgpt/chat/{id}</code> đến <code>done</code>/<code>failed</code>. Sync chỉ local: <code>?async=false</code>. Auth: Bearer API key.</div>
       </div>
     </aside>
     <main class="builder-preview">
@@ -817,14 +822,22 @@ function builderIsChatgpt(){return BUILDER.api==='chatgpt'}
 function builderCgptEndpoint(){return '/api/v1/chatgpt/chat'}
 function builderCgptStatusEndpoint(){return '/api/v1/chatgpt/status'}
 function builderCgptPayload(){const body={prompt:'Phân tích bức ảnh này và trả JSON',model:BUILDER.cgptModel||'gpt-5-5'};if(BUILDER.cgptSource==='image'){body.images=[{data:'data:image/jpeg;base64,IMAGE_BASE64_HERE',file_name:'photo.jpg',mime_type:'image/jpeg'}]}return body}
-function builderCgptCurl(){return `curl -X POST "${docBase()}${builderCgptEndpoint()}" \
-  -H "Authorization: Bearer ${docToken()}" \
-  -H "Content-Type: application/json" \
-  -d '${JSON.stringify(builderCgptPayload())}'`}
-function builderCgptPython(){const hasImage=BUILDER.cgptSource==='image';return `${hasImage?'import base64\nimport mimetypes\n':''}import requests
+function builderCgptCurl(){return `# Async (mặc định) — tránh Cloudflare 524
+curl -X POST "${docBase()}${builderCgptEndpoint()}?async=true" \\
+  -H "Authorization: Bearer ${docToken()}" \\
+  -H "Content-Type: application/json" \\
+  -d '${JSON.stringify(builderCgptPayload())}'
+# → {"id":"JOB_ID","status":"queued","poll_url":"/api/v1/chatgpt/chat/JOB_ID"}
+
+# Poll đến done
+curl -X GET "${docBase()}${builderCgptEndpoint()}/JOB_ID" \\
+  -H "Authorization: Bearer ${docToken()}"`}
+function builderCgptPython(){const hasImage=BUILDER.cgptSource==='image';return `${hasImage?'import base64\nimport mimetypes\n':''}import time
+import requests
 
 BASE_URL = "${docBase()}"
 TOKEN = "${docToken()}"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 ${hasImage?`
 def encode_image(path):
     mime = mimetypes.guess_type(path)[0] or "image/jpeg"
@@ -840,15 +853,34 @@ payload = {
     "images": [{"data": IMAGE, "file_name": "photo.jpg"}],`:''}
 }
 
+# 1) Enqueue (trả về ngay — không bị Cloudflare 524)
 r = requests.post(
     f"{BASE_URL}${builderCgptEndpoint()}",
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+    headers=headers,
+    params={"async": "true"},
     json=payload,
-    timeout=240,
+    timeout=60,
 )
 r.raise_for_status()
-data = r.json()
+job_id = r.json()["id"]
+
+# 2) Poll đến done / failed
+data = None
+for _ in range(180):
+    st = requests.get(f"{BASE_URL}${builderCgptEndpoint()}/{job_id}", headers=headers, timeout=30).json()
+    status = str(st.get("status") or "").lower()
+    if status == "done":
+        data = st.get("result") or st
+        break
+    if status == "failed":
+        raise RuntimeError(st.get("error") or "chatgpt_failed")
+    time.sleep(2)
+else:
+    raise TimeoutError("chatgpt_timeout")
+
 print(data["text"])
+print("images =", len(data.get("images") or []))
+print("files =", len(data.get("files") or []))
 print("conversation_id =", data.get("conversation_id"))
 print("message_id =", data.get("message_id"))
 `}
@@ -868,36 +900,51 @@ r.raise_for_status()
 print(r.json())
 `}
 function builderCgptFollowText(){return BUILDER.clang==='python'?builderCgptFollowPython():builderCgptFollowCurl()}
-function builderCgptFollowCurl(){return `# Multi-turn: dùng conversation_id + message_id từ response trước
-curl -X POST "${docBase()}${builderCgptEndpoint()}" \
-  -H "Authorization: Bearer ${docToken()}" \
-  -H "Content-Type: application/json" \
+function builderCgptFollowCurl(){return `# Multi-turn async: poll xong lấy conversation_id + message_id
+# Lần 1
+curl -X POST "${docBase()}${builderCgptEndpoint()}?async=true" \\
+  -H "Authorization: Bearer ${docToken()}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"prompt":"Xin chào","model":"${BUILDER.cgptModel||'gpt-5-5'}"}'
+# Poll: GET ${builderCgptEndpoint()}/JOB_ID  → conversation_id, message_id
+
+# Lần 2
+curl -X POST "${docBase()}${builderCgptEndpoint()}?async=true" \\
+  -H "Authorization: Bearer ${docToken()}" \\
+  -H "Content-Type: application/json" \\
   -d '{"prompt":"Tiếp tục, rút gọn lại","model":"${BUILDER.cgptModel||'gpt-5-5'}","conversation_id":"CONVERSATION_ID","parent_message_id":"MESSAGE_ID"}'`}
-function builderCgptFollowPython(){return `import requests
+function builderCgptFollowPython(){return `import time
+import requests
 
 BASE_URL = "${docBase()}"
 TOKEN = "${docToken()}"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-# Lần 1
-r1 = requests.post(
-    f"{BASE_URL}${builderCgptEndpoint()}",
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-    json={"prompt": "Xin chào", "model": "${BUILDER.cgptModel||'gpt-5-5'}"},
-    timeout=240,
-).json()
+def chatgpt_chat(payload):
+    job_id = requests.post(
+        f"{BASE_URL}${builderCgptEndpoint()}",
+        headers=headers,
+        params={"async": "true"},
+        json=payload,
+        timeout=60,
+    ).json()["id"]
+    for _ in range(180):
+        st = requests.get(f"{BASE_URL}${builderCgptEndpoint()}/{job_id}", headers=headers, timeout=30).json()
+        status = str(st.get("status") or "").lower()
+        if status == "done":
+            return st.get("result") or st
+        if status == "failed":
+            raise RuntimeError(st.get("error") or "failed")
+        time.sleep(2)
+    raise TimeoutError("chatgpt_timeout")
 
-# Lần 2 (follow-up)
-r2 = requests.post(
-    f"{BASE_URL}${builderCgptEndpoint()}",
-    headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-    json={
-        "prompt": "Tiếp tục, rút gọn lại",
-        "model": "${BUILDER.cgptModel||'gpt-5-5'}",
-        "conversation_id": r1["conversation_id"],
-        "parent_message_id": r1["message_id"],
-    },
-    timeout=240,
-).json()
+r1 = chatgpt_chat({"prompt": "Xin chào", "model": "${BUILDER.cgptModel||'gpt-5-5'}"})
+r2 = chatgpt_chat({
+    "prompt": "Tiếp tục, rút gọn lại",
+    "model": "${BUILDER.cgptModel||'gpt-5-5'}",
+    "conversation_id": r1["conversation_id"],
+    "parent_message_id": r1["message_id"],
+})
 print(r2["text"])
 `}
 function builderStopTitleText(){return BUILDER.stopMode==='all'?'Dừng tất cả task đang queue/chạy':'Dừng 1 task (queued hoặc running)'}
@@ -931,7 +978,7 @@ function updateModelOptions(){const sel=byId('builderModel');if(!sel)return;let 
 function builderShowOmniDuration(){if(!builderIsOmniFlash()||BUILDER.media!=='video')return false;if(BUILDER.source==='text')return true;if(builderIsOmniFrame())return true;return builderIsOmniComponent()&&!builderHasVideo()}
 function renderAspectOptions(){const seg=byId('aspectSeg');if(!seg)return;const vals=BUILDER.media==='image'?['16:9','4:3','1:1','3:4','9:16']:['16:9','9:16'];if(!vals.includes(BUILDER.aspect))BUILDER.aspect='16:9';seg.style.gridTemplateColumns=`repeat(${Math.min(vals.length,5)},1fr)`;seg.innerHTML=vals.map(v=>`<button class="ratio ${BUILDER.aspect===v?'on':''}" data-b="aspect" data-v="${v}">${ratioIconHtml(v)}</button>`).join('');seg.querySelectorAll('[data-b="aspect"]').forEach(btn=>btn.onclick=()=>{BUILDER.aspect=btn.dataset.v;renderBuilder()})}
 function renderBuilderRefCountOptions(){const refSel=byId('refCountSelect');if(!refSel)return;let max=builderIsFrameVideo()?2:3;if(builderIsOmniFrame())max=1;else if(builderIsOmniComponent())max=builderHasVideo()?5:7;const cur=Math.max(1,Math.min(max,Number(BUILDER.refCount)||1));BUILDER.refCount=cur;refSel.innerHTML=Array.from({length:max},(_,i)=>{const n=i+1;let label;if(builderIsOmniFrame())label='1 ảnh (startImage)';else if(builderIsOmniComponent())label=`${n} ảnh (reference)`;else label=builderIsFrameVideo()?(n===1?'1 ảnh (startImage)':'2 ảnh (start + end)'):`${n} ảnh (reference)`;return `<option value="${n}" ${n===cur?'selected':''}>${label}</option>`}).join('')}
-function renderBuilder(){document.querySelectorAll('[data-b="api"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.api));document.querySelectorAll('[data-b="cgptSource"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.cgptSource));document.querySelectorAll('[data-b="clang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.clang));const flowFields=byId('builderFlowFields');const cgptFields=byId('builderChatgptFields');const isCgpt=BUILDER.api==='chatgpt';if(flowFields)flowFields.style.display=isCgpt?'none':'block';if(cgptFields)cgptFields.style.display=isCgpt?'block':'none';const cgptModelSel=byId('builderCgptModel');if(cgptModelSel&&BUILDER.cgptModel)cgptModelSel.value=BUILDER.cgptModel;document.querySelectorAll('[data-b="source"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.source));document.querySelectorAll('[data-b="videoMode"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.videoMode));document.querySelectorAll('[data-b="ulang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.ulang));document.querySelectorAll('[data-b="slang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.slang));document.querySelectorAll('[data-b="omniHasVideo"]').forEach(x=>x.classList.toggle('on',String(BUILDER.omniHasVideo)===String(x.dataset.v==='true')));document.querySelectorAll('[data-b="omniDuration"]').forEach(x=>x.classList.toggle('on',String(BUILDER.omniDuration)===String(x.dataset.v)));const videoModeField=byId('builderVideoModeField');if(videoModeField)videoModeField.style.display=(BUILDER.media==='video'&&BUILDER.source==='image')?'block':'none';const omniVideoField=byId('builderOmniVideoField');if(omniVideoField)omniVideoField.style.display=(builderIsOmniComponent()&&BUILDER.source==='image')?'block':'none';const omniDurField=byId('builderOmniDurationField');if(omniDurField)omniDurField.style.display=builderShowOmniDuration()?'block':'none';const hint=byId('builderVideoModeHint');if(hint)hint.textContent=builderVideoModeHint();renderAspectOptions();updateModelOptions();renderBuilderRefCountOptions();setText('builderCurl',builderCreateText());setText('builderStatus',builderStatusCodeText());setText('builderStop',builderStopCodeText());setText('builderStopTitle',builderStopTitleText());setText('builderUpscale',builderUpscaleText());setText('builderCreateTitle',isCgpt?('Chat GPT — POST '+builderCgptEndpoint()):builderCreateTitleText());setText('builderStatusTitle',isCgpt?'Check ChatGPT ready':'Check status');setText('builderCgptFollow',builderCgptFollowText());const statusCard=byId('statusCodeCard');if(statusCard)statusCard.style.display='block';const stopCard=byId('stopCodeCard');if(stopCard)stopCard.style.display=isCgpt?'none':'block';const followCard=byId('cgptFollowCodeCard');if(followCard)followCard.style.display=isCgpt?'block':'none';const upscaleCard=byId('upscaleCodeCard');const upscaleTitle=byId('builderUpscaleTitle');const imgActions=byId('upscaleImageActions');const vidActions=byId('upscaleVideoActions');if(upscaleCard)upscaleCard.style.display=isCgpt?'none':((BUILDER.media==='image'||BUILDER.media==='video')?'block':'none');if(upscaleTitle)upscaleTitle.textContent=BUILDER.media==='video'?'Upscale video 1080p':'Upscale ảnh 2K / 4K';if(imgActions)imgActions.style.display=(!isCgpt&&BUILDER.media==='image')?'flex':'none';if(vidActions)vidActions.style.display=(!isCgpt&&BUILDER.media==='video')?'flex':'none';const upscaleVideoMode=byId('upscaleVideoModeSelect');if(upscaleVideoMode)upscaleVideoMode.style.display='none';const refSel=byId('refCountSelect');if(refSel){const show=!isCgpt&&builderIsImageInput();refSel.hidden=!show;refSel.style.display=show?'inline-flex':'none';refSel.disabled=false}}
+function renderBuilder(){document.querySelectorAll('[data-b="api"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.api));document.querySelectorAll('[data-b="cgptSource"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.cgptSource));document.querySelectorAll('[data-b="clang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.clang));const flowFields=byId('builderFlowFields');const cgptFields=byId('builderChatgptFields');const isCgpt=BUILDER.api==='chatgpt';if(flowFields)flowFields.style.display=isCgpt?'none':'block';if(cgptFields)cgptFields.style.display=isCgpt?'block':'none';const cgptModelSel=byId('builderCgptModel');if(cgptModelSel&&BUILDER.cgptModel)cgptModelSel.value=BUILDER.cgptModel;document.querySelectorAll('[data-b="source"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.source));document.querySelectorAll('[data-b="videoMode"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.videoMode));document.querySelectorAll('[data-b="ulang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.ulang));document.querySelectorAll('[data-b="slang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===BUILDER.slang));document.querySelectorAll('[data-b="omniHasVideo"]').forEach(x=>x.classList.toggle('on',String(BUILDER.omniHasVideo)===String(x.dataset.v==='true')));document.querySelectorAll('[data-b="omniDuration"]').forEach(x=>x.classList.toggle('on',String(BUILDER.omniDuration)===String(x.dataset.v)));const videoModeField=byId('builderVideoModeField');if(videoModeField)videoModeField.style.display=(BUILDER.media==='video'&&BUILDER.source==='image')?'block':'none';const omniVideoField=byId('builderOmniVideoField');if(omniVideoField)omniVideoField.style.display=(builderIsOmniComponent()&&BUILDER.source==='image')?'block':'none';const omniDurField=byId('builderOmniDurationField');if(omniDurField)omniDurField.style.display=builderShowOmniDuration()?'block':'none';const hint=byId('builderVideoModeHint');if(hint)hint.textContent=builderVideoModeHint();renderAspectOptions();updateModelOptions();renderBuilderRefCountOptions();setText('builderCurl',builderCreateText());setText('builderStatus',builderStatusCodeText());setText('builderStop',builderStopCodeText());setText('builderStopTitle',builderStopTitleText());setText('builderUpscale',builderUpscaleText());setText('builderCreateTitle',isCgpt?('Chat GPT — async POST '+builderCgptEndpoint()+' + poll'):builderCreateTitleText());setText('builderStatusTitle',isCgpt?'Check ChatGPT ready (GET /status)':'Check status');setText('builderCgptFollow',builderCgptFollowText());const statusCard=byId('statusCodeCard');if(statusCard)statusCard.style.display='block';const stopCard=byId('stopCodeCard');if(stopCard)stopCard.style.display=isCgpt?'none':'block';const followCard=byId('cgptFollowCodeCard');if(followCard)followCard.style.display=isCgpt?'block':'none';const upscaleCard=byId('upscaleCodeCard');const upscaleTitle=byId('builderUpscaleTitle');const imgActions=byId('upscaleImageActions');const vidActions=byId('upscaleVideoActions');if(upscaleCard)upscaleCard.style.display=isCgpt?'none':((BUILDER.media==='image'||BUILDER.media==='video')?'block':'none');if(upscaleTitle)upscaleTitle.textContent=BUILDER.media==='video'?'Upscale video 1080p':'Upscale ảnh 2K / 4K';if(imgActions)imgActions.style.display=(!isCgpt&&BUILDER.media==='image')?'flex':'none';if(vidActions)vidActions.style.display=(!isCgpt&&BUILDER.media==='video')?'flex':'none';const upscaleVideoMode=byId('upscaleVideoModeSelect');if(upscaleVideoMode)upscaleVideoMode.style.display='none';const refSel=byId('refCountSelect');if(refSel){const show=!isCgpt&&builderIsImageInput();refSel.hidden=!show;refSel.style.display=show?'inline-flex':'none';refSel.disabled=false}}
 function initBuilder(){document.querySelectorAll('[data-b]').forEach(btn=>{btn.onclick=()=>{const k=btn.dataset.b,v=btn.dataset.v;if(k==='ulang'){BUILDER.ulang=v;document.querySelectorAll('[data-b="ulang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===v));renderBuilder();return}if(k==='slang'){BUILDER.slang=v;document.querySelectorAll('[data-b="slang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===v));renderBuilder();return}if(k==='clang'){BUILDER.clang=v;document.querySelectorAll('[data-b="clang"]').forEach(x=>x.classList.toggle('on',x.dataset.v===v));renderBuilder();return}if(k==='omniHasVideo'){BUILDER.omniHasVideo=v==='true';if(BUILDER.omniHasVideo&&Number(BUILDER.refCount)>5)BUILDER.refCount=5;renderBuilder();return}if(k==='omniDuration'){BUILDER.omniDuration=Number(v)||10;renderBuilder();return}BUILDER[k]=k==='count'?Number(v):v;if(k==='media'){BUILDER.model=BUILDER.media==='image'?'NANO_BANANA_PRO':'fast';if(BUILDER.media==='video'&&!['16:9','9:16'].includes(BUILDER.aspect))BUILDER.aspect='16:9'}if(k==='source'&&BUILDER.media==='video'&&v==='image'&&!BUILDER.videoMode)BUILDER.videoMode='component';if(k==='videoMode'&&builderIsFrameVideo()&&Number(BUILDER.refCount)>2)BUILDER.refCount=2;if(k==='videoMode'&&builderIsOmniFrame())BUILDER.refCount=1;if(k==='model'||k==='media'){if(!builderIsOmniFlash())BUILDER.omniHasVideo=false}document.querySelectorAll(`[data-b="${k}"]`).forEach(x=>x.classList.remove('on'));btn.classList.add('on');renderBuilder()}});const sel=byId('builderModel');if(sel)sel.onchange=()=>{BUILDER.model=sel.value;if(BUILDER.model!=='omni_flash')BUILDER.omniHasVideo=false;renderBuilder()};const cgptSel=byId('builderCgptModel');if(cgptSel){cgptSel.value=BUILDER.cgptModel||'gpt-5-5';cgptSel.onchange=()=>{BUILDER.cgptModel=cgptSel.value||'gpt-5-5';renderBuilder()}}const refSel=byId('refCountSelect');if(refSel)refSel.onchange=()=>{BUILDER.refCount=Number(refSel.value)||1;renderBuilder()};const upscaleRes=byId('upscaleResSelect');if(upscaleRes){upscaleRes.value=BUILDER.upscaleRes;upscaleRes.onchange=()=>{BUILDER.upscaleRes=upscaleRes.value||'4k';renderBuilder()}}const upscaleMode=byId('upscaleModeSelect');if(upscaleMode){upscaleMode.value=BUILDER.upscaleDownload?'download':'json';upscaleMode.onchange=()=>{BUILDER.upscaleDownload=upscaleMode.value==='download';renderBuilder()}}const upscaleVideoMode=byId('upscaleVideoModeSelect');if(upscaleVideoMode){upscaleVideoMode.value=BUILDER.upscaleVideoDownload?'download':'json';upscaleVideoMode.onchange=()=>{BUILDER.upscaleVideoDownload=upscaleVideoMode.value==='download';renderBuilder()}}const stopMode=byId('stopModeSelect');if(stopMode){stopMode.value=BUILDER.stopMode||'single';stopMode.onchange=()=>{BUILDER.stopMode=stopMode.value==='all'?'all':'single';renderBuilder()}}}
 function copyDoc(t){navigator.clipboard?.writeText(t);showToast('Đã copy','success')}
 function renderDocs(){initBuilder();renderBuilder()}
@@ -943,10 +990,10 @@ function renderCgptThumbs(){const box=byId('cgptThumbs');if(!box)return;box.inne
 function removeCgptImage(i){CGPT_IMAGES.splice(i,1);renderCgptThumbs()}
 function readCgptFileAsDataUrl(file){return new Promise((resolve,reject)=>{const fr=new FileReader();fr.onload=()=>resolve(String(fr.result||''));fr.onerror=()=>reject(fr.error||new Error('read_failed'));fr.readAsDataURL(file)})}
 async function onCgptFilesSelected(ev){const files=[...(ev?.target?.files||[])];if(!files.length)return;for(const f of files){if(!String(f.type||'').startsWith('image/'))continue;if(f.size>20*1024*1024){showToast('Ảnh quá lớn (>20MB): '+f.name,'error');continue}try{const data=await readCgptFileAsDataUrl(f);CGPT_IMAGES.push({data,preview:data,fileName:f.name,mimeType:f.type||'image/jpeg'})}catch(e){showToast('Đọc ảnh lỗi: '+(e.message||e),'error')}}if(ev?.target)ev.target.value='';renderCgptThumbs()}
-function renderCgptMessages(){const box=byId('cgptMessages');if(!box)return;if(!CGPT_MESSAGES.length){box.innerHTML='<div class="cgpt-empty" id="cgptEmpty"><strong>Bắt đầu hội thoại</strong>Reload extension Flow2API trên Chrome (profile đã login chatgpt.com). Dashboard dùng HTTP poll — không cần Bridge WS. Khi pill hiện HTTP poll / Web session là gửi được.</div>';return}box.innerHTML=CGPT_MESSAGES.map((m,i)=>{const role=m.role==='assistant'?'assistant':(m.role==='error'?'error':'user');const label=role==='assistant'?'AI':(role==='error'?'!':'Bạn');const typing=m.typing?' cgpt-typing':'';const imgs=(m.images||[]).map(src=>`<div style="margin:0 0 8px"><img src="${esc(src)}" alt="" style="max-width:220px;max-height:160px;border-radius:10px;border:1px solid var(--border)"></div>`).join('');return `<div class="cgpt-msg ${role}" data-i="${i}"><div class="cgpt-avatar">${label}</div><div class="cgpt-bubble${typing}">${imgs}${esc(m.content||(m.typing?'…':''))}</div></div>`}).join('');box.scrollTop=box.scrollHeight}
+function renderCgptMessages(){const box=byId('cgptMessages');if(!box)return;if(!CGPT_MESSAGES.length){box.innerHTML='<div class="cgpt-empty" id="cgptEmpty"><strong>Bắt đầu hội thoại</strong>Reload extension Flow2API trên Chrome (profile đã login chatgpt.com). Dashboard dùng HTTP poll — không cần Bridge WS. Khi pill hiện HTTP poll / Web session là gửi được.</div>';return}box.innerHTML=CGPT_MESSAGES.map((m,i)=>{const role=m.role==='assistant'?'assistant':(m.role==='error'?'error':'user');const label=role==='assistant'?'AI':(role==='error'?'!':'Bạn');const typing=m.typing?' cgpt-typing':'';const imgs=(m.images||[]).map(src=>{const url=typeof src==='string'?src:(src.data||src.download_url||src.url||'');if(!url)return '';return `<img src="${esc(url)}" alt="${esc(src.file_name||'image')}">`}).filter(Boolean);const media=imgs.length?`<div class="cgpt-result-media">${imgs.join('')}</div>`:'';const files=(m.files||[]).map(f=>{const href=f.data||f.download_url||f.url||'#';const name=f.file_name||f.name||'file';const dl=f.data?` download="${esc(name)}"`:' target="_blank" rel="noopener"';return `<a class="cgpt-file-link" href="${esc(href)}"${dl}>${esc(name)}</a>`}).join('');const fileBox=files?`<div class="cgpt-file-list">${files}</div>`:'';return `<div class="cgpt-msg ${role}" data-i="${i}"><div class="cgpt-avatar">${label}</div><div class="cgpt-bubble${typing}">${media}${fileBox}${esc(m.content||(m.typing?'…':''))}</div></div>`}).join('');box.scrollTop=box.scrollHeight}
 function clearCgptChat(){if(CGPT_BUSY)return;CGPT_MESSAGES=[];CGPT_CONVERSATION_ID=null;CGPT_PARENT_MESSAGE_ID=null;CGPT_IMAGES=[];renderCgptThumbs();renderCgptMessages()}
 async function refreshCgptStatus(){if(!DASHBOARD_UNLOCKED)return;try{const pid=(byId('cgptProfile')?.value||'').trim();const q=pid?('?profile_id='+encodeURIComponent(pid)):'';const r=await fetch('/api/chatgpt/web/status'+q,{headers:authHeaders(),cache:'no-store'});if(!r.ok)return;applyCgptStatus(await r.json())}catch(_e){}}
-async function sendCgptMessage(){if(CGPT_BUSY)return;const input=byId('cgptInput');const text=(input?.value||'').trim();const pending=CGPT_IMAGES.slice();if(!text&&!pending.length)return;await ensureToken();CGPT_MESSAGES.push({role:'user',content:text||'(ảnh)',images:pending.map(p=>p.preview||p.data)});CGPT_MESSAGES.push({role:'assistant',content:'',typing:true});if(input)input.value='';CGPT_IMAGES=[];renderCgptThumbs();renderCgptMessages();CGPT_BUSY=true;const sendBtn=byId('cgptSend');if(sendBtn)sendBtn.disabled=true;const model=byId('cgptModel')?.value||undefined;const endpoint=(byId('cgptEndpoint')?.value||'').trim()||undefined;const profile_id=(byId('cgptProfile')?.value||'').trim()||undefined;const images=pending.map(p=>({data:p.data,fileName:p.fileName,mimeType:p.mimeType}));const idx=CGPT_MESSAGES.length-1;try{const r=await fetch('/api/chatgpt/web/chat',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({prompt:text,endpoint,model,profile_id,images:images.length?images:undefined,conversation_id:CGPT_CONVERSATION_ID||undefined,parent_message_id:CGPT_PARENT_MESSAGE_ID||undefined})});let j={};try{j=await r.json()}catch(_e){j={}}if(!r.ok){const detail=typeof j.detail==='string'?j.detail:(j.detail?.msg||j.error||j.message||('HTTP '+r.status));throw new Error(detail)}if(j.conversation_id)CGPT_CONVERSATION_ID=j.conversation_id;if(j.message_id)CGPT_PARENT_MESSAGE_ID=j.message_id;CGPT_MESSAGES[idx]={role:'assistant',content:j.text||'(trống)',typing:false};renderCgptMessages()}catch(e){if(idx>=0&&CGPT_MESSAGES[idx]?.role==='assistant')CGPT_MESSAGES[idx]={role:'error',content:String(e.message||e)};else CGPT_MESSAGES.push({role:'error',content:String(e.message||e)});renderCgptMessages();showToast('Chat lỗi: '+(e.message||e),'error');refreshCgptStatus()}finally{CGPT_BUSY=false;if(sendBtn)sendBtn.disabled=false;byId('cgptInput')?.focus()}}
+async function sendCgptMessage(){if(CGPT_BUSY)return;const input=byId('cgptInput');const text=(input?.value||'').trim();const pending=CGPT_IMAGES.slice();if(!text&&!pending.length)return;await ensureToken();CGPT_MESSAGES.push({role:'user',content:text||'(ảnh)',images:pending.map(p=>p.preview||p.data)});CGPT_MESSAGES.push({role:'assistant',content:'',typing:true});if(input)input.value='';CGPT_IMAGES=[];renderCgptThumbs();renderCgptMessages();CGPT_BUSY=true;const sendBtn=byId('cgptSend');if(sendBtn)sendBtn.disabled=true;const model=byId('cgptModel')?.value||undefined;const endpoint=(byId('cgptEndpoint')?.value||'').trim()||undefined;const profile_id=(byId('cgptProfile')?.value||'').trim()||undefined;const images=pending.map(p=>({data:p.data,fileName:p.fileName,mimeType:p.mimeType}));const idx=CGPT_MESSAGES.length-1;try{const r=await fetch('/api/chatgpt/web/chat',{method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({prompt:text,endpoint,model,profile_id,images:images.length?images:undefined,conversation_id:CGPT_CONVERSATION_ID||undefined,parent_message_id:CGPT_PARENT_MESSAGE_ID||undefined})});let j={};try{j=await r.json()}catch(_e){j={}}if(!r.ok){const detail=typeof j.detail==='string'?j.detail:(j.detail?.msg||j.error||j.message||('HTTP '+r.status));throw new Error(detail)}if(j.conversation_id)CGPT_CONVERSATION_ID=j.conversation_id;if(j.message_id)CGPT_PARENT_MESSAGE_ID=j.message_id;CGPT_MESSAGES[idx]={role:'assistant',content:j.text||'(trống)',typing:false,images:Array.isArray(j.images)?j.images:[],files:Array.isArray(j.files)?j.files:[]};renderCgptMessages()}catch(e){if(idx>=0&&CGPT_MESSAGES[idx]?.role==='assistant')CGPT_MESSAGES[idx]={role:'error',content:String(e.message||e)};else CGPT_MESSAGES.push({role:'error',content:String(e.message||e)});renderCgptMessages();showToast('Chat lỗi: '+(e.message||e),'error');refreshCgptStatus()}finally{CGPT_BUSY=false;if(sendBtn)sendBtn.disabled=false;byId('cgptInput')?.focus()}}
 function initCgptPanel(){const input=byId('cgptInput');if(input&&!input.dataset.bound){input.dataset.bound='1';input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCgptMessage()}})}const ep=byId('cgptEndpoint');if(ep&&!ep.dataset.bound){ep.dataset.bound='1';ep.addEventListener('input',()=>{ep.dataset.touched='1'})}const model=byId('cgptModel');if(model&&!model.dataset.bound){model.dataset.bound='1';model.addEventListener('change',()=>{model.dataset.touched='1'})}const prof=byId('cgptProfile');if(prof&&!prof.dataset.bound){prof.dataset.bound='1';prof.addEventListener('change',()=>refreshCgptStatus())}const fileEl=byId('cgptFile');if(fileEl&&!fileEl.dataset.bound){fileEl.dataset.bound='1';fileEl.addEventListener('change',onCgptFilesSelected)}const keyEl=byId('setOaiKey');if(keyEl&&!keyEl.dataset.bound){keyEl.dataset.bound='1';keyEl.addEventListener('input',()=>{keyEl.dataset.dirty='1'})}refreshCgptStatus()}
 let PROXY_SETTINGS_CFG=null;
 function fmtProxyCountdown(sec){if(sec==null||isNaN(sec))return '--:--';sec=Math.max(0,Math.floor(sec));const m=Math.floor(sec/60),s=sec%60;return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`}

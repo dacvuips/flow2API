@@ -604,11 +604,504 @@ function extractTextFromEventData(data) {
   return '';
 }
 
+const ASSET_POINTER_RE = /^(?:file-service|sediment):\/\/(.+)$/i;
+const SANDBOX_LINK_RE = /\[([^\]]*)\]\((sandbox:\/mnt\/data\/[^)\s]+)\)/gi;
+const SANDBOX_PATH_RE = /sandbox:(\/mnt\/data\/[^\s)'"]+)/gi;
+const IMAGE_MIME_RE = /^image\//i;
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+const MAX_ASSET_BASE64_BYTES = 8 * 1024 * 1024;
+
+function parseAssetPointer(pointer) {
+  const m = ASSET_POINTER_RE.exec(String(pointer || '').trim());
+  return m ? m[1] : null;
+}
+
+function guessKindFromNameMime(name, mime) {
+  if (mime && IMAGE_MIME_RE.test(mime)) return 'image';
+  if (name && IMAGE_EXT_RE.test(name)) return 'image';
+  return 'file';
+}
+
+function basenameFromPath(path) {
+  const s = String(path || '');
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function collectAssetRefsFromPart(part, into, seen) {
+  if (!part || typeof part !== 'object') return;
+  const ctype = String(part.content_type || part.contentType || '');
+  const pointer = part.asset_pointer || part.assetPointer || '';
+  const fileId = parseAssetPointer(pointer) || part.file_id || part.fileId || part.id || null;
+  if (!fileId && !pointer) return;
+
+  const key = fileId || pointer;
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  const name =
+    part.file_name
+    || part.filename
+    || part.name
+    || (part.metadata?.dalle ? 'dalle_image.png' : null)
+    || (ctype.includes('image') ? 'image.png' : 'file');
+  const mime = part.mime_type || part.mimeType || (ctype.includes('image') ? 'image/png' : null);
+  const kind = ctype.includes('image') || guessKindFromNameMime(name, mime) === 'image'
+    ? 'image'
+    : 'file';
+
+  into.push({
+    fileId: fileId || null,
+    fileName: name,
+    mimeType: mime,
+    kind,
+    width: part.width || 0,
+    height: part.height || 0,
+    sizeBytes: part.size_bytes || part.sizeBytes || part.size || 0,
+    assetPointer: pointer || (fileId ? `sediment://${fileId}` : null),
+    source: 'part',
+  });
+}
+
+function collectAssetRefsFromMessage(msg, into, seen, { includeUser = false } = {}) {
+  if (!msg || typeof msg !== 'object') return;
+  const role = msg?.author?.role || msg?.role || '';
+  if (!includeUser && role === 'user') return;
+
+  const parts = msg?.content?.parts;
+  if (Array.isArray(parts)) {
+    for (const part of parts) collectAssetRefsFromPart(part, into, seen);
+  }
+
+  const meta = msg.metadata || {};
+  for (const att of meta.attachments || []) {
+    const fid = att?.id || att?.file_id || att?.fileId;
+    if (!fid || seen.has(fid)) continue;
+    seen.add(fid);
+    const name = att.name || att.file_name || att.filename || 'attachment';
+    const mime = att.mime_type || att.mimeType || null;
+    into.push({
+      fileId: fid,
+      fileName: name,
+      mimeType: mime,
+      kind: guessKindFromNameMime(name, mime),
+      width: att.width || 0,
+      height: att.height || 0,
+      sizeBytes: att.size || att.size_bytes || 0,
+      assetPointer: `sediment://${fid}`,
+      source: 'attachment',
+    });
+  }
+
+  for (const cit of meta.citations || []) {
+    const fid = cit?.metadata?.file_id || cit?.file_id || cit?.fileId;
+    if (!fid || seen.has(fid)) continue;
+    seen.add(fid);
+    const name = cit?.metadata?.title || cit?.title || 'citation';
+    into.push({
+      fileId: fid,
+      fileName: name,
+      mimeType: null,
+      kind: guessKindFromNameMime(name, null),
+      width: 0,
+      height: 0,
+      sizeBytes: 0,
+      assetPointer: `sediment://${fid}`,
+      source: 'citation',
+    });
+  }
+
+  for (const fid of meta.file_ids || meta.gizmo_file_ids || []) {
+    if (!fid || seen.has(fid)) continue;
+    seen.add(fid);
+    into.push({
+      fileId: fid,
+      fileName: fid,
+      mimeType: null,
+      kind: 'file',
+      width: 0,
+      height: 0,
+      sizeBytes: 0,
+      assetPointer: `sediment://${fid}`,
+      source: 'file_ids',
+    });
+  }
+}
+
+function collectSandboxRefsFromText(text, into, seen) {
+  const s = String(text || '');
+  if (!s) return;
+
+  SANDBOX_LINK_RE.lastIndex = 0;
+  let m;
+  while ((m = SANDBOX_LINK_RE.exec(s))) {
+    const label = (m[1] || '').trim();
+    const path = String(m[2] || '').replace(/^sandbox:/i, '');
+    const key = `sandbox:${path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const fileName = label || basenameFromPath(path) || 'file';
+    into.push({
+      fileId: null,
+      fileName,
+      mimeType: null,
+      kind: guessKindFromNameMime(fileName, null),
+      width: 0,
+      height: 0,
+      sizeBytes: 0,
+      assetPointer: null,
+      sandboxPath: path,
+      source: 'sandbox_markdown',
+    });
+  }
+
+  SANDBOX_PATH_RE.lastIndex = 0;
+  while ((m = SANDBOX_PATH_RE.exec(s))) {
+    const path = m[1];
+    const key = `sandbox:${path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const fileName = basenameFromPath(path) || 'file';
+    into.push({
+      fileId: null,
+      fileName,
+      mimeType: null,
+      kind: guessKindFromNameMime(fileName, null),
+      width: 0,
+      height: 0,
+      sizeBytes: 0,
+      assetPointer: null,
+      sandboxPath: path,
+      source: 'sandbox_path',
+    });
+  }
+}
+
+function collectAssetRefsFromEvents(events, text) {
+  const refs = [];
+  const seen = new Set();
+  for (const data of events || []) {
+    if (!data || typeof data !== 'object') continue;
+    if (data.message) collectAssetRefsFromMessage(data.message, refs, seen);
+    // Patch ops may insert full image parts as objects
+    if (data.o === 'patch' && Array.isArray(data.v)) {
+      for (const op of data.v) {
+        if (op && typeof op.v === 'object') collectAssetRefsFromPart(op.v, refs, seen);
+      }
+    }
+    if (data.o === 'add' && data.v && typeof data.v === 'object') {
+      collectAssetRefsFromPart(data.v, refs, seen);
+    }
+  }
+  collectSandboxRefsFromText(text, refs, seen);
+  return refs;
+}
+
+async function fetchConversationDetail(conversationId, accessToken, cookies) {
+  if (!conversationId) return null;
+  try {
+    const { resp } = await chatgptFetch(`/backend-api/conversation/${conversationId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+      cookies,
+    });
+    if (!resp.ok) return null;
+    return await resp.json().catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+function collectAssetRefsFromConversation(convo, { excludeFileIds = null } = {}) {
+  const refs = [];
+  const seen = new Set();
+  const mapping = convo?.mapping || {};
+  const messages = [];
+  for (const node of Object.values(mapping)) {
+    const msg = node?.message;
+    if (!msg) continue;
+    messages.push(msg);
+  }
+  messages.sort((a, b) => (Number(a.create_time) || 0) - (Number(b.create_time) || 0));
+
+  // Only assets from the latest turn (messages after the last user message).
+  let lastUserIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.author?.role === 'user') lastUserIdx = i;
+  }
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx + 1) : messages.slice(-8);
+
+  for (const msg of slice) {
+    collectAssetRefsFromMessage(msg, refs, seen, { includeUser: false });
+    const parts = msg?.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) {
+        if (typeof p === 'string') collectSandboxRefsFromText(p, refs, seen);
+      }
+    }
+  }
+
+  if (excludeFileIds && excludeFileIds.size) {
+    return refs.filter((r) => !r.fileId || !excludeFileIds.has(r.fileId));
+  }
+  return refs;
+}
+
+function mergeAssetRefs(...lists) {
+  const out = [];
+  const seen = new Set();
+  for (const list of lists) {
+    for (const ref of list || []) {
+      const key = ref.fileId
+        || (ref.sandboxPath ? `sandbox:${ref.sandboxPath}` : null)
+        || ref.assetPointer
+        || `${ref.fileName}:${ref.source}`;
+      if (!key || seen.has(key)) {
+        // Prefer filling missing fileId onto sandbox entry
+        if (ref.fileId && ref.sandboxPath) {
+          const existing = out.find((x) => x.sandboxPath === ref.sandboxPath && !x.fileId);
+          if (existing) existing.fileId = ref.fileId;
+        }
+        continue;
+      }
+      seen.add(key);
+      out.push({ ...ref });
+    }
+  }
+  // Match sandbox files to attachment fileIds by filename
+  for (const ref of out) {
+    if (ref.fileId || !ref.sandboxPath) continue;
+    const want = (ref.fileName || basenameFromPath(ref.sandboxPath) || '').toLowerCase();
+    if (!want) continue;
+    const match = out.find((x) => x.fileId && String(x.fileName || '').toLowerCase() === want);
+    if (match) ref.fileId = match.fileId;
+  }
+  return out;
+}
+
+async function resolveFileDownloadMeta(fileId, accessToken, cookies) {
+  const { resp } = await chatgptFetch(`/backend-api/files/download/${encodeURIComponent(fileId)}`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+    },
+    cookies,
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const detail = data?.detail || data?.error || `files_download_http_${resp.status}`;
+    return { ok: false, error: typeof detail === 'string' ? detail : JSON.stringify(detail) };
+  }
+  return {
+    ok: true,
+    downloadUrl: data.download_url || data.downloadUrl || null,
+    fileName: data.file_name || data.fileName || null,
+    status: data.status || null,
+    mimeType: data.mime_type || data.mimeType || data.content_type || null,
+    raw: data,
+  };
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function fetchBinaryAsDataUrl(url, accessToken, cookies, mimeHint) {
+  const { resp } = await chatgptFetch(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: '*/*',
+    },
+    cookies,
+  });
+  if (!resp.ok) return { ok: false, error: `binary_http_${resp.status}` };
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  if (buf.byteLength > MAX_ASSET_BASE64_BYTES) {
+    return {
+      ok: true,
+      tooLarge: true,
+      sizeBytes: buf.byteLength,
+      mimeType: resp.headers.get('content-type') || mimeHint || 'application/octet-stream',
+    };
+  }
+  const mime = (resp.headers.get('content-type') || mimeHint || 'application/octet-stream')
+    .split(';')[0]
+    .trim();
+  return {
+    ok: true,
+    sizeBytes: buf.byteLength,
+    mimeType: mime,
+    data: `data:${mime};base64,${bytesToBase64(buf)}`,
+  };
+}
+
+async function tryDownloadSandboxFile(conversationId, sandboxPath, accessToken, cookies) {
+  if (!conversationId || !sandboxPath) return { ok: false, error: 'missing_sandbox_context' };
+  const path = sandboxPath.startsWith('/') ? sandboxPath : `/${sandboxPath}`;
+  const candidates = [
+    `/backend-api/conversation/${conversationId}/interpreter/download?path=${encodeURIComponent(path)}`,
+    `/backend-api/conversation/${conversationId}/download?file_path=${encodeURIComponent(path)}`,
+    `/backend-api/conversation/${conversationId}/attachment?path=${encodeURIComponent(path)}`,
+  ];
+  for (const url of candidates) {
+    try {
+      const { resp } = await chatgptFetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: '*/*',
+        },
+        cookies,
+      });
+      if (!resp.ok) continue;
+      const ctype = (resp.headers.get('content-type') || '').toLowerCase();
+      if (ctype.includes('application/json')) {
+        const data = await resp.json().catch(() => ({}));
+        const downloadUrl = data.download_url || data.downloadUrl || data.url;
+        if (downloadUrl) {
+          return { ok: true, downloadUrl, fileName: data.file_name || data.fileName || null, mimeType: data.mime_type || null };
+        }
+        if (data.file_id || data.fileId) {
+          return { ok: true, fileId: data.file_id || data.fileId };
+        }
+        continue;
+      }
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      if (!buf.byteLength) continue;
+      const mime = (resp.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim();
+      if (buf.byteLength > MAX_ASSET_BASE64_BYTES) {
+        return { ok: true, tooLarge: true, sizeBytes: buf.byteLength, mimeType: mime };
+      }
+      return {
+        ok: true,
+        sizeBytes: buf.byteLength,
+        mimeType: mime,
+        data: `data:${mime};base64,${bytesToBase64(buf)}`,
+      };
+    } catch {
+      /* try next */
+    }
+  }
+  return { ok: false, error: 'sandbox_download_failed' };
+}
+
+async function resolveAssetRefs(refs, {
+  accessToken,
+  cookies,
+  downloadAssets = true,
+  conversationId = null,
+} = {}) {
+  const images = [];
+  const files = [];
+
+  for (const ref of refs || []) {
+    const entry = {
+      file_id: ref.fileId || null,
+      file_name: ref.fileName || null,
+      mime_type: ref.mimeType || null,
+      kind: ref.kind || 'file',
+      width: ref.width || 0,
+      height: ref.height || 0,
+      size_bytes: ref.sizeBytes || 0,
+      asset_pointer: ref.assetPointer || null,
+      sandbox_path: ref.sandboxPath || null,
+      source: ref.source || null,
+      download_url: null,
+      data: null,
+      error: null,
+    };
+
+    if (ref.fileId) {
+      try {
+        const meta = await resolveFileDownloadMeta(ref.fileId, accessToken, cookies);
+        if (meta.ok) {
+          entry.download_url = meta.downloadUrl;
+          if (meta.fileName) entry.file_name = meta.fileName;
+          if (meta.mimeType) entry.mime_type = meta.mimeType;
+          entry.kind = guessKindFromNameMime(entry.file_name, entry.mime_type);
+          if (downloadAssets && meta.downloadUrl) {
+            const bin = await fetchBinaryAsDataUrl(
+              meta.downloadUrl,
+              accessToken,
+              cookies,
+              entry.mime_type,
+            );
+            if (bin.ok && bin.data) {
+              entry.data = bin.data;
+              entry.mime_type = bin.mimeType || entry.mime_type;
+              entry.size_bytes = bin.sizeBytes || entry.size_bytes;
+              entry.kind = guessKindFromNameMime(entry.file_name, entry.mime_type);
+            } else if (bin.ok && bin.tooLarge) {
+              entry.size_bytes = bin.sizeBytes;
+              entry.mime_type = bin.mimeType || entry.mime_type;
+              entry.error = 'file_too_large_for_base64';
+            } else if (!bin.ok) {
+              entry.error = bin.error;
+            }
+          }
+        } else {
+          entry.error = meta.error;
+        }
+      } catch (e) {
+        entry.error = e?.message || 'resolve_failed';
+      }
+    } else if (ref.sandboxPath) {
+      try {
+        const sand = await tryDownloadSandboxFile(
+          conversationId,
+          ref.sandboxPath,
+          accessToken,
+          cookies,
+        );
+        if (sand.ok && sand.fileId) {
+          entry.file_id = sand.fileId;
+          const meta = await resolveFileDownloadMeta(sand.fileId, accessToken, cookies);
+          if (meta.ok) {
+            entry.download_url = meta.downloadUrl;
+            if (meta.fileName) entry.file_name = meta.fileName;
+            if (meta.mimeType) entry.mime_type = meta.mimeType;
+          }
+        }
+        if (sand.ok && sand.downloadUrl) entry.download_url = sand.downloadUrl;
+        if (sand.ok && sand.data) {
+          entry.data = sand.data;
+          entry.mime_type = sand.mimeType || entry.mime_type;
+          entry.size_bytes = sand.sizeBytes || entry.size_bytes;
+        } else if (sand.ok && sand.tooLarge) {
+          entry.size_bytes = sand.sizeBytes;
+          entry.mime_type = sand.mimeType || entry.mime_type;
+          entry.error = 'file_too_large_for_base64';
+        } else if (!entry.download_url && !entry.data) {
+          entry.error = sand.error || 'sandbox_needs_file_id';
+        }
+        entry.kind = guessKindFromNameMime(entry.file_name, entry.mime_type);
+      } catch (e) {
+        entry.error = e?.message || 'sandbox_resolve_failed';
+      }
+    }
+
+    if (entry.kind === 'image') images.push(entry);
+    else files.push(entry);
+  }
+
+  return { images, files };
+}
+
 async function parseConversationSse(resp) {
   const reader = resp.body?.getReader?.();
   if (!reader) {
     const text = await resp.text();
-    return { text, conversationId: null, messageId: null, raw: text };
+    return { text, conversationId: null, messageId: null, raw: text, assetRefs: [] };
   }
 
   const decoder = new TextDecoder('utf-8');
@@ -657,7 +1150,8 @@ async function parseConversationSse(resp) {
     }
   }
 
-  return { text: assistantText, conversationId, messageId, events };
+  const assetRefs = collectAssetRefsFromEvents(events, assistantText);
+  return { text: assistantText, conversationId, messageId, events, assetRefs };
 }
 
 /**
@@ -798,13 +1292,41 @@ async function sendConversation(opts = {}) {
       error: detail || `http_${resp.status}`,
       status: resp.status,
       endpoint,
-      images: uploadedImages,
+      uploadedImages,
+      images: [],
+      files: [],
       requirementsError: typeof requirementsError !== 'undefined' ? requirementsError : null,
     };
   }
 
   try {
     const parsed = await parseConversationSse(resp);
+    let assetRefs = parsed.assetRefs || [];
+
+    // Conversation detail often has richer file/image pointers than the SSE alone.
+    if (parsed.conversationId) {
+      const excludeFileIds = new Set(
+        uploadedImages.map((u) => u.fileId || u.file_id).filter(Boolean),
+      );
+      const convo = await fetchConversationDetail(parsed.conversationId, accessToken, cookies);
+      if (convo) {
+        assetRefs = mergeAssetRefs(
+          assetRefs.filter((r) => !r.fileId || !excludeFileIds.has(r.fileId)),
+          collectAssetRefsFromConversation(convo, { excludeFileIds }),
+        );
+      } else {
+        assetRefs = assetRefs.filter((r) => !r.fileId || !excludeFileIds.has(r.fileId));
+      }
+    }
+
+    const downloadAssets = opts.downloadAssets !== false;
+    const resolved = await resolveAssetRefs(assetRefs, {
+      accessToken,
+      cookies,
+      downloadAssets,
+      conversationId: parsed.conversationId,
+    });
+
     return {
       ok: true,
       text: parsed.text || '',
@@ -812,11 +1334,20 @@ async function sendConversation(opts = {}) {
       messageId: parsed.messageId,
       endpoint,
       model: payload.model,
-      images: uploadedImages,
+      uploadedImages,
+      images: resolved.images,
+      files: resolved.files,
       requirementsError: typeof requirementsError !== 'undefined' ? requirementsError : null,
     };
   } catch (e) {
-    return { ok: false, error: e?.message || 'sse_parse_failed', endpoint, images: uploadedImages };
+    return {
+      ok: false,
+      error: e?.message || 'sse_parse_failed',
+      endpoint,
+      uploadedImages,
+      images: [],
+      files: [],
+    };
   }
 }
 

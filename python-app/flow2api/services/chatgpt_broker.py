@@ -1,4 +1,8 @@
-"""ChatGPT HTTP broker — dashboard → agent queue → extension poll (không cần Bridge WS)."""
+"""ChatGPT HTTP broker — dashboard → agent queue → extension poll (không cần Bridge WS).
+
+Cũng giữ hàng đợi job public async (POST trả id ngay → client poll GET)
+để tránh Cloudflare 524 khi chat chạy lâu.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +17,8 @@ logger = logging.getLogger(__name__)
 POLL_TIMEOUT_S = 25.0
 DEFAULT_JOB_TIMEOUT_S = 180.0
 WORKER_STALE_S = 60.0
+PUBLIC_JOB_TTL_S = 30 * 60  # giữ result ~30 phút
+PUBLIC_JOB_MAX = 200
 
 
 @dataclass
@@ -36,12 +42,43 @@ class WorkerState:
         return (now - self.last_seen_at) < WORKER_STALE_S
 
 
+@dataclass
+class PublicChatJob:
+    """Job cho API public async — tách khỏi job extension poll."""
+
+    job_id: str
+    status: str = "queued"  # queued | running | done | failed
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    error: str | None = None
+    result: dict[str, Any] | None = None
+    params_summary: dict[str, Any] = field(default_factory=dict)
+
+    def touch(self) -> None:
+        self.updated_at = time.time()
+
+    def to_dict(self, *, include_result: bool = True) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "id": self.job_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "error": self.error,
+            "params": self.params_summary,
+        }
+        if include_result and self.result is not None:
+            out["result"] = self.result
+        return out
+
+
 class ChatgptBroker:
     def __init__(self) -> None:
         self._jobs: dict[str, ChatgptJob] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: dict[str, WorkerState] = {}
         self._waiters: list[asyncio.Future] = []
+        self._public_jobs: dict[str, PublicChatJob] = {}
+        self._public_tasks: dict[str, asyncio.Task] = {}
 
     def touch_worker(self, worker_id: str, label: str = "") -> None:
         wid = (worker_id or "").strip()
@@ -155,12 +192,123 @@ class ChatgptBroker:
         self._jobs.pop(job_id, None)
         return True
 
+    # ── Public async jobs (Cloudflare-safe) ─────────────────────────────
+
+    def _purge_public_jobs(self) -> None:
+        now = time.time()
+        stale = [
+            jid
+            for jid, job in self._public_jobs.items()
+            if (now - job.updated_at) > PUBLIC_JOB_TTL_S
+        ]
+        for jid in stale:
+            self._public_jobs.pop(jid, None)
+            task = self._public_tasks.pop(jid, None)
+            if task and not task.done():
+                task.cancel()
+        # Cap memory: drop oldest finished jobs first
+        if len(self._public_jobs) > PUBLIC_JOB_MAX:
+            finished = sorted(
+                (
+                    (jid, job)
+                    for jid, job in self._public_jobs.items()
+                    if job.status in ("done", "failed")
+                ),
+                key=lambda x: x[1].updated_at,
+            )
+            overflow = len(self._public_jobs) - PUBLIC_JOB_MAX
+            for jid, _ in finished[: max(0, overflow)]:
+                self._public_jobs.pop(jid, None)
+                self._public_tasks.pop(jid, None)
+
+    def _public_params_summary(self, params: dict[str, Any]) -> dict[str, Any]:
+        images = params.get("images") or []
+        return {
+            "prompt_preview": str(params.get("prompt") or "")[:120],
+            "model": params.get("model"),
+            "endpoint": params.get("endpoint"),
+            "profile_id": params.get("profile_id"),
+            "conversation_id": params.get("conversation_id"),
+            "parent_message_id": params.get("parent_message_id"),
+            "image_count": len(images) if isinstance(images, list) else 0,
+        }
+
+    def create_public_job(self, params: dict[str, Any]) -> PublicChatJob:
+        self._purge_public_jobs()
+        job_id = str(uuid.uuid4())
+        job = PublicChatJob(
+            job_id=job_id,
+            status="queued",
+            params_summary=self._public_params_summary(params),
+        )
+        self._public_jobs[job_id] = job
+        return job
+
+    def get_public_job(self, job_id: str) -> PublicChatJob | None:
+        self._purge_public_jobs()
+        return self._public_jobs.get(job_id)
+
+    def mark_public_running(self, job_id: str) -> None:
+        job = self._public_jobs.get(job_id)
+        if not job:
+            return
+        job.status = "running"
+        job.touch()
+
+    def finish_public_job(
+        self,
+        job_id: str,
+        *,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        job = self._public_jobs.get(job_id)
+        if not job:
+            return
+        if error:
+            job.status = "failed"
+            job.error = error
+            job.result = result
+        else:
+            job.status = "done"
+            job.error = None
+            job.result = result or {}
+        job.touch()
+        self._public_tasks.pop(job_id, None)
+
+    def track_public_task(self, job_id: str, task: asyncio.Task) -> None:
+        self._public_tasks[job_id] = task
+
+        def _done(t: asyncio.Task) -> None:
+            self._public_tasks.pop(job_id, None)
+            if t.cancelled():
+                job = self._public_jobs.get(job_id)
+                if job and job.status in ("queued", "running"):
+                    job.status = "failed"
+                    job.error = "cancelled"
+                    job.touch()
+            else:
+                exc = t.exception()
+                if exc is not None:
+                    job = self._public_jobs.get(job_id)
+                    if job and job.status in ("queued", "running"):
+                        job.status = "failed"
+                        job.error = str(exc)
+                        job.touch()
+
+        task.add_done_callback(_done)
+
     def stats(self) -> dict[str, Any]:
+        self._purge_public_jobs()
         return {
             "pending_jobs": len(self._jobs),
             "queue_size": self._queue.qsize(),
             "workers_online": len(self.online_workers()),
             "workers": self.online_workers(),
+            "public_jobs": len(self._public_jobs),
+            "public_running": sum(
+                1 for j in self._public_jobs.values() if j.status in ("queued", "running")
+            ),
         }
 
 
