@@ -105,12 +105,20 @@ function switchTab(name) {
   $('tabStatus').hidden = name !== 'status';
   $('tabMode').classList.toggle('active', name === 'mode');
   $('tabMode').hidden = name !== 'mode';
+  if ($('tabChatgpt')) {
+    $('tabChatgpt').classList.toggle('active', name === 'chatgpt');
+    $('tabChatgpt').hidden = name !== 'chatgpt';
+  }
 
   if (name === 'mode') {
     refreshModePanel();
     startModeStatsTicker();
   } else {
     stopModeStatsTicker();
+  }
+
+  if (name === 'chatgpt') {
+    refreshChatgptCookies();
   }
 
   chrome.storage.local.set({ f2apiActiveTab: name }).catch(() => {});
@@ -295,9 +303,121 @@ function setHint(id, msg, cls) {
 
 // Restore active tab
 chrome.storage.local.get('f2apiActiveTab').then((data) => {
-  if (data.f2apiActiveTab === 'mode') switchTab('mode');
+  if (data.f2apiActiveTab === 'mode' || data.f2apiActiveTab === 'chatgpt') {
+    switchTab(data.f2apiActiveTab);
+  }
 });
 
 fetchStatus();
 setInterval(fetchStatus, 1500);
 refreshModePanel();
+
+// ── ChatGPT cookies (read-only) ───────────────────────────────────────
+
+async function refreshChatgptCookies() {
+  const hint = $('cgpt-hint');
+  setText('cgpt-login', 'đang tải…');
+  const status = await send('CHATGPT_COOKIE_STATUS');
+  if (!status || status.ok === false) {
+    setText('cgpt-login', 'lỗi');
+    setText('cgpt-account', '—');
+    setText('cgpt-did', '—');
+    setText('cgpt-count', '0');
+    if ($('cgpt-flags')) $('cgpt-flags').innerHTML = '';
+    if ($('cgpt-list')) $('cgpt-list').innerHTML = '';
+    if (hint) {
+      hint.textContent = status?.error
+        ? `Lỗi: ${status.error}`
+        : 'Không đọc được cookie. Reload extension và thử lại.';
+      hint.className = 'hint err';
+    }
+    return;
+  }
+
+  setText('cgpt-login', status.loggedIn ? 'đã đăng nhập' : 'chưa đăng nhập');
+  const loginEl = $('cgpt-login');
+  if (loginEl) {
+    loginEl.className = status.loggedIn ? 'value token-ready' : 'value token-missing';
+  }
+  setText('cgpt-account', status.email || status.name || '—');
+  setText('cgpt-did', status.deviceId ? `${String(status.deviceId).slice(0, 8)}…` : '—');
+  const did = $('cgpt-did');
+  if (did) did.title = status.deviceId || '';
+  setText('cgpt-count', status.cookieCount || 0);
+
+  const flags = $('cgpt-flags');
+  if (flags) {
+    const present = status.present || {};
+    flags.innerHTML = Object.keys(present).map((name) => {
+      const on = !!present[name];
+      const short = name.replace('__Secure-next-auth.session-token', 'session-token');
+      return `<span class="cgpt-flag ${on ? 'on' : 'off'}" title="${name}">${short}: ${on ? 'OK' : 'no'}</span>`;
+    }).join('');
+  }
+
+  const list = $('cgpt-list');
+  if (list) {
+    const rows = status.cookies || [];
+    if (!rows.length) {
+      list.innerHTML = '<div class="cgpt-row"><div class="cgpt-name">Không có cookie chatgpt.com</div></div>';
+    } else {
+      list.innerHTML = rows.map((c) => `
+        <div class="cgpt-row">
+          <div>
+            <div class="cgpt-name">${c.name}</div>
+            <div class="cgpt-meta">${c.domain}${c.path || ''} · ${c.httpOnly ? 'HttpOnly' : 'JS'} · ${c.secure ? 'Secure' : 'Insecure'}</div>
+          </div>
+          <div class="cgpt-val" title="${c.valuePreview || ''}">${c.valuePreview || ''}</div>
+        </div>
+      `).join('');
+    }
+  }
+
+  if (hint) {
+    hint.textContent = status.loggedIn
+      ? 'Cookie OK (ẩn giá trị). Có thể gửi conversation bên dưới.'
+      : 'Chưa thấy session. Bấm “Mở ChatGPT”, đăng nhập, rồi Làm mới.';
+    hint.className = status.loggedIn ? 'hint ok' : 'hint';
+  }
+}
+
+$('btn-cgpt-refresh')?.addEventListener('click', () => refreshChatgptCookies());
+$('btn-cgpt-open')?.addEventListener('click', async () => {
+  const r = await send('CHATGPT_OPEN_TAB');
+  if (!r?.ok) {
+    setHint('cgpt-hint', `Không mở được tab: ${r?.error || 'unknown'}`, 'err');
+  }
+});
+
+$('btn-cgpt-send')?.addEventListener('click', async () => {
+  const prompt = ($('cgpt-prompt')?.value || '').trim();
+  const endpoint = ($('cgpt-endpoint')?.value || '').trim();
+  const replyEl = $('cgpt-reply');
+  const btn = $('btn-cgpt-send');
+  if (!prompt) {
+    setHint('cgpt-chat-hint', 'Nhập prompt trước khi gửi.', 'err');
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setHint('cgpt-chat-hint', 'Đang gọi conversation…', '');
+  if (replyEl) {
+    replyEl.classList.add('on');
+    replyEl.textContent = '…';
+  }
+  try {
+    const r = await send('CHATGPT_SEND', { prompt, endpoint: endpoint || undefined }, 120000);
+    if (!r?.ok) {
+      const err = r?.error || 'send_failed';
+      setHint('cgpt-chat-hint', `Lỗi: ${err}`, 'err');
+      if (replyEl) replyEl.textContent = String(err);
+      return;
+    }
+    setHint('cgpt-chat-hint', `OK · ${r.endpoint || endpoint || 'conversation'}`, 'ok');
+    if (replyEl) replyEl.textContent = r.text || '(empty response)';
+  } catch (e) {
+    setHint('cgpt-chat-hint', `Lỗi: ${e?.message || e}`, 'err');
+    if (replyEl) replyEl.textContent = String(e?.message || e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+});

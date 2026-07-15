@@ -22,6 +22,9 @@
     "https://google.com/*",
     "https://*.recaptcha.net/*",
     "https://recaptcha.net/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://*.oaiusercontent.com/*",
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],

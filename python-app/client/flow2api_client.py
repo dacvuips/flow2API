@@ -247,3 +247,54 @@ class Flow2APIClient:
                 dr.raise_for_status()
                 return dr.content
         return task
+
+    def chatgpt_status(self, profile_id: Optional[str] = None) -> dict:
+        """Kiểm tra extension/session ChatGPT sẵn sàng."""
+        params: dict[str, Any] = {}
+        if profile_id:
+            params["profile_id"] = profile_id
+        with httpx.Client(timeout=30.0) as client:
+            r = client.get(
+                f"{self.base_url}/api/v1/chatgpt/status",
+                headers=self._headers(),
+                params=params or None,
+            )
+            r.raise_for_status()
+            return r.json()
+
+    def chatgpt_chat(
+        self,
+        prompt: str = "",
+        *,
+        model: str = "gpt-5-5",
+        conversation_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        images: Optional[list[dict[str, Any]]] = None,
+        endpoint: Optional[str] = None,
+    ) -> dict:
+        """
+        Gửi chat ChatGPT (sync) qua web session trên Chrome extension.
+
+        images: [{"data": "data:image/jpeg;base64,...", "file_name": "a.jpg"}]
+        Multi-turn: truyền lại conversation_id + parent_message_id (= message_id trước).
+        """
+        body: dict[str, Any] = {"prompt": prompt, "model": model}
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        if parent_message_id:
+            body["parent_message_id"] = parent_message_id
+        if profile_id:
+            body["profile_id"] = profile_id
+        if endpoint:
+            body["endpoint"] = endpoint
+        if images:
+            body["images"] = images
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/v1/chatgpt/chat",
+                headers=self._headers(),
+                json=body,
+            )
+            r.raise_for_status()
+            return r.json()

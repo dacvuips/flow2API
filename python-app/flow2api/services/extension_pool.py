@@ -396,6 +396,36 @@ class ExtensionSession:
             )
             return False
 
+    async def chatgpt_session_status(self, timeout: float = 20.0) -> dict[str, Any]:
+        if not self._ws:
+            return {"ok": False, "error": "extension_not_connected"}
+        try:
+            resp = await self._send("chatgpt_session_status", {}, timeout=timeout)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if isinstance(data, dict):
+            return data
+        return {
+            "ok": False,
+            "error": (resp or {}).get("error") if isinstance(resp, dict) else "chatgpt_status_failed",
+        }
+
+    async def chatgpt_send(self, params: dict[str, Any], timeout: float = 180.0) -> dict[str, Any]:
+        if not self._ws:
+            return {"ok": False, "error": "extension_not_connected"}
+        try:
+            resp = await self._send("chatgpt_send", params or {}, timeout=timeout)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if isinstance(data, dict):
+            return data
+        return {
+            "ok": False,
+            "error": (resp or {}).get("error") if isinstance(resp, dict) else "chatgpt_send_failed",
+        }
+
     async def api_request(
         self,
         url: str,

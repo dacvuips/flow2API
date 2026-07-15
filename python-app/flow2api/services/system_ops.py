@@ -33,6 +33,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chat_id": "",
         "enabled": False,
     },
+    "openai": {
+        "api_key": "",
+        "model": "gpt-4o-mini",
+        "base_url": "https://api.openai.com/v1",
+    },
     "proxy_pool": [],
     "proxy_pool_enabled": False,
     "proxy_rotate_enabled": False,
@@ -61,6 +66,8 @@ def load_config() -> dict[str, Any]:
                 out.update({k: v for k, v in raw.items() if k in DEFAULT_CONFIG})
                 if isinstance(raw.get("telegram"), dict):
                     out["telegram"] = {**out["telegram"], **raw["telegram"]}
+                if isinstance(raw.get("openai"), dict):
+                    out["openai"] = {**out["openai"], **raw["openai"]}
                 if "proxy_pool_enabled" not in raw:
                     out["proxy_pool_enabled"] = bool(raw.get("proxy_pool"))
             return out
@@ -87,9 +94,33 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
             current[key] = cfg[key]
     if isinstance(cfg.get("telegram"), dict):
         current["telegram"] = {**current.get("telegram", {}), **cfg["telegram"]}
+    if isinstance(cfg.get("openai"), dict):
+        current["openai"] = {**current.get("openai", {}), **cfg["openai"]}
     with _LOCK:
         _CONFIG_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
     return current
+
+
+def openai_config() -> dict[str, Any]:
+    cfg = load_config()
+    oai = dict(cfg.get("openai") or {})
+    return {
+        "api_key": str(oai.get("api_key") or "").strip(),
+        "model": str(oai.get("model") or "gpt-4o-mini").strip() or "gpt-4o-mini",
+        "base_url": str(oai.get("base_url") or "https://api.openai.com/v1").strip().rstrip("/")
+        or "https://api.openai.com/v1",
+    }
+
+
+def public_openai_config() -> dict[str, Any]:
+    oai = openai_config()
+    key = oai["api_key"]
+    return {
+        "configured": bool(key),
+        "api_key": (key[:7] + "…" + key[-4:]) if len(key) > 12 else ("…" if key else ""),
+        "model": oai["model"],
+        "base_url": oai["base_url"],
+    }
 
 
 def public_config() -> dict[str, Any]:
@@ -100,6 +131,7 @@ def public_config() -> dict[str, Any]:
     return {
         "flow_url": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
         "telegram": tg,
+        "openai": public_openai_config(),
         "proxy_pool": list(cfg.get("proxy_pool") or []),
         "proxy_pool_enabled": is_proxy_pool_enabled(cfg),
         "proxy_rotate_enabled": bool(cfg.get("proxy_rotate_enabled")),

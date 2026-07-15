@@ -45,6 +45,8 @@ def path_requires_api_key(path: str) -> bool:
         return False
     if path.startswith("/api/internal/captcha/"):
         return False
+    if path.startswith("/api/internal/chatgpt/"):
+        return False
     # Stored output files use request_id in the URL (shareable links for clients/browsers).
     stored_media_prefixes = (
         "/video/",

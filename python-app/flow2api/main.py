@@ -33,6 +33,9 @@ from flow2api.routes.activity import router as activity_router
 from flow2api.routes.admin import router as admin_router
 from flow2api.routes.auth import router as auth_router
 from flow2api.routes.captcha_broker import router as captcha_broker_router
+from flow2api.routes.chatgpt import router as chatgpt_router
+from flow2api.routes.chatgpt import v1_router as chatgpt_v1_router
+from flow2api.routes.chatgpt_broker import router as chatgpt_broker_router
 from flow2api.routes.requests import router as requests_router
 from flow2api.routes.settings import router as settings_router
 from flow2api.routes.system import router as system_router
@@ -79,6 +82,8 @@ class _SuppressNoisyAccessLog(logging.Filter):
         "/api/settings",
         "/api/activity",
         "/api/ext/callback",
+        "/api/internal/chatgpt/poll",
+        "/api/internal/captcha/poll",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -237,6 +242,9 @@ def create_app() -> FastAPI:
     app.include_router(settings_router)
     app.include_router(worker_router)
     app.include_router(captcha_broker_router)
+    app.include_router(chatgpt_broker_router)
+    app.include_router(chatgpt_router)
+    app.include_router(chatgpt_v1_router)
 
     dashboard = FRONTEND_DIR / "dashboard.html"
     if dashboard.is_file():
