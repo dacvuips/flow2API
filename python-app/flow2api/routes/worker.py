@@ -26,17 +26,17 @@ router = APIRouter(prefix="/api/worker", tags=["worker"])
 class WorkerSettingsBody(BaseModel):
     max_concurrent: int | None = Field(None, ge=1, le=100)
     task_stagger_s: float | None = Field(None, ge=0.0, le=300.0)
-    profile_default_max_concurrent: int | None = Field(None, ge=1, le=8)
+    profile_default_max_concurrent: int | None = Field(None, ge=1, le=30)
 
 
 class ProfileLimitBody(BaseModel):
     profile_id: str
-    max_concurrent: int = Field(1, ge=1, le=8)
+    max_concurrent: int = Field(1, ge=1, le=30)
 
 
 class ProfileLimitsBulkBody(BaseModel):
     profile_limits: dict[str, int] = Field(default_factory=dict)
-    profile_default_max_concurrent: int | None = Field(None, ge=1, le=8)
+    profile_default_max_concurrent: int | None = Field(None, ge=1, le=30)
 
 
 class ProfileDispatchBody(BaseModel):

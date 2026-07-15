@@ -13,7 +13,7 @@ _SETTINGS_PATH = STORAGE_DIR / "worker_settings.json"
 _LOCK = threading.Lock()
 
 _MAX_CONCURRENT_CAP = 100
-_PROFILE_MAX_CAP = 8
+_PROFILE_MAX_CAP = 30
 
 
 @dataclass
