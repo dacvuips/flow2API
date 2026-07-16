@@ -488,8 +488,17 @@ async def chatgpt_web_status(
 
 
 @router.post("/web/chat")
-async def chatgpt_web_chat(body: WebChatBody, _: int = Depends(auth_key_id)):
-    return await run_web_chat(
+async def chatgpt_web_chat(
+    body: WebChatBody,
+    async_mode: bool = Query(
+        True,
+        alias="async",
+        description="Mặc định true: trả job id ngay rồi poll GET /web/chat/{id} (tránh Cloudflare 524). "
+        "false = chờ xong trong 1 request (chỉ dùng local).",
+    ),
+    _: int = Depends(auth_key_id),
+):
+    kwargs = dict(
         prompt=body.prompt,
         model=body.model,
         endpoint=body.endpoint,
@@ -501,6 +510,18 @@ async def chatgpt_web_chat(body: WebChatBody, _: int = Depends(auth_key_id)):
         system_hints=body.system_hints,
         picture=body.picture,
     )
+    if async_mode:
+        out = enqueue_web_chat(**kwargs)
+        # Dashboard poll path (same job store as /api/v1/chatgpt/chat/{id})
+        out["poll_url"] = f"/api/chatgpt/web/chat/{out['id']}"
+        return out
+    return await run_web_chat(**kwargs)
+
+
+@router.get("/web/chat/{job_id}")
+async def chatgpt_web_chat_job(job_id: str, _: int = Depends(auth_key_id)):
+    """Poll job ChatGPT async từ dashboard (`queued` | `running` | `done` | `failed`)."""
+    return public_job_payload(job_id)
 
 
 @router.post("/settings")
