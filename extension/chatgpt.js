@@ -1312,6 +1312,8 @@ async function sendConversation(opts = {}) {
         fileSize: img.fileSize || img.size_bytes || img.size,
         width: img.width || 0,
         height: img.height || 0,
+        libraryFileId: img.libraryFileId || img.library_file_id,
+        is_big_paste: !!img.is_big_paste,
       });
       continue;
     }
