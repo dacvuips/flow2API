@@ -378,25 +378,73 @@ async def assign_request_profile(
 @router.get("/{request_id}")
 async def get_request_status(
     request_id: str,
-    download: bool = Query(False, description="Tải MP4 khi upsample_video status=done"),
+    download: bool = Query(
+        False,
+        description="Tải file kết quả (ảnh/video) khi status=done",
+    ),
+    index: int = Query(0, ge=0, description="Chỉ số ảnh/video khi download=true"),
     _=Depends(_auth_key_id),
 ):
     row = activity.get_request(request_id)
     if not row:
         raise HTTPException(404, "not_found")
     if download:
-        if row.type != "upsample_video":
-            raise HTTPException(400, "download_only_for_upsample_video")
         if row.status != "done":
             raise HTTPException(409, f"not_ready (status={row.status})")
         result = json.loads(row.result_json or "{}")
-        raw, mime = await fetch_upsample_video_bytes(result)
-        mid = str(result.get("source_media_id") or request_id)[:8]
+        if row.type == "upsample_video":
+            raw, mime = await fetch_upsample_video_bytes(result)
+            mid = str(result.get("source_media_id") or request_id)[:8]
+            return Response(
+                content=raw,
+                media_type=mime,
+                headers={
+                    "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
+                },
+            )
+
+        from flow2api.services.stored_media import (
+            materialize_request_video,
+            resolve_stored_image_path,
+            resolve_stored_video_path,
+        )
+
+        is_video = "video" in str(row.type or "").lower()
+        if is_video:
+            path = resolve_stored_video_path(request_id, index)
+            if not path:
+                path = await materialize_request_video(request_id, index, result)
+            if not path:
+                raise HTTPException(404, "result_file_not_found")
+            raw = path.read_bytes()
+            return Response(
+                content=raw,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="flow-{request_id[:8]}-{index}.mp4"'
+                    )
+                },
+            )
+
+        path = resolve_stored_image_path(request_id, index)
+        if not path:
+            raise HTTPException(404, "result_file_not_found")
+        ext = path.suffix.lower().lstrip(".") or "jpg"
+        if ext == "jpeg":
+            ext = "jpg"
+        mime = {
+            "jpg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+        }.get(ext, "image/jpeg")
         return Response(
-            content=raw,
+            content=path.read_bytes(),
             media_type=mime,
             headers={
-                "Content-Disposition": f'attachment; filename="flow-1080p-{mid}.mp4"'
+                "Content-Disposition": (
+                    f'attachment; filename="flow-{request_id[:8]}-{index}.{ext}"'
+                )
             },
         )
     data = activity.record_to_public(row)

@@ -85,7 +85,27 @@ curl -X POST "http://127.0.0.1:1994/api/requests" ^
 curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/REQUEST_ID"
 ```
 
-Khi `status=done`, response có `result.media_ids` (dùng cho upscale 4K / 1080p) và `result.project_id`.
+Khi `status=done`, response có:
+
+| Field | Mô tả |
+|-------|--------|
+| `result.image_urls` / `result.video_urls` | URL công khai HTTPS (frontend dùng trực tiếp, **không** cần Bearer) |
+| `result.Link` | URL chính (ảnh/video đầu tiên) |
+| `result.media_ids` | Dùng cho upscale 2K/4K / 1080p |
+| `result.project_id` | Project Flow (upscale) |
+
+URL ổn định theo `request_id` (không cần auth):
+
+- Ảnh: `GET /image/{REQUEST_ID}` (thêm `/0`, `/1`, … nếu nhiều ảnh)
+- Video: `GET /video/{REQUEST_ID}`
+
+Tải file gốc (attachment, cần Bearer):
+
+```bash
+curl -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  "http://127.0.0.1:1994/api/requests/REQUEST_ID?download=true" ^
+  -o output.jpg
+```
 
 ### Tải ảnh 2K / 4K (upscale)
 

@@ -509,6 +509,81 @@ def finalize_video_result_urls(request_id: str, result: dict[str, Any]) -> dict[
     return normalize_publisher_urls(rewrite_result_public_urls(out))
 
 
+def apply_image_public_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Expose {PUBLIC_BASE_URL}/image/{request_id} when output images exist on disk."""
+    if not _safe_request_id(request_id) or not isinstance(result, dict):
+        return result
+
+    out = dict(result)
+    out_dir = output_dir(request_id)
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    stored = sorted(
+        p
+        for p in (out_dir.iterdir() if out_dir.is_dir() else [])
+        if p.is_file() and p.suffix.lower() in exts
+    )
+    if not stored:
+        single = resolve_stored_image_path(request_id, 0)
+        if single:
+            stored = [single]
+    if not stored:
+        return out
+
+    public_urls = [
+        public_image_url(request_id, 0 if len(stored) == 1 else idx)
+        for idx in range(len(stored))
+    ]
+    out["image_urls"] = public_urls
+    out["Link"] = public_urls[0]
+    out["local_files"] = [
+        local_output_path(request_id, path.name) for path in stored
+    ]
+
+    media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+    entries: list[dict[str, str]] = []
+    for idx, pub in enumerate(public_urls):
+        entry: dict[str, str] = {"url": pub, "kind": "image"}
+        if idx < len(media_ids):
+            entry["media_id"] = media_ids[idx]
+        entries.append(entry)
+    if entries:
+        out["media_entries"] = entries
+
+    return out
+
+
+def finalize_image_result_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Prefer stable public /image/{id} URLs when files are cached locally."""
+    out = rewrite_result_public_urls(dict(result))
+    external = _external_https_urls(out.get("image_urls") or [])
+    link = str(out.get("Link") or "").strip()
+    if link.startswith(("http://", "https://")):
+        rewritten_link = rewrite_public_base_url(link)
+        base = get_public_base_url()
+        if rewritten_link.startswith(("http://", "https://")) and (
+            not base or not rewritten_link.startswith(base)
+        ):
+            external = external or [rewritten_link]
+
+    if resolve_stored_image_path(request_id, 0):
+        out = apply_image_public_urls(request_id, out)
+    elif external:
+        out["image_urls"] = external
+        out["Link"] = external[0]
+    else:
+        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+        if media_ids:
+            pubs = [public_media_url(mid) for mid in media_ids]
+            out["image_urls"] = pubs
+            out["Link"] = pubs[0]
+            out["media_entries"] = [
+                {"url": pub, "media_id": mid, "kind": "image"}
+                for pub, mid in zip(pubs, media_ids)
+            ]
+
+    return normalize_publisher_urls(rewrite_result_public_urls(out))
+
+
 def _load_request_video_result(request_id: str) -> dict[str, Any] | None:
     from flow2api.services import activity
 
@@ -580,15 +655,12 @@ async def persist_task_result(
     result: dict[str, Any],
     task_type: str,
 ) -> dict[str, Any]:
-    """Cache media on disk but keep publisher URLs in API result fields."""
+    """Cache media on disk and expose stable public /image or /video URLs."""
     if not isinstance(result, dict) or not _safe_request_id(request_id):
         return result
 
     out = dict(result)
     is_video = "video" in str(task_type or "").lower()
-    publisher_image_urls = list(out.get("image_urls") or [])
-    publisher_video_urls = list(out.get("video_urls") or [])
-    publisher_link = out.get("Link")
 
     try:
         if is_video:
@@ -611,12 +683,7 @@ async def persist_task_result(
                 )
         out = finalize_video_result_urls(request_id, out)
     else:
-        if publisher_video_urls:
-            out["video_urls"] = publisher_video_urls
-        if publisher_image_urls:
-            out["image_urls"] = publisher_image_urls
-        if publisher_link:
-            out["Link"] = publisher_link
+        out = finalize_image_result_urls(request_id, out)
 
     return normalize_publisher_urls(out)
 
