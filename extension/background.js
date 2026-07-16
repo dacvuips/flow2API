@@ -821,6 +821,11 @@ function connectToAgent() {
               filesEndpoint: p.filesEndpoint,
               extraHeaders: p.extraHeaders,
               extraPayload: p.extraPayload,
+              systemHints: p.systemHints || p.system_hints,
+              mode: p.mode || p.chatMode || p.chat_mode,
+              picture: p.picture,
+              picture_v2: p.picture_v2,
+              thinkingEffort: p.thinkingEffort || p.thinking_effort,
             });
             sendToAgent({
               id: msg.id,
@@ -1892,8 +1897,14 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
       conduitToken: msg.conduitToken,
       conversationId: msg.conversationId,
       parentMessageId: msg.parentMessageId,
+      images: msg.images,
       extraHeaders: msg.extraHeaders,
       extraPayload: msg.extraPayload,
+      systemHints: msg.systemHints || msg.system_hints,
+      mode: msg.mode || msg.chatMode || msg.chat_mode,
+      picture: msg.picture,
+      picture_v2: msg.picture_v2,
+      thinkingEffort: msg.thinkingEffort || msg.thinking_effort,
     })
       .then((result) => reply(result))
       .catch((e) => reply({ ok: false, error: e?.message || String(e) }));

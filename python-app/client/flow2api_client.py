@@ -272,6 +272,9 @@ class Flow2APIClient:
         profile_id: Optional[str] = None,
         images: Optional[list[dict[str, Any]]] = None,
         endpoint: Optional[str] = None,
+        mode: Optional[str] = None,
+        system_hints: Optional[list[str]] = None,
+        picture: Optional[bool] = None,
         async_mode: bool = True,
         wait: bool = True,
         poll_interval: float = 2.0,
@@ -285,6 +288,7 @@ class Flow2APIClient:
         wait=False: trả ngay {"id","status","poll_url"} — caller tự poll.
 
         images: [{"data": "data:image/jpeg;base64,...", "file_name": "a.jpg"}]
+        mode="picture_v2" / system_hints=["picture_v2"]: tạo ảnh Conversation image.
         Multi-turn: truyền lại conversation_id + parent_message_id (= message_id trước).
 
         Response (khi done) gồm text, images[] (ảnh assistant), files[] (file tải được).
@@ -300,6 +304,12 @@ class Flow2APIClient:
             body["endpoint"] = endpoint
         if images:
             body["images"] = images
+        if mode:
+            body["mode"] = mode
+        if system_hints:
+            body["system_hints"] = system_hints
+        if picture is not None:
+            body["picture"] = picture
         params = {"async": "true" if async_mode else "false"}
         with httpx.Client(timeout=self.timeout if not async_mode else 60.0) as client:
             r = client.post(

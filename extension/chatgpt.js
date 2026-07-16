@@ -446,12 +446,37 @@ async function uploadImage(opts = {}) {
   };
 }
 
+function normalizeSystemHints(opts = {}) {
+  const hints = [];
+  const mode = String(opts.mode || opts.chatMode || opts.chat_mode || '').toLowerCase().trim();
+  if (
+    mode === 'picture_v2'
+    || mode === 'picture'
+    || opts.picture === true
+    || opts.picture_v2 === true
+  ) {
+    hints.push('picture_v2');
+  }
+  const raw = opts.systemHints || opts.system_hints;
+  if (Array.isArray(raw)) {
+    for (const h of raw) {
+      const s = String(h || '').trim();
+      if (s && !hints.includes(s)) hints.push(s);
+    }
+  } else if (typeof raw === 'string' && raw.trim()) {
+    const s = raw.trim();
+    if (!hints.includes(s)) hints.push(s);
+  }
+  return hints;
+}
+
 function buildConversationPayload(prompt, opts = {}) {
   const messageId = opts.messageId || uuid();
   const parentMessageId = opts.parentMessageId || 'client-created-root';
   const model = opts.model || DEFAULT_MODEL;
   const now = Date.now() / 1000;
   const images = Array.isArray(opts.images) ? opts.images.filter(Boolean) : [];
+  const systemHints = normalizeSystemHints(opts);
 
   let content;
   let metadata = {
@@ -501,7 +526,11 @@ function buildConversationPayload(prompt, opts = {}) {
     };
   }
 
-  return {
+  if (systemHints.length) {
+    metadata = { ...metadata, system_hints: systemHints };
+  }
+
+  const payload = {
     action: 'next',
     messages: [
       {
@@ -519,7 +548,7 @@ function buildConversationPayload(prompt, opts = {}) {
     timezone: opts.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Bangkok',
     conversation_mode: { kind: 'primary_assistant' },
     enable_message_followups: true,
-    system_hints: [],
+    system_hints: systemHints,
     supports_buffering: true,
     supported_encodings: ['v1'],
     client_contextual_info: {
@@ -536,9 +565,22 @@ function buildConversationPayload(prompt, opts = {}) {
     },
     paragen_cot_summary_display_override: 'allow',
     force_parallel_switch: 'auto',
+    ...(systemHints.includes('picture_v2')
+      ? { thinking_effort: opts.thinkingEffort || opts.thinking_effort || 'standard' }
+      : {}),
     ...(opts.conversationId ? { conversation_id: opts.conversationId } : {}),
     ...(opts.extraPayload && typeof opts.extraPayload === 'object' ? opts.extraPayload : {}),
   };
+
+  // Message-level system_hints must survive extraPayload shallow merge.
+  if (systemHints.length && payload.messages?.[0]?.metadata) {
+    payload.messages[0].metadata.system_hints = systemHints;
+  }
+  if (systemHints.length) {
+    payload.system_hints = systemHints;
+  }
+
+  return payload;
 }
 
 function extractTextFromDeltaOps(ops) {
@@ -813,6 +855,75 @@ async function fetchConversationDetail(conversationId, accessToken, cookies) {
   } catch {
     return null;
   }
+}
+
+function extractAssistantTextFromConversation(convo) {
+  const mapping = convo?.mapping || {};
+  const messages = [];
+  for (const node of Object.values(mapping)) {
+    const msg = node?.message;
+    if (!msg) continue;
+    messages.push(msg);
+  }
+  messages.sort((a, b) => (Number(a.create_time) || 0) - (Number(b.create_time) || 0));
+  let lastUserIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.author?.role === 'user') lastUserIdx = i;
+  }
+  const slice = lastUserIdx >= 0 ? messages.slice(lastUserIdx + 1) : messages.slice(-8);
+  const chunks = [];
+  for (const msg of slice) {
+    const role = msg?.author?.role;
+    if (role !== 'assistant' && role !== 'tool') continue;
+    const parts = msg?.content?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const p of parts) {
+      if (typeof p === 'string' && p.trim()) chunks.push(p);
+    }
+  }
+  return chunks.join('');
+}
+
+function conversationImageRefsReady(refs) {
+  return (refs || []).some((r) => {
+    if (!r) return false;
+    if (r.kind === 'image') return true;
+    const mime = String(r.mimeType || r.mime_type || '').toLowerCase();
+    if (mime.startsWith('image/')) return true;
+    const name = String(r.fileName || r.file_name || '');
+    return /\.(png|jpe?g|webp|gif)$/i.test(name);
+  });
+}
+
+/**
+ * picture_v2 SSE often finishes before images exist (ghostrider async).
+ * Poll conversation detail until image asset pointers appear.
+ */
+async function waitForConversationImages(
+  conversationId,
+  accessToken,
+  cookies,
+  {
+    excludeFileIds = null,
+    maxAttempts = 36,
+    intervalMs = 2500,
+  } = {},
+) {
+  let lastRefs = [];
+  let lastText = '';
+  for (let i = 0; i < maxAttempts; i++) {
+    if (i > 0) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    const convo = await fetchConversationDetail(conversationId, accessToken, cookies);
+    if (!convo) continue;
+    lastRefs = collectAssetRefsFromConversation(convo, { excludeFileIds });
+    lastText = extractAssistantTextFromConversation(convo) || lastText;
+    if (conversationImageRefsReady(lastRefs)) {
+      return { refs: lastRefs, text: lastText, attempts: i + 1 };
+    }
+  }
+  return { refs: lastRefs, text: lastText, attempts: maxAttempts };
 }
 
 function collectAssetRefsFromConversation(convo, { excludeFileIds = null } = {}) {
@@ -1168,6 +1279,8 @@ async function parseConversationSse(resp) {
  * @param {string} [opts.conduitToken]
  * @param {object} [opts.extraHeaders]
  * @param {object} [opts.extraPayload]
+ * @param {string[]|string} [opts.systemHints] - e.g. ["picture_v2"] for Conversation image
+ * @param {string} [opts.mode] - "picture_v2" / "picture"
  */
 async function sendConversation(opts = {}) {
   const prompt = String(opts.prompt || '').trim();
@@ -1239,7 +1352,19 @@ async function sendConversation(opts = {}) {
     timezoneOffsetMin: opts.timezoneOffsetMin,
     extraPayload: opts.extraPayload,
     images: uploadedImages,
+    systemHints: opts.systemHints || opts.system_hints,
+    mode: opts.mode || opts.chatMode || opts.chat_mode,
+    picture: opts.picture,
+    picture_v2: opts.picture_v2,
+    thinkingEffort: opts.thinkingEffort || opts.thinking_effort,
   });
+  const systemHints = normalizeSystemHints({
+    systemHints: payload.system_hints,
+    mode: opts.mode || opts.chatMode || opts.chat_mode,
+    picture: opts.picture,
+    picture_v2: opts.picture_v2,
+  });
+  const isPictureMode = systemHints.includes('picture_v2');
 
   const headers = {
     Accept: 'text/event-stream',
@@ -1302,6 +1427,7 @@ async function sendConversation(opts = {}) {
   try {
     const parsed = await parseConversationSse(resp);
     let assetRefs = parsed.assetRefs || [];
+    let assistantText = parsed.text || '';
 
     // Conversation detail often has richer file/image pointers than the SSE alone.
     if (parsed.conversationId) {
@@ -1314,8 +1440,30 @@ async function sendConversation(opts = {}) {
           assetRefs.filter((r) => !r.fileId || !excludeFileIds.has(r.fileId)),
           collectAssetRefsFromConversation(convo, { excludeFileIds }),
         );
+        const detailText = extractAssistantTextFromConversation(convo);
+        if (detailText) assistantText = detailText;
       } else {
         assetRefs = assetRefs.filter((r) => !r.fileId || !excludeFileIds.has(r.fileId));
+      }
+
+      // picture_v2: SSE ends early; poll until generated images land in the conversation.
+      if (isPictureMode && !conversationImageRefsReady(assetRefs)) {
+        const waited = await waitForConversationImages(
+          parsed.conversationId,
+          accessToken,
+          cookies,
+          {
+            excludeFileIds,
+            maxAttempts: Number(opts.picturePollAttempts) > 0
+              ? Number(opts.picturePollAttempts)
+              : 36,
+            intervalMs: Number(opts.picturePollIntervalMs) > 0
+              ? Number(opts.picturePollIntervalMs)
+              : 2500,
+          },
+        );
+        assetRefs = mergeAssetRefs(assetRefs, waited.refs || []);
+        if (waited.text) assistantText = waited.text;
       }
     }
 
@@ -1329,11 +1477,12 @@ async function sendConversation(opts = {}) {
 
     return {
       ok: true,
-      text: parsed.text || '',
+      text: assistantText || '',
       conversationId: parsed.conversationId,
       messageId: parsed.messageId,
       endpoint,
       model: payload.model,
+      systemHints,
       uploadedImages,
       images: resolved.images,
       files: resolved.files,
@@ -1464,6 +1613,7 @@ self.ChatGPTExt = {
   getChatRequirements,
   uploadImage,
   buildConversationPayload,
+  normalizeSystemHints,
   sendConversation,
   startPollLoop,
   stopPollLoop,

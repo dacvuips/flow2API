@@ -50,6 +50,9 @@ class WebChatBody(BaseModel):
     conversation_id: str | None = None
     parent_message_id: str | None = None
     images: list[dict[str, Any]] | None = None
+    mode: str | None = None
+    system_hints: list[str] | None = None
+    picture: bool | None = None
 
 
 class PublicChatImage(BaseModel):
@@ -72,6 +75,26 @@ class PublicChatBody(BaseModel):
     profile_id: str | None = None
     endpoint: str | None = None
     images: list[PublicChatImage] | None = None
+    mode: str | None = None
+    system_hints: list[str] | None = None
+    picture: bool | None = None
+
+
+def _normalize_system_hints(
+    *,
+    mode: str | None = None,
+    system_hints: list[str] | None = None,
+    picture: bool | None = None,
+) -> list[str]:
+    hints: list[str] = []
+    mode_l = str(mode or "").strip().lower()
+    if mode_l in ("picture_v2", "picture") or picture is True:
+        hints.append("picture_v2")
+    for h in system_hints or []:
+        s = str(h or "").strip()
+        if s and s not in hints:
+            hints.append(s)
+    return hints
 
 
 def _normalize_images(images: list[Any] | None) -> list[dict[str, Any]]:
@@ -221,6 +244,9 @@ async def run_web_chat(
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
     images: list[Any] | None = None,
+    mode: str | None = None,
+    system_hints: list[str] | None = None,
+    picture: bool | None = None,
 ) -> dict[str, Any]:
     prompt = (prompt or "").strip()
     norm_images = _normalize_images(images)
@@ -229,6 +255,7 @@ async def run_web_chat(
 
     endpoint = (endpoint or "").strip() or DEFAULT_WEB_ENDPOINT
     model = (model or "").strip() or DEFAULT_WEB_MODEL
+    hints = _normalize_system_hints(mode=mode, system_hints=system_hints, picture=picture)
     params: dict[str, Any] = {
         "prompt": prompt,
         "endpoint": endpoint,
@@ -240,10 +267,17 @@ async def run_web_chat(
         params["conversationId"] = conversation_id
     if parent_message_id:
         params["parentMessageId"] = parent_message_id
+    if hints:
+        params["systemHints"] = hints
+        params["mode"] = "picture_v2" if "picture_v2" in hints else (mode or "")
+
+    # picture_v2 can take longer (async ghostrider image gen + poll)
+    send_timeout = 300.0 if "picture_v2" in hints else 180.0
+    broker_timeout = 360.0 if "picture_v2" in hints else 240.0
 
     session = _try_pick_ws_session(profile_id)
     if session:
-        result = await session.chatgpt_send(params, timeout=180.0)
+        result = await session.chatgpt_send(params, timeout=send_timeout)
         return _format_web_result(
             result,
             endpoint=endpoint,
@@ -267,7 +301,7 @@ async def run_web_chat(
             "Agent phải chạy ở http://127.0.0.1:1994.",
         )
 
-    result = await broker.submit(params, timeout=240.0)
+    result = await broker.submit(params, timeout=broker_timeout)
     return _format_web_result(result, endpoint=endpoint, model=model, via="http")
 
 
@@ -296,6 +330,9 @@ def enqueue_web_chat(
     conversation_id: str | None = None,
     parent_message_id: str | None = None,
     images: list[Any] | None = None,
+    mode: str | None = None,
+    system_hints: list[str] | None = None,
+    picture: bool | None = None,
 ) -> dict[str, Any]:
     """Enqueue chat job and return immediately (Cloudflare-safe)."""
     prompt = (prompt or "").strip()
@@ -303,6 +340,7 @@ def enqueue_web_chat(
     if not prompt and not norm_images:
         raise HTTPException(400, "empty_prompt")
 
+    hints = _normalize_system_hints(mode=mode, system_hints=system_hints, picture=picture)
     kwargs = {
         "prompt": prompt,
         "model": model,
@@ -311,6 +349,9 @@ def enqueue_web_chat(
         "conversation_id": conversation_id,
         "parent_message_id": parent_message_id,
         "images": images,
+        "mode": mode,
+        "system_hints": hints or system_hints,
+        "picture": picture,
     }
     broker = get_chatgpt_broker()
     job = broker.create_public_job(
@@ -322,6 +363,8 @@ def enqueue_web_chat(
             "conversation_id": conversation_id,
             "parent_message_id": parent_message_id,
             "images": norm_images,
+            "mode": "picture_v2" if "picture_v2" in hints else mode,
+            "system_hints": hints,
         }
     )
     task = asyncio.create_task(_run_public_chat_job(job.job_id, kwargs))
@@ -454,6 +497,9 @@ async def chatgpt_web_chat(body: WebChatBody, _: int = Depends(auth_key_id)):
         conversation_id=body.conversation_id,
         parent_message_id=body.parent_message_id,
         images=body.images,
+        mode=body.mode,
+        system_hints=body.system_hints,
+        picture=body.picture,
     )
 
 
@@ -638,7 +684,8 @@ async def chatgpt_v1_chat(
     Sync: `?async=false` — chờ kết quả trong cùng request (dễ 524 qua Cloudflare).
 
     Multi-turn: gửi lại `conversation_id` + `parent_message_id` (= `message_id` lần trước).
-    Ảnh: truyền `images[].data` dạng data URL hoặc base64.
+    Ảnh upload: truyền `images[].data` dạng data URL hoặc base64.
+    Tạo ảnh (Conversation image): `mode: "picture_v2"` hoặc `system_hints: ["picture_v2"]`.
     """
     kwargs = dict(
         prompt=body.prompt,
@@ -648,6 +695,9 @@ async def chatgpt_v1_chat(
         conversation_id=body.conversation_id,
         parent_message_id=body.parent_message_id,
         images=list(body.images or []),
+        mode=body.mode,
+        system_hints=body.system_hints,
+        picture=body.picture,
     )
     if async_mode:
         return enqueue_web_chat(**kwargs)
