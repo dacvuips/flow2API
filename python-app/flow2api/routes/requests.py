@@ -18,6 +18,7 @@ from flow2api.services.result_media import (
 )
 from flow2api.services.request_params import get_video_quality, normalize_request_params
 from flow2api.services.image_upsample import (
+    build_upsample_image_job_params,
     fetch_upsample_image_bytes,
     run_upsample_image,
     upsample_resolution_label,
@@ -155,11 +156,18 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
 @router.post("/upsample-image")
 async def upsample_image_external(
     body: UpsampleImageRequest,
-    download: bool = Query(False, description="Trả file ảnh JPEG/PNG thay vì JSON"),
+    download: bool = Query(
+        False,
+        description="Tải file khi job done (dùng với sync=true hoặc GET /api/requests/{id}?download=true)",
+    ),
+    sync: bool = Query(
+        False,
+        description="Chờ xong trong 1 request (chỉ local; qua Cloudflare dùng async mặc định)",
+    ),
     api_key_id: int = Depends(_auth_key_id),
 ):
-    """Upscale ảnh đã generate lên 2K/4K. Dùng media_id hoặc request_id (task gen_image done)."""
-    result = await run_upsample_image(
+    """Upscale ảnh đã generate lên 2K/4K. Mặc định enqueue worker (tránh Cloudflare 504)."""
+    params = build_upsample_image_job_params(
         media_id=body.media_id,
         request_id=body.request_id,
         index=body.index,
@@ -167,30 +175,66 @@ async def upsample_image_external(
         profile_id=body.profile_id,
         target_resolution=body.target_resolution,
     )
+    if sync:
+        result = await run_upsample_image(
+            media_id=body.media_id,
+            request_id=body.request_id,
+            index=body.index,
+            project_id=body.project_id,
+            profile_id=body.profile_id,
+            target_resolution=body.target_resolution,
+        )
+        append_request_log(
+            body.request_id or result.get("source_media_id") or "-",
+            "http",
+            "POST /api/requests/upsample-image (sync)",
+            level="info",
+            data={
+                "source_media_id": result.get("source_media_id"),
+                "upsampled_media_id": result.get("media_id"),
+                "download": download,
+            },
+        )
+        if download:
+            raw, mime = await fetch_upsample_image_bytes(result)
+            mid = str(result.get("source_media_id") or "image")[:8]
+            label = upsample_resolution_label(str(result.get("target_resolution") or ""))
+            ext = "png" if "png" in mime else "jpg"
+            return Response(
+                content=raw,
+                media_type=mime,
+                headers={
+                    "Content-Disposition": f'attachment; filename="flow-{label}-{mid}.{ext}"'
+                },
+            )
+        return result
+
+    label = upsample_resolution_label(str(params.get("target_resolution") or ""))
+    rid = new_request_id()
+    activity.create_request(
+        rid,
+        "upsample_image",
+        f"upsample {label}",
+        label,
+        params,
+        api_key_id=api_key_id,
+    )
     append_request_log(
-        body.request_id or result.get("source_media_id") or "-",
+        rid,
         "http",
         "POST /api/requests/upsample-image",
         level="info",
-        data={
-            "source_media_id": result.get("source_media_id"),
-            "upsampled_media_id": result.get("media_id"),
-            "download": download,
-        },
+        data={"source_request_id": params.get("source_request_id"), "async": True},
     )
     if download:
-        raw, mime = await fetch_upsample_image_bytes(result)
-        mid = str(result.get("source_media_id") or "image")[:8]
-        label = upsample_resolution_label(str(result.get("target_resolution") or ""))
-        ext = "png" if "png" in mime else "jpg"
-        return Response(
-            content=raw,
-            media_type=mime,
-            headers={
-                "Content-Disposition": f'attachment; filename="flow-{label}-{mid}.{ext}"'
-            },
-        )
-    return result
+        return {
+            "id": rid,
+            "status": "queued",
+            "poll": f"/api/requests/{rid}",
+            "download_when_done": f"/api/requests/{rid}?download=true",
+            "hint": "Poll đến status=done rồi GET download_when_done (upscale có thể >100s qua CF)",
+        }
+    return {"id": rid, "status": "queued"}
 
 
 @router.post("/upsample-video")
@@ -392,6 +436,22 @@ async def get_request_status(
         if row.status != "done":
             raise HTTPException(409, f"not_ready (status={row.status})")
         result = json.loads(row.result_json or "{}")
+        if row.type == "upsample_image":
+            raw, mime = await fetch_upsample_image_bytes(result)
+            mid = str(result.get("source_media_id") or request_id)[:8]
+            label = upsample_resolution_label(
+                str(result.get("target_resolution") or "")
+            )
+            ext = "png" if "png" in mime else "jpg"
+            return Response(
+                content=raw,
+                media_type=mime,
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="flow-{label}-{mid}.{ext}"'
+                    )
+                },
+            )
         if row.type == "upsample_video":
             raw, mime = await fetch_upsample_video_bytes(result)
             mid = str(result.get("source_media_id") or request_id)[:8]

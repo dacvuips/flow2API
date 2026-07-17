@@ -230,7 +230,7 @@ class ChatgptBroker:
     def _public_params_summary(self, params: dict[str, Any]) -> dict[str, Any]:
         images = params.get("images") or []
         profile_id = params.get("profile_id")
-        return {
+        out = {
             "prompt_preview": str(params.get("prompt") or "")[:120],
             "model": params.get("model"),
             "endpoint": params.get("endpoint"),
@@ -242,6 +242,10 @@ class ChatgptBroker:
             "image_count": len(images) if isinstance(images, list) else 0,
             "mode": params.get("mode"),
         }
+        tid = str(params.get("tab_id") or "").strip()
+        if tid:
+            out["tab_id"] = tid[:64]
+        return out
 
     def create_public_job(
         self,

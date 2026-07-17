@@ -97,6 +97,77 @@ def resolve_upsample_inputs(
     return mid, pid, prof
 
 
+def build_upsample_image_job_params(
+    *,
+    media_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    index: int = 0,
+    project_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+    target_resolution: str = UPSAMPLE_RESOLUTION_4K,
+) -> dict[str, Any]:
+    """Resolved worker params — validates source image task / ids."""
+    resolution = normalize_target_resolution(target_resolution)
+    mid, pid, prof = resolve_upsample_inputs(
+        media_id=media_id,
+        request_id=request_id,
+        index=index,
+        project_id=project_id,
+        profile_id=profile_id,
+    )
+    out: dict[str, Any] = {
+        "media_id": mid,
+        "project_id": pid,
+        "profile_id": prof,
+        "target_resolution": resolution,
+    }
+    if request_id:
+        out["source_request_id"] = str(request_id).strip()
+    return out
+
+
+async def execute_upsample_image_on_client(
+    client,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Run image upsample on a bound Flow client (worker or sync HTTP)."""
+    import asyncio
+
+    mid = str(params.get("media_id") or "").strip()
+    pid = str(params.get("project_id") or "").strip()
+    prof = str(params.get("profile_id") or "").strip()
+    resolution = normalize_target_resolution(
+        str(params.get("target_resolution") or UPSAMPLE_RESOLUTION_4K)
+    )
+
+    if not client.paygate_tier:
+        await client.fetch_paygate_tier()
+
+    if not pid:
+        try:
+            pid = await ensure_project(client)
+        except Exception as exc:
+            logger.warning("upsample ensure_project failed: %s", exc)
+            raise RuntimeError("project_unavailable") from exc
+
+    raw = await asyncio.wait_for(
+        upsample_image(
+            client,
+            media_id=mid,
+            project_id=pid,
+            target_resolution=resolution,
+        ),
+        timeout=300,
+    )
+    return format_upsample_response(
+        raw,
+        source_media_id=mid,
+        project_id=pid,
+        profile_id=prof or getattr(client, "profile_id", ""),
+        target_resolution=resolution,
+    )
+
+
 async def run_upsample_image(
     *,
     media_id: Optional[str] = None,
@@ -106,14 +177,16 @@ async def run_upsample_image(
     profile_id: Optional[str] = None,
     target_resolution: str = UPSAMPLE_RESOLUTION_4K,
 ) -> dict[str, Any]:
-    resolution = normalize_target_resolution(target_resolution)
-    mid, pid, prof = resolve_upsample_inputs(
+    params = build_upsample_image_job_params(
         media_id=media_id,
         request_id=request_id,
         index=index,
         project_id=project_id,
         profile_id=profile_id,
+        target_resolution=target_resolution,
     )
+    mid = str(params.get("media_id") or "")
+    prof = str(params.get("profile_id") or "")
 
     try:
         client = get_flow_client_for_profile(prof or None)
@@ -125,45 +198,24 @@ async def run_upsample_image(
         raise HTTPException(503, "extension_not_connected")
     if not client.flow_key:
         raise HTTPException(503, "no_flow_token")
-    if not client.paygate_tier:
-        await client.fetch_paygate_tier()
-
-    if not pid:
-        try:
-            pid = await ensure_project(client)
-        except Exception as exc:
-            logger.warning("upsample ensure_project failed: %s", exc)
-            raise HTTPException(503, "project_unavailable") from exc
 
     import asyncio
 
     try:
-        raw = await asyncio.wait_for(
-            upsample_image(
-                client,
-                media_id=mid,
-                project_id=pid,
-                target_resolution=resolution,
-            ),
-            timeout=300,
-        )
+        return await execute_upsample_image_on_client(client, params)
     except asyncio.TimeoutError:
         raise HTTPException(504, "upsample_timeout") from None
     except FlowApiError as exc:
         raise HTTPException(502, str(exc)) from exc
+    except RuntimeError as exc:
+        if str(exc) == "project_unavailable":
+            raise HTTPException(503, "project_unavailable") from exc
+        raise
     except HTTPException:
         raise
     except Exception as exc:
         logger.warning("upsample_image failed %s: %s", mid[:12], exc)
         raise HTTPException(502, "upsample_failed") from exc
-
-    return format_upsample_response(
-        raw,
-        source_media_id=mid,
-        project_id=pid,
-        profile_id=prof or client.profile_id,
-        target_resolution=resolution,
-    )
 
 
 def format_upsample_response(

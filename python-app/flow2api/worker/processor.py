@@ -904,6 +904,40 @@ class WorkerController:
         profile_id = str(params.get("profile_id") or "")
         req_type = row.type
 
+        if req_type == "upsample_image":
+            from flow2api.services.image_upsample import execute_upsample_image_on_client
+
+            append_request_log(
+                rid,
+                "worker",
+                f"Upsample image {str(params.get('media_id') or '')[:12]}…",
+                level="info",
+            )
+            formatted = await execute_upsample_image_on_client(client, params)
+            image_urls = []
+            if formatted.get("image_url"):
+                image_urls = [str(formatted["image_url"])]
+            elif formatted.get("url"):
+                image_urls = [str(formatted["url"])]
+            media_ids = [str(formatted["media_id"])] if formatted.get("media_id") else []
+            result = {
+                "image_urls": image_urls,
+                "media_ids": media_ids,
+                "url": formatted.get("url"),
+                "image_url": formatted.get("image_url"),
+                "data_url": formatted.get("data_url"),
+                "project_id": formatted.get("project_id") or params.get("project_id"),
+                "profile_id": profile_id,
+                "source_media_id": formatted.get("source_media_id"),
+                "target_resolution": formatted.get("target_resolution"),
+                "upsampled_media_id": formatted.get("upsampled_media_id")
+                or formatted.get("media_id"),
+            }
+            result = await persist_task_result(rid, result, req_type)
+            activity.update_request(rid, status="done", result=result, error=None)
+            events.publish("request_finished", {"id": rid, "status": "done"})
+            return
+
         if req_type == "upsample_video":
             from flow2api.services.video_upsample import execute_upsample_video_on_client
 

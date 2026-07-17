@@ -130,8 +130,14 @@ class Flow2APIClient:
         profile_id: Optional[str] = None,
         resolution: str = "4k",
         download: bool = False,
+        sync: bool = False,
+        poll_interval: float = 2.5,
+        max_attempts: int = 120,
     ) -> dict | bytes:
-        """Upscale ảnh đã generate lên 2K hoặc 4K. resolution: 2k | 4k."""
+        """Upscale ảnh đã generate lên 2K hoặc 4K. resolution: 2k | 4k.
+
+        Mặc định async queue + poll (an toàn với Cloudflare). sync=True chỉ dùng local.
+        """
         body: dict[str, Any] = {
             "target_resolution": resolution,
             "index": index,
@@ -144,18 +150,43 @@ class Flow2APIClient:
             body["project_id"] = project_id
         if profile_id:
             body["profile_id"] = profile_id
-        params = {"download": "true"} if download else {}
-        with httpx.Client(timeout=self.timeout) as client:
+        if sync:
+            params: dict[str, Any] = {"sync": "true"}
+            if download:
+                params["download"] = "true"
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.post(
+                    f"{self.base_url}/api/requests/upsample-image",
+                    headers=self._headers(),
+                    params=params,
+                    json=body,
+                )
+                r.raise_for_status()
+                if download:
+                    return r.content
+                return r.json()
+        with httpx.Client(timeout=60.0) as client:
             r = client.post(
                 f"{self.base_url}/api/requests/upsample-image",
                 headers=self._headers(),
-                params=params,
                 json=body,
             )
             r.raise_for_status()
-            if download:
-                return r.content
-            return r.json()
+            job = r.json()
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            raise RuntimeError("missing_upsample_job_id")
+        task = self.wait(job_id, poll_interval=poll_interval, max_attempts=max_attempts)
+        if download:
+            with httpx.Client(timeout=self.timeout) as client:
+                dr = client.get(
+                    f"{self.base_url}/api/requests/{job_id}",
+                    headers=self._headers(),
+                    params={"download": "true"},
+                )
+                dr.raise_for_status()
+                return dr.content
+        return task
 
     def upsample_image_4k(
         self,

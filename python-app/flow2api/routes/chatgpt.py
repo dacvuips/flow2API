@@ -9,12 +9,17 @@ from typing import Any, AsyncIterator, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from flow2api.services import system_ops
 from flow2api.services.api_auth import auth_key_id
 from flow2api.services.chatgpt_broker import get_chatgpt_broker
+from flow2api.services.chatgpt_media import (
+    persist_chatgpt_result_media,
+    resolve_chatgpt_media_path,
+    sanitize_chatgpt_result_for_poll,
+)
 from flow2api.services.chatgpt_playwright import playwright_status, run_playwright_chat
 from flow2api.services.chatgpt_pool import (
     PLAYWRIGHT_PROFILE_ID,
@@ -73,6 +78,7 @@ class WebChatBody(BaseModel):
     mode: str | None = None
     system_hints: list[str] | None = None
     picture: bool | None = None
+    tab_id: str | None = None  # client browser-tab id — poll gắn theo tab
 
 
 class PublicChatImage(BaseModel):
@@ -431,6 +437,7 @@ async def _run_public_chat_job(job_id: str, kwargs: dict[str, Any]) -> None:
             )
         }
         result = await run_web_chat(**clean)
+        result = persist_chatgpt_result_media(job_id, result)
         broker.finish_public_job(job_id, result=result)
     except HTTPException as exc:
         detail = exc.detail
@@ -460,6 +467,7 @@ def enqueue_web_chat(
     mode: str | None = None,
     system_hints: list[str] | None = None,
     picture: bool | None = None,
+    tab_id: str | None = None,
 ) -> dict[str, Any]:
     """Enqueue chat job and return immediately (Cloudflare-safe). Scheduler starts work."""
     prompt = (prompt or "").strip()
@@ -469,6 +477,7 @@ def enqueue_web_chat(
 
     hints = _normalize_system_hints(mode=mode, system_hints=system_hints, picture=picture)
     pid = (profile_id or "").strip() or None
+    tid = str(tab_id or "").strip()[:64] or None
     kwargs = {
         "prompt": prompt,
         "model": model,
@@ -494,18 +503,25 @@ def enqueue_web_chat(
             "images": norm_images,
             "mode": "picture_v2" if "picture_v2" in hints else mode,
             "system_hints": hints,
+            "tab_id": tid,
         },
         kwargs=kwargs,
     )
     ensure_scheduler_started()
     nudge_scheduler()
-    logger.info("chatgpt public job queued %s profile=%s", job.job_id[:8], pid or "auto")
+    logger.info(
+        "chatgpt public job queued %s profile=%s tab=%s",
+        job.job_id[:8],
+        pid or "auto",
+        (tid or "-")[:12],
+    )
     return {
         "ok": True,
         "id": job.job_id,
         "status": "queued",
         "poll_url": f"/api/v1/chatgpt/chat/{job.job_id}",
         "profile_id": pid,
+        "tab_id": tid,
         "queue": queue_summary(),
     }
 
@@ -516,9 +532,12 @@ def public_job_payload(job_id: str) -> dict[str, Any]:
     if not job:
         raise HTTPException(404, "chatgpt_job_not_found")
     payload = job.to_dict(include_result=True)
+    if isinstance(payload.get("result"), dict):
+        payload["result"] = sanitize_chatgpt_result_for_poll(payload["result"])
     payload["ok"] = job.status != "failed"
     if job.status == "done" and isinstance(job.result, dict):
         # Flatten common fields for convenient poll clients
+        safe_result = sanitize_chatgpt_result_for_poll(job.result) or {}
         for key in (
             "text",
             "images",
@@ -530,8 +549,8 @@ def public_job_payload(job_id: str) -> dict[str, Any]:
             "via",
             "uploaded_images",
         ):
-            if key in job.result and key not in payload:
-                payload[key] = job.result[key]
+            if key in safe_result and key not in payload:
+                payload[key] = safe_result[key]
     return payload
 
 
@@ -872,18 +891,38 @@ async def chatgpt_web_chat(
         mode=body.mode,
         system_hints=body.system_hints,
         picture=body.picture,
+        tab_id=body.tab_id,
     )
     if async_mode:
         out = enqueue_web_chat(**kwargs)
         out["poll_url"] = f"/api/chatgpt/web/chat/{out['id']}"
         return out
-    return await run_web_chat(**kwargs)
+    sync_kwargs = {k: v for k, v in kwargs.items() if k != "tab_id"}
+    return await run_web_chat(**sync_kwargs)
 
 
 @router.get("/web/chat/{job_id}")
 async def chatgpt_web_chat_job(job_id: str, _: int = Depends(auth_key_id)):
     """Poll job ChatGPT async từ dashboard (`queued` | `running` | `done` | `failed`)."""
     return public_job_payload(job_id)
+
+
+@router.get("/web/chat/{job_id}/media/{kind}/{index}")
+async def chatgpt_web_chat_media(job_id: str, kind: str, index: int = 0):
+    """Serve persisted ChatGPT result image/file (auth via middleware / access_token query)."""
+    path = resolve_chatgpt_media_path(job_id, kind, index)
+    if not path or not path.is_file():
+        raise HTTPException(404, "chatgpt_media_not_found")
+    ext = path.suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".pdf": "application/pdf",
+    }.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=mime)
 
 
 @router.post("/settings")

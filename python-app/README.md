@@ -116,11 +116,20 @@ Sau khi tạo ảnh xong, gọi upscale với `target_resolution`:
 | `2k` hoặc `UPSAMPLE_IMAGE_RESOLUTION_2K` | Upscale 2K |
 | `4k` hoặc `UPSAMPLE_IMAGE_RESOLUTION_4K` | Upscale 4K (mặc định) |
 
+**Quan trọng qua Cloudflare Tunnel**: upscale có thể >100s — **không** giữ 1 HTTP request mở (sẽ 504/524). Mặc định **async**: POST trả `queued` ngay, poll status, rồi tải file. Chỉ dùng `?sync=true` khi gọi local (`127.0.0.1`).
+
 ```bash
+# Bước 1 — enqueue
 curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image" ^
   -H "Authorization: Bearer f2api_YOUR_KEY" ^
   -H "Content-Type: application/json" ^
   -d "{\"request_id\":\"REQUEST_ID\",\"target_resolution\":\"UPSAMPLE_IMAGE_RESOLUTION_2K\"}"
+
+# Bước 2 — poll JOB_ID đến status=done
+curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/JOB_ID"
+
+# Bước 3 — tải file
+curl -H "Authorization: Bearer f2api_YOUR_KEY" "http://127.0.0.1:1994/api/requests/JOB_ID?download=true" -o output_2k.jpg
 ```
 
 Hoặc truyền trực tiếp `media_id` từ `result.media_ids[0]`:
@@ -132,17 +141,15 @@ curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image" ^
   -d "{\"media_id\":\"MEDIA_UUID\",\"project_id\":\"PROJECT_UUID\",\"target_resolution\":\"2k\"}"
 ```
 
-Tải thẳng file ảnh (không JSON): thêm query `?download=true`
+Local sync (không qua Cloudflare): thêm `?sync=true` (và tùy chọn `&download=true`).
 
-```bash
-curl -X POST "http://127.0.0.1:1994/api/requests/upsample-image?download=true" ^
-  -H "Authorization: Bearer f2api_YOUR_KEY" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"request_id\":\"REQUEST_ID\"}" ^
-  -o output_4k.jpg
+Response enqueue:
+
+```json
+{"id": "JOB_ID", "status": "queued"}
 ```
 
-Response JSON mẫu:
+Khi job `done`, result JSON mẫu:
 
 ```json
 {
