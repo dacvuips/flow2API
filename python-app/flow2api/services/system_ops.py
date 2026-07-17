@@ -38,6 +38,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model": "gpt-4o-mini",
         "base_url": "https://api.openai.com/v1",
     },
+    "chatgpt": {
+        "call_delay_s": 5.0,
+        # extension | playwright — playwright giả lập UI chatgpt.com
+        "transport": "playwright",
+        "cdp_url": "",
+        "chrome_profile": "Default",
+        "chrome_user_data_dir": "",
+        "use_system_chrome_profile": False,
+        "headless": False,
+    },
     "proxy_pool": [],
     "proxy_pool_enabled": False,
     "proxy_rotate_enabled": False,
@@ -68,6 +78,8 @@ def load_config() -> dict[str, Any]:
                     out["telegram"] = {**out["telegram"], **raw["telegram"]}
                 if isinstance(raw.get("openai"), dict):
                     out["openai"] = {**out["openai"], **raw["openai"]}
+                if isinstance(raw.get("chatgpt"), dict):
+                    out["chatgpt"] = {**out["chatgpt"], **raw["chatgpt"]}
                 if "proxy_pool_enabled" not in raw:
                     out["proxy_pool_enabled"] = bool(raw.get("proxy_pool"))
             return out
@@ -96,6 +108,8 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
         current["telegram"] = {**current.get("telegram", {}), **cfg["telegram"]}
     if isinstance(cfg.get("openai"), dict):
         current["openai"] = {**current.get("openai", {}), **cfg["openai"]}
+    if isinstance(cfg.get("chatgpt"), dict):
+        current["chatgpt"] = {**current.get("chatgpt", {}), **cfg["chatgpt"]}
     with _LOCK:
         _CONFIG_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
     return current
@@ -123,6 +137,30 @@ def public_openai_config() -> dict[str, Any]:
     }
 
 
+def chatgpt_config() -> dict[str, Any]:
+    cfg = load_config()
+    cgpt = dict(cfg.get("chatgpt") or {})
+    delay = float(cgpt.get("call_delay_s") if cgpt.get("call_delay_s") is not None else 5.0)
+    delay = max(0.0, min(600.0, delay))
+    transport = str(cgpt.get("transport") or "playwright").strip().lower()
+    if transport not in ("playwright", "extension"):
+        transport = "playwright"
+    return {
+        "call_delay_s": delay,
+        "transport": transport,
+        "cdp_url": str(cgpt.get("cdp_url") or "").strip(),
+        "chrome_profile": str(cgpt.get("chrome_profile") or "Default").strip() or "Default",
+        "chrome_user_data_dir": str(cgpt.get("chrome_user_data_dir") or "").strip(),
+        "use_system_chrome_profile": bool(cgpt.get("use_system_chrome_profile")),
+        "headless": bool(cgpt.get("headless")),
+        "chrome_profiles": list_chrome_profiles(),
+    }
+
+
+def public_chatgpt_config() -> dict[str, Any]:
+    return chatgpt_config()
+
+
 def public_config() -> dict[str, Any]:
     cfg = load_config()
     tg = dict(cfg.get("telegram") or {})
@@ -132,6 +170,7 @@ def public_config() -> dict[str, Any]:
         "flow_url": cfg.get("flow_url") or _FLOW_URL_DEFAULT,
         "telegram": tg,
         "openai": public_openai_config(),
+        "chatgpt": public_chatgpt_config(),
         "proxy_pool": list(cfg.get("proxy_pool") or []),
         "proxy_pool_enabled": is_proxy_pool_enabled(cfg),
         "proxy_rotate_enabled": bool(cfg.get("proxy_rotate_enabled")),
@@ -179,6 +218,228 @@ def list_chrome_profiles() -> list[str]:
             if (entry / "Preferences").is_file():
                 found.append(entry.name)
     return found
+
+
+def cdp_endpoint_alive(cdp_url: str = "http://127.0.0.1:9222") -> bool:
+    url = (cdp_url or "").strip().rstrip("/")
+    if not url:
+        return False
+    try:
+        req = Request(url + "/json/version", method="GET")
+        with urlopen(req, timeout=1.5) as resp:
+            return 200 <= int(getattr(resp, "status", 200) or 200) < 500
+    except Exception:
+        return False
+
+
+def launch_chrome_for_playwright(
+    *,
+    profile: str | None = None,
+    port: int = 9222,
+    use_system_profile: bool | None = None,
+    start_url: str = "https://chatgpt.com/",
+) -> dict[str, Any]:
+    """
+    Open Chrome with --remote-debugging-port so Playwright can attach (CDP).
+
+    - use_system_profile=True: real User Data + profile (login + extension).
+      Chrome using that User Data must be closed first.
+    - False: dedicated dir under storage (login once; extension not required).
+    """
+    paths = _chrome_paths()
+    if not paths:
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+
+    cgpt = chatgpt_config()
+    profile_name = (profile or cgpt.get("chrome_profile") or "Default").strip() or "Default"
+    port = max(1024, min(65535, int(port or 9222)))
+    if use_system_profile is None:
+        use_system_profile = bool(cgpt.get("use_system_chrome_profile"))
+
+    custom_ud = str(cgpt.get("chrome_user_data_dir") or "").strip()
+    if use_system_profile:
+        user_data = Path(custom_ud) if custom_ud else _user_data_dir()
+    else:
+        user_data = STORAGE_DIR / "playwright_chatgpt_chrome"
+        user_data.mkdir(parents=True, exist_ok=True)
+
+    cdp_url = f"http://127.0.0.1:{port}"
+    if cdp_endpoint_alive(cdp_url):
+        # already running — just remember URL
+        to_save = {k: v for k, v in {**cgpt, "cdp_url": cdp_url, "chrome_profile": profile_name}.items() if k != "chrome_profiles"}
+        save_config({"chatgpt": to_save})
+        return {
+            "ok": True,
+            "already_running": True,
+            "cdp_url": cdp_url,
+            "profile": profile_name,
+            "user_data_dir": str(user_data),
+            "use_system_profile": bool(use_system_profile),
+            "message": f"Chrome CDP đã chạy tại {cdp_url} — Playwright sẽ gắn vào profile đang mở.",
+        }
+
+    chrome = str(paths[0])
+    args = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data}",
+        f"--profile-directory={profile_name}" if use_system_profile else "--profile-directory=Default",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--hide-crash-restore-bubble",
+        "--disable-session-crashed-bubble",
+        start_url or "https://chatgpt.com/",
+    ]
+    try:
+        subprocess.Popen(
+            args,
+            cwd=str(user_data),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "chrome_launch_failed",
+            "message": str(exc),
+            "hint": (
+                "Nếu dùng profile hệ thống: đóng hết Chrome rồi thử lại. "
+                "Hoặc tắt 'Dùng Chrome User Data hệ thống' để mở profile Playwright riêng."
+            ),
+        }
+
+    # Wait briefly for CDP
+    for _ in range(20):
+        time.sleep(0.25)
+        if cdp_endpoint_alive(cdp_url):
+            break
+
+    to_save = {
+        k: v
+        for k, v in {
+            **cgpt,
+            "cdp_url": cdp_url,
+            "chrome_profile": profile_name,
+            "use_system_chrome_profile": bool(use_system_profile),
+        }.items()
+        if k != "chrome_profiles"
+    }
+    save_config({"chatgpt": to_save})
+
+    alive = cdp_endpoint_alive(cdp_url)
+    return {
+        "ok": alive,
+        "cdp_url": cdp_url,
+        "profile": profile_name,
+        "user_data_dir": str(user_data),
+        "use_system_profile": bool(use_system_profile),
+        "message": (
+            f"Đã mở Chrome CDP {cdp_url} · profile {profile_name}. "
+            "Frontend nhận kết quả qua API (Playwright bắt Network conversation) — không cần extension."
+            if alive
+            else (
+                f"Đã gọi mở Chrome nhưng CDP {cdp_url} chưa sẵn sàng. "
+                "Đóng Chrome đang chạy (cùng User Data) rồi bấm lại."
+            )
+        ),
+        "error": None if alive else "cdp_not_ready",
+    }
+
+
+def launch_playwright_slot(
+    slot_id: str,
+    *,
+    start_url: str = "https://chatgpt.com/",
+) -> dict[str, Any]:
+    """Open Chrome CDP for one Playwright pool slot (dedicated user-data dir)."""
+    from flow2api.services.chatgpt_pool_settings import get_playwright_slot
+
+    slot = get_playwright_slot(slot_id)
+    if not slot:
+        return {"ok": False, "error": "slot_not_found", "message": f"Không tìm thấy slot {slot_id}"}
+
+    paths = _chrome_paths()
+    if not paths:
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+
+    user_data = Path(slot.user_data_dir())
+    user_data.mkdir(parents=True, exist_ok=True)
+    cdp_url = slot.cdp_url()
+    port = int(slot.port)
+
+    if cdp_endpoint_alive(cdp_url):
+        return {
+            "ok": True,
+            "already_running": True,
+            "slot_id": slot.id,
+            "label": slot.label,
+            "cdp_url": cdp_url,
+            "port": port,
+            "user_data_dir": str(user_data),
+            "message": f"Slot {slot.id} CDP đã chạy tại {cdp_url}.",
+        }
+
+    chrome = str(paths[0])
+    args = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data}",
+        "--profile-directory=Default",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--hide-crash-restore-bubble",
+        "--disable-session-crashed-bubble",
+        start_url or "https://chatgpt.com/",
+    ]
+    try:
+        subprocess.Popen(
+            args,
+            cwd=str(user_data),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "chrome_launch_failed",
+            "slot_id": slot.id,
+            "message": str(exc),
+        }
+
+    for _ in range(24):
+        time.sleep(0.25)
+        if cdp_endpoint_alive(cdp_url):
+            break
+
+    alive = cdp_endpoint_alive(cdp_url)
+    return {
+        "ok": alive,
+        "slot_id": slot.id,
+        "label": slot.label,
+        "cdp_url": cdp_url,
+        "port": port,
+        "user_data_dir": str(user_data),
+        "message": (
+            f"Đã mở slot {slot.id} · CDP {cdp_url}. Đăng nhập chatgpt.com trong cửa sổ này (một lần)."
+            if alive
+            else f"Đã gọi mở slot {slot.id} nhưng CDP {cdp_url} chưa sẵn sàng."
+        ),
+        "error": None if alive else "cdp_not_ready",
+    }
+
+
+def launch_all_playwright_slots(*, start_url: str = "https://chatgpt.com/") -> dict[str, Any]:
+    from flow2api.services.chatgpt_pool_settings import list_playwright_slots
+
+    results = []
+    for slot in list_playwright_slots():
+        results.append(launch_playwright_slot(slot.id, start_url=start_url))
+    ok_n = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": ok_n > 0,
+        "launched": ok_n,
+        "total": len(results),
+        "results": results,
+        "message": f"Đã mở {ok_n}/{len(results)} Chrome CDP slot.",
+    }
 
 
 def ensure_launch_script() -> Path:

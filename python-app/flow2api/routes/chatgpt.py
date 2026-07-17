@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Literal
 
 import httpx
@@ -14,6 +15,25 @@ from pydantic import BaseModel, Field
 from flow2api.services import system_ops
 from flow2api.services.api_auth import auth_key_id
 from flow2api.services.chatgpt_broker import get_chatgpt_broker
+from flow2api.services.chatgpt_playwright import playwright_status, run_playwright_chat
+from flow2api.services.chatgpt_pool import (
+    PLAYWRIGHT_PROFILE_ID,
+    ensure_scheduler_started,
+    is_playwright_slot_id,
+    list_chatgpt_profiles,
+    nudge_scheduler,
+    queue_summary,
+    register_job_runner,
+)
+from flow2api.services.chatgpt_pool_settings import (
+    add_playwright_slot,
+    get_chatgpt_pool_settings,
+    list_playwright_slots,
+    remove_playwright_slot,
+    save_chatgpt_pool_settings,
+    set_chatgpt_dispatch_enabled,
+    update_playwright_slot,
+)
 from flow2api.services.extension_pool import ExtensionSession, get_extension_pool
 
 logger = logging.getLogger(__name__)
@@ -142,6 +162,29 @@ def _try_pick_ws_session(profile_id: str | None = None) -> ExtensionSession | No
     return None
 
 
+_chatgpt_delay_lock = asyncio.Lock()
+_chatgpt_last_start_at = 0.0
+
+
+async def _await_chatgpt_call_delay() -> float:
+    """Sleep so consecutive ChatGPT calls are spaced by chatgpt.call_delay_s."""
+    global _chatgpt_last_start_at
+    delay = float(system_ops.chatgpt_config().get("call_delay_s") or 0)
+    delay = max(0.0, min(600.0, delay))
+    if delay <= 0:
+        async with _chatgpt_delay_lock:
+            _chatgpt_last_start_at = time.time()
+        return 0.0
+
+    async with _chatgpt_delay_lock:
+        now = time.time()
+        wait = delay - (now - _chatgpt_last_start_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _chatgpt_last_start_at = time.time()
+        return max(0.0, wait)
+
+
 def _format_asset_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "file_id": item.get("file_id") or item.get("fileId"),
@@ -247,6 +290,9 @@ async def run_web_chat(
     mode: str | None = None,
     system_hints: list[str] | None = None,
     picture: bool | None = None,
+    slot_id: str | None = None,
+    _force_playwright: bool = False,
+    _force_extension: bool = False,
 ) -> dict[str, Any]:
     prompt = (prompt or "").strip()
     norm_images = _normalize_images(images)
@@ -271,14 +317,56 @@ async def run_web_chat(
         params["systemHints"] = hints
         params["mode"] = "picture_v2" if "picture_v2" in hints else (mode or "")
 
-    # picture_v2 can take longer (async ghostrider image gen + poll)
+    cgpt_cfg = system_ops.chatgpt_config()
+    transport = str(cgpt_cfg.get("transport") or "playwright").strip().lower()
+    pid = (profile_id or "").strip() or None
+    sid = (slot_id or "").strip() or None
+    if not sid and is_playwright_slot_id(pid):
+        sid = pid if pid != PLAYWRIGHT_PROFILE_ID else None
+
+    # Scheduler / explicit pin overrides global transport
+    use_playwright = bool(_force_playwright) or (
+        not _force_extension
+        and (is_playwright_slot_id(pid) or transport == "playwright")
+    )
+    if is_playwright_slot_id(pid):
+        use_playwright = True
+    if _force_extension and pid and not is_playwright_slot_id(pid):
+        use_playwright = False
+
+    waited = await _await_chatgpt_call_delay()
+    if waited > 0:
+        logger.info("chatgpt delay waited %.1fs", waited)
+
     send_timeout = 300.0 if "picture_v2" in hints else 180.0
     broker_timeout = 360.0 if "picture_v2" in hints else 240.0
 
-    session = _try_pick_ws_session(profile_id)
+    if use_playwright:
+        result = await run_playwright_chat(
+            prompt=prompt,
+            images=norm_images,
+            picture_mode="picture_v2" in hints,
+            timeout_s=send_timeout,
+            slot_id=sid or pid,
+        )
+        used_slot = result.get("slot_id") or sid or pid or PLAYWRIGHT_PROFILE_ID
+        out = _format_web_result(
+            result,
+            endpoint=endpoint,
+            model=model,
+            via="playwright",
+            profile_id=str(used_slot),
+            profile_label=str(used_slot),
+        )
+        out["call_delay_s"] = cgpt_cfg.get("call_delay_s")
+        out["page_url"] = result.get("page_url")
+        out["slot_id"] = used_slot
+        return out
+
+    session = _try_pick_ws_session(pid)
     if session:
         result = await session.chatgpt_send(params, timeout=send_timeout)
-        return _format_web_result(
+        out = _format_web_result(
             result,
             endpoint=endpoint,
             model=model,
@@ -286,6 +374,8 @@ async def run_web_chat(
             profile_id=session.profile_id,
             profile_label=session.display_name(),
         )
+        out["call_delay_s"] = cgpt_cfg.get("call_delay_s")
+        return out
 
     broker = get_chatgpt_broker()
     if not broker.online_workers():
@@ -298,28 +388,65 @@ async def run_web_chat(
             503,
             "extension_not_ready — Không có Bridge WS và chưa thấy extension poll HTTP. "
             "Reload extension trên Chrome (profile đã login chatgpt.com), đợi 2–3 giây rồi gọi lại. "
+            "Hoặc Settings → Chat GPT → transport = playwright. "
             "Agent phải chạy ở http://127.0.0.1:1994.",
         )
 
+    if pid:
+        params["preferredWorkerId"] = pid
     result = await broker.submit(params, timeout=broker_timeout)
-    return _format_web_result(result, endpoint=endpoint, model=model, via="http")
+    out = _format_web_result(
+        result,
+        endpoint=endpoint,
+        model=model,
+        via="http",
+        profile_id=pid,
+    )
+    out["call_delay_s"] = cgpt_cfg.get("call_delay_s")
+    return out
 
 
 async def _run_public_chat_job(job_id: str, kwargs: dict[str, Any]) -> None:
     broker = get_chatgpt_broker()
-    broker.mark_public_running(job_id)
+    if broker.get_public_job(job_id) and broker.get_public_job(job_id).status == "queued":
+        broker.mark_public_running(job_id)
     try:
-        result = await run_web_chat(**kwargs)
+        clean = {
+            k: v
+            for k, v in kwargs.items()
+            if k in (
+                "prompt",
+                "model",
+                "endpoint",
+                "profile_id",
+                "conversation_id",
+                "parent_message_id",
+                "images",
+                "mode",
+                "system_hints",
+                "picture",
+                "slot_id",
+                "_force_playwright",
+                "_force_extension",
+            )
+        }
+        result = await run_web_chat(**clean)
         broker.finish_public_job(job_id, result=result)
     except HTTPException as exc:
         detail = exc.detail
         if not isinstance(detail, str):
             detail = str(detail)
         broker.finish_public_job(job_id, error=detail)
+    except asyncio.CancelledError:
+        broker.finish_public_job(job_id, error="cancelled")
+        raise
     except Exception as exc:
         logger.exception("chatgpt public job %s failed", job_id[:8])
         broker.finish_public_job(job_id, error=str(exc) or "chatgpt_job_failed")
 
+
+# Wire scheduler → job runner (avoid circular import at module import time)
+register_job_runner(_run_public_chat_job)
 
 def enqueue_web_chat(
     *,
@@ -334,18 +461,19 @@ def enqueue_web_chat(
     system_hints: list[str] | None = None,
     picture: bool | None = None,
 ) -> dict[str, Any]:
-    """Enqueue chat job and return immediately (Cloudflare-safe)."""
+    """Enqueue chat job and return immediately (Cloudflare-safe). Scheduler starts work."""
     prompt = (prompt or "").strip()
     norm_images = _normalize_images(images)
     if not prompt and not norm_images:
         raise HTTPException(400, "empty_prompt")
 
     hints = _normalize_system_hints(mode=mode, system_hints=system_hints, picture=picture)
+    pid = (profile_id or "").strip() or None
     kwargs = {
         "prompt": prompt,
         "model": model,
         "endpoint": endpoint,
-        "profile_id": profile_id,
+        "profile_id": pid,
         "conversation_id": conversation_id,
         "parent_message_id": parent_message_id,
         "images": images,
@@ -359,22 +487,26 @@ def enqueue_web_chat(
             "prompt": prompt,
             "model": (model or "").strip() or DEFAULT_WEB_MODEL,
             "endpoint": (endpoint or "").strip() or DEFAULT_WEB_ENDPOINT,
-            "profile_id": profile_id,
+            "profile_id": pid,
+            "profile_assigned_by_user": bool(pid),
             "conversation_id": conversation_id,
             "parent_message_id": parent_message_id,
             "images": norm_images,
             "mode": "picture_v2" if "picture_v2" in hints else mode,
             "system_hints": hints,
-        }
+        },
+        kwargs=kwargs,
     )
-    task = asyncio.create_task(_run_public_chat_job(job.job_id, kwargs))
-    broker.track_public_task(job.job_id, task)
-    logger.info("chatgpt public job queued %s", job.job_id[:8])
+    ensure_scheduler_started()
+    nudge_scheduler()
+    logger.info("chatgpt public job queued %s profile=%s", job.job_id[:8], pid or "auto")
     return {
         "ok": True,
         "id": job.job_id,
         "status": "queued",
         "poll_url": f"/api/v1/chatgpt/chat/{job.job_id}",
+        "profile_id": pid,
+        "queue": queue_summary(),
     }
 
 
@@ -409,32 +541,51 @@ async def web_status_payload(profile_id: str | None = None) -> dict[str, Any]:
     broker = get_chatgpt_broker()
     broker_stats = broker.stats()
     http_workers = broker.online_workers()
-    profiles = [
-        {
-            "profile_id": s.profile_id,
-            "display_name": s.display_name(),
-            "online": s.connected,
-            "email": s.email,
-        }
-        for s in pool.list_sessions()
-    ]
-    online = [p for p in profiles if p["online"]]
+    profiles = await list_chatgpt_profiles()
+    online = [p for p in profiles if p.get("online")]
+    accepting = [p for p in profiles if p.get("accepts_new_jobs")]
     session = _try_pick_ws_session(profile_id)
+    cgpt_cfg = system_ops.chatgpt_config()
+    transport_setting = str(cgpt_cfg.get("transport") or "playwright").strip().lower()
+    pw_st = await playwright_status()
+    pool_settings = get_chatgpt_pool_settings()
+    ensure_scheduler_started()
 
     base = {
         "ok": True,
         "mode": "web",
         "profiles_online": len(online),
         "profiles_total": len(profiles),
+        "profiles_accepting": len(accepting),
         "profiles_offline_gen": pool.offline_gen_count(),
         "profiles": profiles,
         "http_workers_online": len(http_workers),
         "http_workers": http_workers,
         "broker": broker_stats,
+        "queue": queue_summary(),
+        "pool": pool_settings.to_dict(),
         "default_endpoint": DEFAULT_WEB_ENDPOINT,
         "default_model": DEFAULT_WEB_MODEL,
+        "transport_setting": transport_setting,
+        "chatgpt": cgpt_cfg,
+        "playwright": pw_st,
         "transport": "ws" if session else ("http" if http_workers else "none"),
     }
+
+    if transport_setting == "playwright":
+        return {
+            **base,
+            "transport": "playwright",
+            "extension_connected": bool(pw_st.get("playwright_installed")),
+            "loggedIn": None,
+            "ok": bool(pw_st.get("playwright_installed")),
+            "error": None
+            if pw_st.get("playwright_installed")
+            else (pw_st.get("hint") or "playwright_not_installed"),
+            "hint": pw_st.get("hint")
+            or "Playwright sẽ mở chatgpt.com (/ hoặc /images), gõ prompt, bấm nút gửi, bắt Network conversation.",
+            "profile_label": cgpt_cfg.get("chrome_profile") or "Default",
+        }
 
     if session:
         data = await session.chatgpt_session_status(timeout=20.0)
@@ -458,7 +609,19 @@ async def web_status_payload(profile_id: str | None = None) -> dict[str, Any]:
             "extension_connected": True,
             "loggedIn": None,
             "error": None,
-            "hint": "Extension đang poll HTTP (không cần Bridge WS). Gửi chat sẽ qua hàng đợi.",
+            "hint": "Extension đang poll HTTP (không cần Bridge WS). Gửi chat sẽ qua hàng đợi pool.",
+        }
+
+    # Still OK if playwright slot is accepting
+    if any(p.get("kind") == "playwright" and p.get("accepts_new_jobs") for p in profiles):
+        return {
+            **base,
+            "transport": "playwright",
+            "extension_connected": True,
+            "loggedIn": None,
+            "ok": True,
+            "error": None,
+            "hint": "Playwright slot sẵn sàng nhận job.",
         }
 
     return {
@@ -467,9 +630,8 @@ async def web_status_payload(profile_id: str | None = None) -> dict[str, Any]:
         "extension_connected": False,
         "loggedIn": False,
         "error": (
-            "Chưa có extension sẵn sàng (WS offline và chưa có HTTP poll). "
-            "Reload extension Flow2API trên Chrome profile đã login chatgpt.com, "
-            "đảm bảo Python agent chạy ở http://127.0.0.1:1994."
+            "Chưa có profile ChatGPT sẵn sàng (WS/HTTP/Playwright). "
+            "Bật Nhận job trên profile, Mở Chrome CDP, hoặc reload extension."
         ),
     }
 
@@ -485,6 +647,207 @@ async def chatgpt_web_status(
     _: int = Depends(auth_key_id),
 ):
     return await web_status_payload(profile_id)
+
+
+class ProfileDispatchBody(BaseModel):
+    enabled: bool
+
+
+class PoolSettingsBody(BaseModel):
+    max_concurrent: int | None = None
+    profile_default_max_concurrent: int | None = None
+
+
+class AssignProfileBody(BaseModel):
+    profile_id: str | None = None
+
+
+@router.get("/web/jobs")
+async def chatgpt_web_jobs(
+    status: str | None = Query(None, description="queued|running|done|failed|cancelled|active|all"),
+    limit: int = Query(50, ge=1, le=200),
+    _: int = Depends(auth_key_id),
+):
+    broker = get_chatgpt_broker()
+    ensure_scheduler_started()
+    return {
+        "ok": True,
+        "items": broker.list_public_jobs(status=status, limit=limit),
+        "queue": queue_summary(),
+        "pool": get_chatgpt_pool_settings().to_dict(),
+    }
+
+
+@router.put("/web/chat/{job_id}/profile")
+async def chatgpt_assign_job_profile(
+    job_id: str,
+    body: AssignProfileBody,
+    _: int = Depends(auth_key_id),
+):
+    broker = get_chatgpt_broker()
+    try:
+        job = broker.set_public_profile(job_id, body.profile_id)
+    except KeyError:
+        raise HTTPException(404, "chatgpt_job_not_found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    nudge_scheduler()
+    return {"ok": True, **job.to_dict(include_result=False)}
+
+
+@router.post("/web/chat/{job_id}/cancel")
+async def chatgpt_cancel_job(job_id: str, _: int = Depends(auth_key_id)):
+    broker = get_chatgpt_broker()
+    try:
+        job = broker.cancel_public_job(job_id)
+    except KeyError:
+        raise HTTPException(404, "chatgpt_job_not_found") from None
+    nudge_scheduler()
+    return {"ok": True, **job.to_dict(include_result=False)}
+
+
+@router.put("/profiles/{profile_id}/dispatch")
+async def chatgpt_profile_dispatch(
+    profile_id: str,
+    body: ProfileDispatchBody,
+    _: int = Depends(auth_key_id),
+):
+    try:
+        settings = set_chatgpt_dispatch_enabled(profile_id, bool(body.enabled))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    nudge_scheduler()
+    profiles = await list_chatgpt_profiles()
+    return {
+        "ok": True,
+        "profile_id": profile_id,
+        "enabled": bool(body.enabled),
+        "pool": settings.to_dict(),
+        "profiles": profiles,
+    }
+
+
+@router.get("/pool/settings")
+async def chatgpt_pool_settings_get(_: int = Depends(auth_key_id)):
+    return {"ok": True, "pool": get_chatgpt_pool_settings().to_dict()}
+
+
+@router.put("/pool/settings")
+async def chatgpt_pool_settings_put(body: PoolSettingsBody, _: int = Depends(auth_key_id)):
+    patch: dict[str, Any] = {}
+    if body.max_concurrent is not None:
+        patch["max_concurrent"] = body.max_concurrent
+    if body.profile_default_max_concurrent is not None:
+        patch["profile_default_max_concurrent"] = body.profile_default_max_concurrent
+    settings = save_chatgpt_pool_settings(**patch) if patch else get_chatgpt_pool_settings()
+    nudge_scheduler()
+    return {"ok": True, "pool": settings.to_dict()}
+
+
+@router.post("/pool/nudge")
+async def chatgpt_pool_nudge(_: int = Depends(auth_key_id)):
+    ensure_scheduler_started()
+    nudge_scheduler()
+    return {"ok": True, "queue": queue_summary()}
+
+
+class SlotCreateBody(BaseModel):
+    label: str | None = None
+    port: int | None = None
+
+
+class SlotUpdateBody(BaseModel):
+    label: str | None = None
+    port: int | None = None
+
+
+@router.get("/slots")
+async def chatgpt_slots_list(_: int = Depends(auth_key_id)):
+    from flow2api.services.chatgpt_playwright import playwright_slot_status
+
+    st = await playwright_slot_status()
+    return {
+        "ok": True,
+        "slots": st.get("slots") or [s.to_dict() for s in list_playwright_slots()],
+        "pool": get_chatgpt_pool_settings().to_dict(),
+        "profiles": await list_chatgpt_profiles(),
+    }
+
+
+@router.post("/slots")
+async def chatgpt_slots_create(body: SlotCreateBody | None = None, _: int = Depends(auth_key_id)):
+    body = body or SlotCreateBody()
+    slot = add_playwright_slot(label=body.label, port=body.port)
+    nudge_scheduler()
+    return {
+        "ok": True,
+        "slot": slot.to_dict(),
+        "pool": get_chatgpt_pool_settings().to_dict(),
+        "profiles": await list_chatgpt_profiles(),
+    }
+
+
+@router.put("/slots/{slot_id}")
+async def chatgpt_slots_update(
+    slot_id: str,
+    body: SlotUpdateBody,
+    _: int = Depends(auth_key_id),
+):
+    try:
+        slot = update_playwright_slot(slot_id, label=body.label, port=body.port)
+    except KeyError:
+        raise HTTPException(404, "slot_not_found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    nudge_scheduler()
+    return {"ok": True, "slot": slot.to_dict(), "profiles": await list_chatgpt_profiles()}
+
+
+@router.delete("/slots/{slot_id}")
+async def chatgpt_slots_delete(slot_id: str, _: int = Depends(auth_key_id)):
+    from flow2api.services.chatgpt_playwright import reset_playwright_browser
+
+    try:
+        settings = remove_playwright_slot(slot_id)
+    except KeyError:
+        raise HTTPException(404, "slot_not_found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await reset_playwright_browser(slot_id)
+    nudge_scheduler()
+    return {
+        "ok": True,
+        "pool": settings.to_dict(),
+        "profiles": await list_chatgpt_profiles(),
+    }
+
+
+@router.post("/slots/{slot_id}/launch")
+async def chatgpt_slots_launch(slot_id: str, _: int = Depends(auth_key_id)):
+    from flow2api.services.chatgpt_playwright import reset_playwright_browser
+
+    result = system_ops.launch_playwright_slot(slot_id)
+    await reset_playwright_browser(slot_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message") or result.get("error") or "launch_failed")
+    nudge_scheduler()
+    return {
+        **result,
+        "profiles": await list_chatgpt_profiles(),
+    }
+
+
+@router.post("/slots/launch-all")
+async def chatgpt_slots_launch_all(_: int = Depends(auth_key_id)):
+    from flow2api.services.chatgpt_playwright import reset_playwright_browser
+
+    result = system_ops.launch_all_playwright_slots()
+    await reset_playwright_browser()
+    nudge_scheduler()
+    return {
+        **result,
+        "profiles": await list_chatgpt_profiles(),
+    }
 
 
 @router.post("/web/chat")
@@ -512,7 +875,6 @@ async def chatgpt_web_chat(
     )
     if async_mode:
         out = enqueue_web_chat(**kwargs)
-        # Dashboard poll path (same job store as /api/v1/chatgpt/chat/{id})
         out["poll_url"] = f"/api/chatgpt/web/chat/{out['id']}"
         return out
     return await run_web_chat(**kwargs)

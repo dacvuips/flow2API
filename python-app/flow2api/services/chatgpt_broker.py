@@ -47,12 +47,13 @@ class PublicChatJob:
     """Job cho API public async — tách khỏi job extension poll."""
 
     job_id: str
-    status: str = "queued"  # queued | running | done | failed
+    status: str = "queued"  # queued | running | done | failed | cancelled
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str | None = None
     result: dict[str, Any] | None = None
     params_summary: dict[str, Any] = field(default_factory=dict)
+    kwargs: dict[str, Any] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -65,6 +66,8 @@ class PublicChatJob:
             "updated_at": self.updated_at,
             "error": self.error,
             "params": self.params_summary,
+            "profile_id": self.params_summary.get("assigned_profile_id")
+            or self.params_summary.get("profile_id"),
         }
         if include_result and self.result is not None:
             out["result"] = self.result
@@ -79,6 +82,7 @@ class ChatgptBroker:
         self._waiters: list[asyncio.Future] = []
         self._public_jobs: dict[str, PublicChatJob] = {}
         self._public_tasks: dict[str, asyncio.Task] = {}
+        self._public_kwargs: dict[str, dict[str, Any]] = {}
 
     def touch_worker(self, worker_id: str, label: str = "") -> None:
         wid = (worker_id or "").strip()
@@ -203,6 +207,7 @@ class ChatgptBroker:
         ]
         for jid in stale:
             self._public_jobs.pop(jid, None)
+            self._public_kwargs.pop(jid, None)
             task = self._public_tasks.pop(jid, None)
             if task and not task.done():
                 task.cancel()
@@ -212,41 +217,120 @@ class ChatgptBroker:
                 (
                     (jid, job)
                     for jid, job in self._public_jobs.items()
-                    if job.status in ("done", "failed")
+                    if job.status in ("done", "failed", "cancelled")
                 ),
                 key=lambda x: x[1].updated_at,
             )
             overflow = len(self._public_jobs) - PUBLIC_JOB_MAX
             for jid, _ in finished[: max(0, overflow)]:
                 self._public_jobs.pop(jid, None)
+                self._public_kwargs.pop(jid, None)
                 self._public_tasks.pop(jid, None)
 
     def _public_params_summary(self, params: dict[str, Any]) -> dict[str, Any]:
         images = params.get("images") or []
+        profile_id = params.get("profile_id")
         return {
             "prompt_preview": str(params.get("prompt") or "")[:120],
             "model": params.get("model"),
             "endpoint": params.get("endpoint"),
-            "profile_id": params.get("profile_id"),
+            "profile_id": profile_id,
+            "assigned_profile_id": params.get("assigned_profile_id") or profile_id,
+            "profile_assigned_by_user": bool(params.get("profile_assigned_by_user")),
             "conversation_id": params.get("conversation_id"),
             "parent_message_id": params.get("parent_message_id"),
             "image_count": len(images) if isinstance(images, list) else 0,
+            "mode": params.get("mode"),
         }
 
-    def create_public_job(self, params: dict[str, Any]) -> PublicChatJob:
+    def create_public_job(
+        self,
+        params: dict[str, Any],
+        *,
+        kwargs: dict[str, Any] | None = None,
+    ) -> PublicChatJob:
         self._purge_public_jobs()
         job_id = str(uuid.uuid4())
+        summary = self._public_params_summary(params)
         job = PublicChatJob(
             job_id=job_id,
             status="queued",
-            params_summary=self._public_params_summary(params),
+            params_summary=summary,
+            kwargs=dict(kwargs or {}),
         )
         self._public_jobs[job_id] = job
+        self._public_kwargs[job_id] = dict(kwargs or {})
         return job
 
     def get_public_job(self, job_id: str) -> PublicChatJob | None:
         self._purge_public_jobs()
         return self._public_jobs.get(job_id)
+
+    def iter_public_jobs(self) -> list[PublicChatJob]:
+        self._purge_public_jobs()
+        return list(self._public_jobs.values())
+
+    def get_public_kwargs(self, job_id: str) -> dict[str, Any] | None:
+        return self._public_kwargs.get(job_id)
+
+    def update_public_params(self, job_id: str, patch: dict[str, Any]) -> PublicChatJob | None:
+        job = self._public_jobs.get(job_id)
+        if not job:
+            return None
+        job.params_summary = {**job.params_summary, **patch}
+        job.touch()
+        kw = self._public_kwargs.get(job_id)
+        if kw is not None and "profile_id" in patch:
+            kw["profile_id"] = patch["profile_id"]
+        return job
+
+    def set_public_profile(self, job_id: str, profile_id: str | None) -> PublicChatJob:
+        job = self.get_public_job(job_id)
+        if not job:
+            raise KeyError("chatgpt_job_not_found")
+        if job.status != "queued":
+            raise ValueError("job_not_queued")
+        pid = (profile_id or "").strip() or None
+        job.params_summary["profile_id"] = pid
+        job.params_summary["assigned_profile_id"] = pid
+        job.params_summary["profile_assigned_by_user"] = bool(pid)
+        job.touch()
+        kw = self._public_kwargs.get(job_id)
+        if kw is not None:
+            kw["profile_id"] = pid
+        return job
+
+    def cancel_public_job(self, job_id: str) -> PublicChatJob:
+        job = self.get_public_job(job_id)
+        if not job:
+            raise KeyError("chatgpt_job_not_found")
+        if job.status in ("done", "failed", "cancelled"):
+            return job
+        task = self._public_tasks.pop(job_id, None)
+        if task and not task.done():
+            task.cancel()
+        job.status = "cancelled"
+        job.error = "cancelled"
+        job.touch()
+        return job
+
+    def list_public_jobs(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        self._purge_public_jobs()
+        jobs = list(self._public_jobs.values())
+        if status and status != "all":
+            want = status.strip().lower()
+            if want == "active":
+                jobs = [j for j in jobs if j.status in ("queued", "running")]
+            else:
+                jobs = [j for j in jobs if j.status == want]
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        limit = max(1, min(200, int(limit or 50)))
+        return [j.to_dict(include_result=False) for j in jobs[:limit]]
 
     def mark_public_running(self, job_id: str) -> None:
         job = self._public_jobs.get(job_id)
@@ -264,6 +348,9 @@ class ChatgptBroker:
     ) -> None:
         job = self._public_jobs.get(job_id)
         if not job:
+            return
+        if job.status == "cancelled":
+            self._public_tasks.pop(job_id, None)
             return
         if error:
             job.status = "failed"
@@ -284,7 +371,7 @@ class ChatgptBroker:
             if t.cancelled():
                 job = self._public_jobs.get(job_id)
                 if job and job.status in ("queued", "running"):
-                    job.status = "failed"
+                    job.status = "cancelled"
                     job.error = "cancelled"
                     job.touch()
             else:
@@ -308,6 +395,9 @@ class ChatgptBroker:
             "public_jobs": len(self._public_jobs),
             "public_running": sum(
                 1 for j in self._public_jobs.values() if j.status in ("queued", "running")
+            ),
+            "public_queued": sum(
+                1 for j in self._public_jobs.values() if j.status == "queued"
             ),
         }
 

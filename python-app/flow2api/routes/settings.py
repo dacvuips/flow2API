@@ -37,9 +37,77 @@ class AutostartBody(BaseModel):
     enabled: bool
 
 
+class ChatgptSettingsBody(BaseModel):
+    call_delay_s: float | None = None
+    transport: str | None = None
+    cdp_url: str | None = None
+    chrome_profile: str | None = None
+    chrome_user_data_dir: str | None = None
+    use_system_chrome_profile: bool | None = None
+    headless: bool | None = None
+
+
 @router.get("/config")
 async def get_config(_: int = Depends(auth_key_id)):
     return system_ops.public_config()
+
+
+@router.post("/chatgpt")
+async def save_chatgpt_settings(body: ChatgptSettingsBody, _: int = Depends(auth_key_id)):
+    current = system_ops.chatgpt_config()
+    patch: dict[str, Any] = {}
+    if body.call_delay_s is not None:
+        patch["call_delay_s"] = max(0.0, min(600.0, float(body.call_delay_s)))
+    if body.transport is not None:
+        t = str(body.transport).strip().lower()
+        if t not in ("playwright", "extension"):
+            raise HTTPException(400, "transport must be playwright or extension")
+        patch["transport"] = t
+    if body.cdp_url is not None:
+        patch["cdp_url"] = str(body.cdp_url).strip()
+    if body.chrome_profile is not None:
+        patch["chrome_profile"] = str(body.chrome_profile).strip() or "Default"
+    if body.chrome_user_data_dir is not None:
+        patch["chrome_user_data_dir"] = str(body.chrome_user_data_dir).strip()
+    if body.use_system_chrome_profile is not None:
+        patch["use_system_chrome_profile"] = bool(body.use_system_chrome_profile)
+    if body.headless is not None:
+        patch["headless"] = bool(body.headless)
+    if not patch:
+        return {"ok": True, "chatgpt": current}
+    # drop runtime-only list before save
+    to_save = {k: v for k, v in {**current, **patch}.items() if k != "chrome_profiles"}
+    system_ops.save_config({"chatgpt": to_save})
+    return {"ok": True, "chatgpt": system_ops.chatgpt_config(), "message": "Đã lưu cấu hình Chat GPT"}
+
+
+class LaunchPlaywrightChromeBody(BaseModel):
+    profile: str | None = None
+    port: int | None = 9222
+    use_system_profile: bool | None = None
+
+
+@router.post("/chatgpt/launch-chrome")
+async def launch_chatgpt_chrome(body: LaunchPlaywrightChromeBody | None = None, _: int = Depends(auth_key_id)):
+    """Open all Playwright CDP slots (or legacy single launch)."""
+    body = body or LaunchPlaywrightChromeBody()
+    from flow2api.services.chatgpt_playwright import reset_playwright_browser
+
+    # Prefer multi-slot launch
+    result = system_ops.launch_all_playwright_slots()
+    await reset_playwright_browser()
+    if result.get("launched"):
+        return result
+    # Fallback legacy single
+    result = system_ops.launch_chrome_for_playwright(
+        profile=body.profile,
+        port=int(body.port or 9222),
+        use_system_profile=body.use_system_profile,
+    )
+    await reset_playwright_browser()
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message") or result.get("error") or "chrome_launch_failed")
+    return result
 
 
 @router.post("/telegram")
