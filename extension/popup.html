@@ -235,83 +235,6 @@
       cursor: pointer;
     }
 
-    .cgpt-list {
-      max-height: 168px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #fff;
-      font-size: 11px;
-    }
-    .cgpt-row {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      padding: 7px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    .cgpt-row:last-child { border-bottom: 0; }
-    .cgpt-name { font-weight: 700; color: var(--text); word-break: break-all; }
-    .cgpt-meta { color: var(--muted); margin-top: 2px; }
-    .cgpt-val { color: var(--soft); text-align: right; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .cgpt-flags { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 10px; }
-    .cgpt-flag {
-      font-size: 10px;
-      font-weight: 700;
-      padding: 3px 7px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      color: var(--muted);
-      background: var(--panel-soft);
-    }
-    .cgpt-flag.on { color: var(--green); border-color: #bbf7d0; background: #f0fdf4; }
-    .cgpt-flag.off { color: var(--red); border-color: #fecdd3; background: #fff1f2; }
-    .cgpt-chat-box {
-      margin-top: 14px;
-      padding-top: 12px;
-      border-top: 1px solid var(--line);
-    }
-    .cgpt-chat-box .section-title { margin-bottom: 6px; }
-    .cgpt-chat-input {
-      width: 100%;
-      min-height: 64px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px 10px;
-      font: 600 12px/1.4 ui-sans-serif, system-ui, sans-serif;
-      color: var(--text);
-      background: #fff;
-      box-sizing: border-box;
-    }
-    .cgpt-endpoint {
-      width: 100%;
-      height: 32px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 0 10px;
-      font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      color: var(--text);
-      background: #fff;
-      box-sizing: border-box;
-      margin-bottom: 8px;
-    }
-    .cgpt-reply {
-      margin-top: 8px;
-      max-height: 160px;
-      overflow: auto;
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: #f8fafc;
-      border: 1px solid var(--line);
-      white-space: pre-wrap;
-      word-break: break-word;
-      font: 500 12px/1.45 ui-sans-serif, system-ui, sans-serif;
-      color: var(--text);
-      display: none;
-    }
-    .cgpt-reply.on { display: block; }
-
     .toggle {
       position: relative;
       display: inline-flex;
@@ -375,7 +298,6 @@
     <nav class="tab-nav" role="tablist">
       <button type="button" class="tab-btn active" data-tab="status" role="tab" aria-selected="true">Trạng thái</button>
       <button type="button" class="tab-btn" data-tab="mode" role="tab" aria-selected="false">Chế độ</button>
-      <button type="button" class="tab-btn" data-tab="chatgpt" role="tab" aria-selected="false">Chat GPT</button>
     </nav>
 
     <div id="tabStatus" class="tab-panel active" role="tabpanel">
@@ -476,48 +398,6 @@
             <div class="cs"><div class="n" id="cs-poll">—</div><div class="l">LAST POLL</div></div>
             <div class="cs"><div class="n" id="cs-online">—</div><div class="l">CENTERS ONLINE</div></div>
           </div>
-        </div>
-      </div>
-    </div>
-
-    <div id="tabChatgpt" class="tab-panel" role="tabpanel" hidden>
-      <div class="mode-panel">
-        <p class="section-title" style="margin: 0 0 6px;">Cookie chatgpt.com</p>
-        <p class="hint" id="cgpt-hint">Chỉ đọc cookie (ẩn giá trị). Đăng nhập chatgpt.com trên Chrome profile này trước.</p>
-        <div class="row">
-          <span class="label">Trạng thái</span>
-          <span class="value" id="cgpt-login">—</span>
-        </div>
-        <div class="row">
-          <span class="label">Tài khoản</span>
-          <span class="value" id="cgpt-account">—</span>
-        </div>
-        <div class="row">
-          <span class="label">oai-did</span>
-          <span class="value" id="cgpt-did">—</span>
-        </div>
-        <div class="row">
-          <span class="label">Số cookie</span>
-          <span class="value" id="cgpt-count">0</span>
-        </div>
-        <div class="cgpt-flags" id="cgpt-flags"></div>
-        <div class="cgpt-list" id="cgpt-list"></div>
-        <div class="actions" style="margin-top: 12px;">
-          <button type="button" class="btn btn-primary" id="btn-cgpt-refresh">Làm mới</button>
-          <button type="button" class="btn btn-stop" id="btn-cgpt-open">Mở ChatGPT</button>
-        </div>
-
-        <div class="cgpt-chat-box">
-          <p class="section-title">Gửi conversation</p>
-          <p class="hint" id="cgpt-chat-hint">Gọi POST endpoint bên dưới (cookie + Bearer lấy từ session profile này).</p>
-          <input class="cgpt-endpoint" id="cgpt-endpoint" type="text" spellcheck="false"
-            value="/backend-api/f/conversation"
-            placeholder="/backend-api/f/conversation hoặc https://chatgpt.com/..."/>
-          <textarea class="cgpt-chat-input" id="cgpt-prompt" rows="3" placeholder="Nhập prompt…"></textarea>
-          <div class="actions" style="margin-top: 8px;">
-            <button type="button" class="btn btn-primary" id="btn-cgpt-send">Gửi</button>
-          </div>
-          <div class="cgpt-reply" id="cgpt-reply"></div>
         </div>
       </div>
     </div>

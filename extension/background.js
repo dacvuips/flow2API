@@ -19,13 +19,6 @@ try {
   console.error('[Flow2API] importScripts(center-loop.js) failed:', e);
 }
 
-// ChatGPT session cookies + conversation client (/backend-api/…).
-try {
-  importScripts('chatgpt.js');
-} catch (e) {
-  console.error('[Flow2API] importScripts(chatgpt.js) failed:', e);
-}
-
 const AGENT_WS_URL  = 'ws://127.0.0.1:1609';
 const CALLBACK_URL  = 'http://127.0.0.1:1994/api/ext/callback';
 const TOKEN_SOFT_MAX_AGE_MS = 5 * 60 * 1000;
@@ -470,13 +463,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'reconnect') connectToAgent();
   if (alarm.name === 'keepAlive') keepAlive();
   if (alarm.name === 'flowWatchdog') runFlowWatchdog();
-  if (alarm.name === 'f2api-chatgpt-poll') {
-    try {
-      self.ChatGPTExt?.startPollLoop?.();
-    } catch {
-      /* ignore */
-    }
-  }
 });
 
 async function getOrCreateProfileId() {
@@ -495,13 +481,6 @@ async function getExtensionMode() {
 async function init() {
   const mode = await getExtensionMode();
   console.log('[Flow2API] Extension mode =', mode);
-
-  // ChatGPT dashboard jobs: HTTP long-poll (không phụ thuộc Bridge WS).
-  try {
-    self.ChatGPTExt?.startPollLoop?.();
-  } catch (e) {
-    console.warn('[Flow2API] chatgpt poll start failed:', e?.message || e);
-  }
 
   if (mode === 'center') {
     // Center: chỉ chạy long-poll broker, không WS Bridge / không proxy.
@@ -782,66 +761,6 @@ function connectToAgent() {
             metrics,
           },
         });
-      } else if (msg.method === 'chatgpt_session_status') {
-        const api = self.ChatGPTExt;
-        if (!api?.getChatgptCookieStatus) {
-          sendToAgent({ id: msg.id, status: 503, error: 'chatgpt_module_unavailable' });
-        } else {
-          try {
-            const status = await api.getChatgptCookieStatus();
-            sendToAgent({ id: msg.id, status: 200, data: status });
-          } catch (e) {
-            sendToAgent({
-              id: msg.id,
-              status: 500,
-              error: e?.message || String(e),
-              data: { ok: false, error: e?.message || String(e) },
-            });
-          }
-        }
-      } else if (msg.method === 'chatgpt_send') {
-        const api = self.ChatGPTExt;
-        if (!api?.sendConversation) {
-          sendToAgent({ id: msg.id, status: 503, error: 'chatgpt_module_unavailable' });
-        } else {
-          try {
-            const p = msg.params || {};
-            const result = await api.sendConversation({
-              prompt: p.prompt,
-              endpoint: p.endpoint,
-              model: p.model,
-              accessToken: p.accessToken,
-              requirementsToken: p.requirementsToken,
-              proofToken: p.proofToken,
-              turnstileToken: p.turnstileToken,
-              conduitToken: p.conduitToken,
-              conversationId: p.conversationId,
-              parentMessageId: p.parentMessageId,
-              images: p.images,
-              filesEndpoint: p.filesEndpoint,
-              extraHeaders: p.extraHeaders,
-              extraPayload: p.extraPayload,
-              systemHints: p.systemHints || p.system_hints,
-              mode: p.mode || p.chatMode || p.chat_mode,
-              picture: p.picture,
-              picture_v2: p.picture_v2,
-              thinkingEffort: p.thinkingEffort || p.thinking_effort,
-            });
-            sendToAgent({
-              id: msg.id,
-              status: result?.ok ? 200 : 502,
-              data: result,
-              error: result?.ok ? undefined : (result?.error || 'chatgpt_send_failed'),
-            });
-          } catch (e) {
-            sendToAgent({
-              id: msg.id,
-              status: 500,
-              error: e?.message || String(e),
-              data: { ok: false, error: e?.message || String(e) },
-            });
-          }
-        }
       }
     } catch (e) {
       console.error('[Flow2API] Message error:', e);
@@ -1853,61 +1772,6 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     ensureFreshFlowToken('popup', true)
       .then((ok) => reply({ ok }))
       .catch((e) => reply({ error: e.message }));
-    return true;
-  }
-
-  if (msg.type === 'CHATGPT_COOKIE_STATUS') {
-    const api = self.ChatGPTExt;
-    if (!api?.getChatgptCookieStatus) {
-      reply({ ok: false, error: 'chatgpt_module_unavailable' });
-      return true;
-    }
-    api.getChatgptCookieStatus()
-      .then((status) => reply(status))
-      .catch((e) => reply({ ok: false, error: e?.message || String(e) }));
-    return true;
-  }
-
-  if (msg.type === 'CHATGPT_OPEN_TAB') {
-    const api = self.ChatGPTExt;
-    if (!api?.openChatgptTab) {
-      reply({ ok: false, error: 'chatgpt_module_unavailable' });
-      return true;
-    }
-    api.openChatgptTab()
-      .then((result) => reply(result))
-      .catch((e) => reply({ ok: false, error: e?.message || String(e) }));
-    return true;
-  }
-
-  if (msg.type === 'CHATGPT_SEND') {
-    const api = self.ChatGPTExt;
-    if (!api?.sendConversation) {
-      reply({ ok: false, error: 'chatgpt_module_unavailable' });
-      return true;
-    }
-    api.sendConversation({
-      prompt: msg.prompt,
-      endpoint: msg.endpoint,
-      model: msg.model,
-      accessToken: msg.accessToken,
-      requirementsToken: msg.requirementsToken,
-      proofToken: msg.proofToken,
-      turnstileToken: msg.turnstileToken,
-      conduitToken: msg.conduitToken,
-      conversationId: msg.conversationId,
-      parentMessageId: msg.parentMessageId,
-      images: msg.images,
-      extraHeaders: msg.extraHeaders,
-      extraPayload: msg.extraPayload,
-      systemHints: msg.systemHints || msg.system_hints,
-      mode: msg.mode || msg.chatMode || msg.chat_mode,
-      picture: msg.picture,
-      picture_v2: msg.picture_v2,
-      thinkingEffort: msg.thinkingEffort || msg.thinking_effort,
-    })
-      .then((result) => reply(result))
-      .catch((e) => reply({ ok: false, error: e?.message || String(e) }));
     return true;
   }
 
