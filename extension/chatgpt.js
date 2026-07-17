@@ -8,9 +8,10 @@ const CHATGPT_DOMAINS = ['chatgpt.com', '.chatgpt.com'];
 const CHATGPT_URLS = [`${CHATGPT_ORIGIN}/`, CHATGPT_ORIGIN];
 
 const DEFAULT_CONVERSATION_PATH = '/backend-api/f/conversation';
+const DEFAULT_PREPARE_PATH = '/backend-api/f/conversation/prepare';
 const DEFAULT_MODEL = 'gpt-5-5';
-const DEFAULT_CLIENT_VERSION = 'prod-81b695379309b67344b31fc2b695f6f307dc34bb';
-const DEFAULT_BUILD_NUMBER = '8250038';
+const DEFAULT_CLIENT_VERSION = 'prod-e8f67765f24e1c6773b4b61b4310d5ff9297439a';
+const DEFAULT_BUILD_NUMBER = '8338682';
 
 const IMPORTANT_COOKIES = [
   '__Secure-next-auth.session-token',
@@ -229,6 +230,104 @@ async function getChatRequirements(accessToken, cookies, deviceId) {
     throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
   }
   return data;
+}
+
+/**
+ * Pre-warm turn via /backend-api/f/conversation/prepare (web does this before submit).
+ * Returns conduit_token used as x-conduit-token on the real conversation POST.
+ */
+async function prepareConversation(opts = {}) {
+  const prompt = String(opts.prompt || '').trim();
+  const accessToken = opts.accessToken;
+  const cookies = opts.cookies || (await getChatgptCookies());
+  const deviceId = opts.deviceId || pickCookie(cookies, 'oai-did')?.value || uuid();
+  const sessionId = opts.sessionId || uuid();
+  const model = opts.model || DEFAULT_MODEL;
+  const parentMessageId = opts.parentMessageId || 'client-created-root';
+  const systemHints = normalizeSystemHints(opts);
+  const preparePath = opts.prepareEndpoint || DEFAULT_PREPARE_PATH;
+  const turnTraceId = opts.turnTraceId || uuid();
+
+  const partialContent = opts.partialContent || {
+    content_type: 'text',
+    parts: [prompt || ''],
+  };
+
+  const body = {
+    action: 'next',
+    parent_message_id: parentMessageId,
+    model,
+    client_prepare_state: 'success',
+    client_prepare_dispatch: 'immediate',
+    client_prepare_source: opts.prepareSource || 'context_change',
+    timezone_offset_min: opts.timezoneOffsetMin ?? -new Date().getTimezoneOffset(),
+    timezone: opts.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Bangkok',
+    conversation_mode: { kind: 'primary_assistant' },
+    system_hints: systemHints,
+    partial_query: {
+      id: opts.messageId || uuid(),
+      author: { role: 'user' },
+      content: partialContent,
+    },
+    supports_buffering: true,
+    supported_encodings: ['v1'],
+    client_contextual_info: {
+      app_name: 'chatgpt.com',
+      has_web_push_capabilities: true,
+      web_push_notification_permission: 'default',
+    },
+    ...(systemHints.includes('picture_v2')
+      || String(model).includes('thinking')
+      ? { thinking_effort: opts.thinkingEffort || opts.thinking_effort || 'standard' }
+      : {}),
+    ...(opts.conversationId ? { conversation_id: opts.conversationId } : {}),
+  };
+
+  const headers = {
+    Accept: '*/*',
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${accessToken}`,
+    Origin: CHATGPT_ORIGIN,
+    Referer: `${CHATGPT_ORIGIN}/`,
+    'oai-device-id': deviceId,
+    'oai-language': opts.language || 'vi-VN',
+    'oai-session-id': sessionId,
+    'oai-client-version': opts.clientVersion || DEFAULT_CLIENT_VERSION,
+    'oai-client-build-number': opts.buildNumber || DEFAULT_BUILD_NUMBER,
+    'x-openai-target-path': preparePath,
+    'x-openai-target-route': preparePath,
+    'x-oai-turn-trace-id': turnTraceId,
+    ...(opts.conduitToken ? { 'x-conduit-token': opts.conduitToken } : {}),
+    ...(opts.requirementsToken
+      ? { 'openai-sentinel-chat-requirements-token': opts.requirementsToken }
+      : {}),
+    ...(opts.extraHeaders && typeof opts.extraHeaders === 'object' ? opts.extraHeaders : {}),
+  };
+
+  const { resp } = await chatgptFetch(preparePath, {
+    method: 'POST',
+    headers,
+    body,
+    cookies,
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const detail = data?.detail || data?.error || `prepare_http_${resp.status}`;
+    return {
+      ok: false,
+      error: typeof detail === 'string' ? detail : JSON.stringify(detail),
+      status: resp.status,
+      raw: data,
+    };
+  }
+  const conduitToken = data?.conduit_token || data?.conduitToken || null;
+  return {
+    ok: String(data?.status || '').toLowerCase() === 'ok' || !!conduitToken,
+    status: data?.status || 'ok',
+    conduitToken,
+    turnTraceId,
+    raw: data,
+  };
 }
 
 function guessMimeFromName(name) {
@@ -1367,6 +1466,47 @@ async function sendConversation(opts = {}) {
     picture_v2: opts.picture_v2,
   });
   const isPictureMode = systemHints.includes('picture_v2');
+  const turnTraceId = opts.turnTraceId || uuid();
+
+  // Web always POSTs /conversation/prepare first to mint x-conduit-token.
+  let conduitToken = opts.conduitToken || null;
+  let prepareError = null;
+  if (opts.skipPrepare !== true) {
+    try {
+      const prepared = await prepareConversation({
+        prompt,
+        accessToken,
+        cookies,
+        deviceId,
+        sessionId,
+        model: payload.model,
+        conversationId: opts.conversationId,
+        parentMessageId: opts.parentMessageId || payload.parent_message_id,
+        messageId: payload.messages?.[0]?.id,
+        systemHints,
+        mode: opts.mode || opts.chatMode || opts.chat_mode,
+        picture: opts.picture,
+        picture_v2: opts.picture_v2,
+        thinkingEffort: opts.thinkingEffort || opts.thinking_effort,
+        timezone: opts.timezone,
+        timezoneOffsetMin: opts.timezoneOffsetMin,
+        clientVersion: opts.clientVersion,
+        buildNumber: opts.buildNumber,
+        requirementsToken,
+        conduitToken,
+        turnTraceId,
+        language: opts.language,
+        extraHeaders: opts.extraHeaders,
+      });
+      if (prepared?.conduitToken) {
+        conduitToken = prepared.conduitToken;
+      } else if (!prepared?.ok) {
+        prepareError = prepared?.error || 'prepare_failed';
+      }
+    } catch (e) {
+      prepareError = e?.message || String(e);
+    }
+  }
 
   const headers = {
     Accept: 'text/event-stream',
@@ -1375,12 +1515,13 @@ async function sendConversation(opts = {}) {
     Origin: CHATGPT_ORIGIN,
     Referer: `${CHATGPT_ORIGIN}/`,
     'oai-device-id': deviceId,
-    'oai-language': 'en-US',
+    'oai-language': opts.language || 'vi-VN',
     'oai-session-id': sessionId,
     'oai-client-version': opts.clientVersion || DEFAULT_CLIENT_VERSION,
     'oai-client-build-number': opts.buildNumber || DEFAULT_BUILD_NUMBER,
     'x-openai-target-path': new URL(endpoint).pathname,
     'x-openai-target-route': new URL(endpoint).pathname,
+    'x-oai-turn-trace-id': turnTraceId,
     ...(requirementsToken
       ? { 'openai-sentinel-chat-requirements-token': requirementsToken }
       : {}),
@@ -1388,7 +1529,7 @@ async function sendConversation(opts = {}) {
     ...(opts.turnstileToken
       ? { 'openai-sentinel-turnstile-token': opts.turnstileToken }
       : {}),
-    ...(opts.conduitToken ? { 'x-conduit-token': opts.conduitToken } : {}),
+    ...(conduitToken ? { 'x-conduit-token': conduitToken } : {}),
     ...(opts.extraHeaders && typeof opts.extraHeaders === 'object' ? opts.extraHeaders : {}),
   };
 
@@ -1422,6 +1563,7 @@ async function sendConversation(opts = {}) {
       uploadedImages,
       images: [],
       files: [],
+      prepareError,
       requirementsError: typeof requirementsError !== 'undefined' ? requirementsError : null,
     };
   }
@@ -1485,6 +1627,8 @@ async function sendConversation(opts = {}) {
       endpoint,
       model: payload.model,
       systemHints,
+      conduitToken,
+      prepareError,
       uploadedImages,
       images: resolved.images,
       files: resolved.files,
@@ -1613,6 +1757,7 @@ self.ChatGPTExt = {
   openChatgptTab,
   getAccessToken,
   getChatRequirements,
+  prepareConversation,
   uploadImage,
   buildConversationPayload,
   normalizeSystemHints,
@@ -1620,5 +1765,6 @@ self.ChatGPTExt = {
   startPollLoop,
   stopPollLoop,
   DEFAULT_CONVERSATION_PATH,
+  DEFAULT_PREPARE_PATH,
   CHATGPT_ORIGIN,
 };

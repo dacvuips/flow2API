@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Flow2API — Bridge (proxy API + inject captcha) hoặc Captcha Center (mint reCAPTCHA cho pool profiles). Chọn mode ở popup.",
   "permissions": [
     "storage",
