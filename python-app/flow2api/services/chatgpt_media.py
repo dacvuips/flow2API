@@ -118,6 +118,32 @@ def persist_chatgpt_result_media(job_id: str, result: dict[str, Any] | None) -> 
     return out
 
 
+def persist_chatgpt_request_images(
+    job_id: str, images: list[Any] | None
+) -> list[dict[str, Any]]:
+    """Persist request/upload images so job list + detail can show input previews."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return []
+    items: list[dict[str, Any]] = []
+    for img in images or []:
+        if isinstance(img, dict):
+            data = str(img.get("data") or img.get("base64") or "").strip()
+            if not data:
+                continue
+            items.append(
+                {
+                    "data": data,
+                    "fileName": img.get("fileName") or img.get("file_name") or "upload.jpg",
+                    "mimeType": img.get("mimeType") or img.get("mime_type"),
+                    "kind": "request",
+                }
+            )
+        elif isinstance(img, str) and img.strip():
+            items.append({"data": img.strip(), "fileName": "upload.jpg", "kind": "request"})
+    return _persist_asset_list(jid, items, kind="request")
+
+
 def sanitize_chatgpt_result_for_poll(result: dict[str, Any] | None) -> dict[str, Any] | None:
     """Ensure no data: URLs leak into poll JSON (defense in depth)."""
     if result is None:
@@ -146,7 +172,13 @@ def resolve_chatgpt_media_path(job_id: str, kind: str, index: int) -> Path | Non
     root = chatgpt_media_dir(job_id)
     if not root.is_dir():
         return None
-    kind = "file" if str(kind).lower() == "file" else "image"
+    raw = str(kind or "image").lower()
+    if raw == "file":
+        kind = "file"
+    elif raw in ("request", "input"):
+        kind = "request"
+    else:
+        kind = "image"
     idx = max(0, int(index))
     matches = sorted(root.glob(f"{kind}-{idx}.*"))
     if matches:

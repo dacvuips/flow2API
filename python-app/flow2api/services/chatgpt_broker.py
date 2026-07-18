@@ -230,8 +230,13 @@ class ChatgptBroker:
     def _public_params_summary(self, params: dict[str, Any]) -> dict[str, Any]:
         images = params.get("images") or []
         profile_id = params.get("profile_id")
+        prompt = str(params.get("prompt") or "")
+        preview_urls = params.get("input_preview_urls") or []
+        if not isinstance(preview_urls, list):
+            preview_urls = []
         out = {
-            "prompt_preview": str(params.get("prompt") or "")[:120],
+            "prompt": prompt,
+            "prompt_preview": prompt[:200],
             "model": params.get("model"),
             "endpoint": params.get("endpoint"),
             "profile_id": profile_id,
@@ -240,6 +245,7 @@ class ChatgptBroker:
             "conversation_id": params.get("conversation_id"),
             "parent_message_id": params.get("parent_message_id"),
             "image_count": len(images) if isinstance(images, list) else 0,
+            "input_preview_urls": [str(u) for u in preview_urls if u][:12],
             "mode": params.get("mode"),
         }
         tid = str(params.get("tab_id") or "").strip()

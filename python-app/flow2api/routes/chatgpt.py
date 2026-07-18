@@ -16,6 +16,7 @@ from flow2api.services import system_ops
 from flow2api.services.api_auth import auth_key_id
 from flow2api.services.chatgpt_broker import get_chatgpt_broker
 from flow2api.services.chatgpt_media import (
+    persist_chatgpt_request_images,
     persist_chatgpt_result_media,
     resolve_chatgpt_media_path,
     sanitize_chatgpt_result_for_poll,
@@ -507,6 +508,23 @@ def enqueue_web_chat(
         },
         kwargs=kwargs,
     )
+    # Persist request images for dashboard list/detail (prompt + input thumbs)
+    if norm_images:
+        previews = persist_chatgpt_request_images(job.job_id, norm_images)
+        urls = [
+            str(p.get("url") or p.get("download_url") or "")
+            for p in previews
+            if isinstance(p, dict) and (p.get("url") or p.get("download_url"))
+        ]
+        broker.update_public_params(
+            job.job_id,
+            {
+                "prompt": prompt,
+                "prompt_preview": prompt[:200],
+                "image_count": len(norm_images),
+                "input_preview_urls": urls[:12],
+            },
+        )
     ensure_scheduler_started()
     nudge_scheduler()
     logger.info(
@@ -551,6 +569,52 @@ def public_job_payload(job_id: str) -> dict[str, Any]:
         ):
             if key in safe_result and key not in payload:
                 payload[key] = safe_result[key]
+
+    # Request payload for dashboard detail (full prompt + input images)
+    params = job.params_summary or {}
+    kwargs = broker.get_public_kwargs(job_id) or {}
+    prompt = str(kwargs.get("prompt") or params.get("prompt") or params.get("prompt_preview") or "")
+    request_images: list[dict[str, Any]] = []
+    for url in params.get("input_preview_urls") or []:
+        u = str(url or "").strip()
+        if u:
+            request_images.append({"url": u, "download_url": u, "kind": "request"})
+    if not request_images:
+        for img in kwargs.get("images") or []:
+            if isinstance(img, dict):
+                src = str(img.get("data") or img.get("url") or img.get("download_url") or "").strip()
+                if not src:
+                    continue
+                entry: dict[str, Any] = {"kind": "request"}
+                if src.startswith("data:"):
+                    entry["data"] = src
+                else:
+                    entry["url"] = src
+                    entry["download_url"] = src
+                if img.get("fileName") or img.get("file_name"):
+                    entry["file_name"] = img.get("fileName") or img.get("file_name")
+                request_images.append(entry)
+            elif isinstance(img, str) and img.strip():
+                src = img.strip()
+                entry = {"kind": "request"}
+                if src.startswith("data:"):
+                    entry["data"] = src
+                else:
+                    entry["url"] = src
+                    entry["download_url"] = src
+                request_images.append(entry)
+    payload["request"] = {
+        "prompt": prompt,
+        "images": request_images[:12],
+        "image_count": int(params.get("image_count") or len(request_images) or 0),
+    }
+    # Ensure list-style params also expose full prompt for UI
+    if isinstance(payload.get("params"), dict):
+        payload["params"] = {
+            **payload["params"],
+            "prompt": prompt or payload["params"].get("prompt") or "",
+            "prompt_preview": (prompt or payload["params"].get("prompt_preview") or "")[:200],
+        }
     return payload
 
 
