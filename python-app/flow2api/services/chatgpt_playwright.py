@@ -1318,13 +1318,15 @@ async def _fill_prompt(page, prompt: str) -> None:
 
 async def _find_enabled_send(page):
     """Locate the black up-arrow send button (not mic / not disabled)."""
-    # Role-based first (most stable across UI redesigns)
     for name in ("Send prompt", "Send message", "Send", "Gửi"):
         try:
-            loc = page.get_by_role("button", name=name).first
+            loc = page.get_by_role("button", name=re.compile(rf"^{re.escape(name)}$", re.I)).first
             if await loc.count() > 0 and await loc.is_visible():
                 disabled = await loc.get_attribute("disabled")
                 aria = await loc.get_attribute("aria-disabled")
+                label = ((await loc.get_attribute("aria-label")) or "").lower()
+                if any(x in label for x in ("dictat", "voice", "microphone", "speech")):
+                    continue
                 if disabled is None and aria not in ("true", "True"):
                     return loc
         except Exception:
@@ -1332,12 +1334,14 @@ async def _find_enabled_send(page):
     for sel in _SEND_SELECTORS:
         try:
             loc = page.locator(sel).first
-            if await loc.count() == 0:
-                continue
-            if not await loc.is_visible():
+            if await loc.count() == 0 or not await loc.is_visible():
                 continue
             disabled = await loc.get_attribute("disabled")
             aria = await loc.get_attribute("aria-disabled")
+            label = ((await loc.get_attribute("aria-label")) or "").lower()
+            testid = ((await loc.get_attribute("data-testid")) or "").lower()
+            if any(x in label or x in testid for x in ("dictat", "voice", "microphone", "speech")):
+                continue
             if disabled is not None or aria in ("true", "True"):
                 continue
             return loc
@@ -1346,8 +1350,67 @@ async def _find_enabled_send(page):
     return None
 
 
-async def _click_send(page) -> None:
-    # Wait until send button becomes enabled after composer text settles
+async def _js_click_send(page) -> bool:
+    """Direct DOM click on composer send arrow — most reliable for ChatGPT redesign."""
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                  const root = document.querySelector('form[data-type="unified-composer"]')
+                    || document.querySelector('form')
+                    || document.body;
+                  const buttons = [...root.querySelectorAll('button')];
+                  const labelOf = (el) =>
+                    ((el.getAttribute('aria-label') || '') + ' '
+                      + (el.getAttribute('data-testid') || '') + ' '
+                      + (el.title || '')).toLowerCase();
+                  const bad = (el) =>
+                    el.disabled
+                    || el.getAttribute('aria-disabled') === 'true'
+                    || /dictat|microphone|voice|speech|attach|upload|plus|medium|model/.test(labelOf(el));
+                  const isSend = (el) => {
+                    const t = labelOf(el);
+                    return el.getAttribute('data-testid') === 'send-button'
+                      || /send prompt|send message|^send$|gửi/.test(t);
+                  };
+                  let hit = buttons.find(b => isSend(b) && !bad(b));
+                  if (!hit) {
+                    // rightmost small enabled button in composer (black up-arrow)
+                    const cands = buttons
+                      .filter(b => !bad(b))
+                      .map(b => ({b, r: b.getBoundingClientRect()}))
+                      .filter(x => x.r.width >= 24 && x.r.height >= 24 && x.r.width <= 64)
+                      .sort((a, c) => c.r.right - a.r.right);
+                    hit = cands[0] && isSend(cands[0].b) ? cands[0].b
+                      : (cands.find(x => isSend(x.b)) || {}).b
+                      || null;
+                    // If still none, take rightmost circular toolbar btn that is not mic
+                    if (!hit && cands.length) hit = cands[0].b;
+                  }
+                  if (!hit) return false;
+                  hit.focus();
+                  hit.click();
+                  return true;
+                }"""
+            )
+        )
+    except Exception as exc:
+        logger.warning("js click send failed: %s", exc)
+        return False
+
+
+async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) -> None:
+    # After long prompt (+ image) ChatGPT needs a few seconds before up-arrow accepts click.
+    wait_s = max(5.0, float(settle_s or 0)) + (2.0 if has_images else 0.0)
+    logger.info("waiting %.1fs before clicking send arrow (images=%s)", wait_s, has_images)
+    await asyncio.sleep(wait_s)
+
+    if has_images:
+        try:
+            await _wait_uploads_ready(page, 1, max_wait_s=30.0)
+        except Exception:
+            pass
+
     deadline = time.time() + 25
     send = None
     last_err: Exception | None = None
@@ -1355,53 +1418,55 @@ async def _click_send(page) -> None:
         try:
             send = await _find_enabled_send(page)
             if send is not None:
-                break
+                await asyncio.sleep(0.6)
+                if await _find_enabled_send(page) is not None:
+                    break
+                send = None
         except Exception as exc:
             last_err = exc
         await asyncio.sleep(0.25)
 
-    if send is None:
-        # Fallback: Enter in composer (ChatGPT often binds Enter=send)
+    logger.info("clicking ChatGPT send arrow…")
+
+    # 1) JS click inside composer (most reliable with image + long prompt)
+    if await _js_click_send(page):
+        logger.info("send arrow clicked (js composer)")
+        await asyncio.sleep(0.4)
+        return
+
+    if send is not None:
         try:
-            box = page.locator("#prompt-textarea, [data-testid='prompt-textarea'], div.ProseMirror[contenteditable='true']").first
-            await box.click(timeout=3000)
-            await page.keyboard.press("Enter")
-            logger.warning("send-button not found — pressed Enter fallback (%s)", last_err)
+            await send.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            await send.click(timeout=8000)
+            logger.info("send arrow clicked (normal)")
             return
         except Exception as exc:
-            raise TimeoutError(
-                f"send_button_not_found — Không thấy nút mũi tên gửi. "
-                f"Composer text={await _read_composer_text(page)!r:.80}. ({exc or last_err})"
-            ) from exc
+            last_err = exc
+            logger.warning("send click failed, retry force: %s", exc)
+        try:
+            await send.click(timeout=5000, force=True)
+            logger.info("send arrow clicked (force)")
+            return
+        except Exception as exc:
+            last_err = exc
 
-    # Try normal click, then force, then JS click, then Enter
+    # Fallback: Enter in composer
     try:
-        await send.scroll_into_view_if_needed(timeout=3000)
-    except Exception:
-        pass
-    try:
-        await send.click(timeout=8000)
-        return
-    except Exception as exc:
-        last_err = exc
-        logger.warning("send click failed, retry force: %s", exc)
-    try:
-        await send.click(timeout=5000, force=True)
-        return
-    except Exception as exc:
-        last_err = exc
-        logger.warning("send force-click failed, try JS click: %s", exc)
-    try:
-        await send.evaluate("el => el.click()")
-        return
-    except Exception as exc:
-        last_err = exc
-    try:
+        box = page.locator(
+            "#prompt-textarea, [data-testid='prompt-textarea'], div.ProseMirror[contenteditable='true']"
+        ).first
+        await box.click(timeout=3000)
         await page.keyboard.press("Enter")
-        logger.warning("send click all failed — pressed Enter (%s)", last_err)
+        logger.warning("send click fallback — pressed Enter (%s)", last_err)
         return
     except Exception as exc:
-        raise TimeoutError(f"send_click_failed: {exc or last_err}") from exc
+        raise TimeoutError(
+            f"send_button_not_found — Không nhấn được nút mũi tên gửi. "
+            f"Composer text={await _read_composer_text(page)!r:.80}. ({exc or last_err})"
+        ) from exc
 
 
 async def _upload_images(page, images: list[dict[str, Any]], tmp_dir: Path) -> list[Path]:
@@ -1577,7 +1642,7 @@ async def run_playwright_chat(
 
             try:
                 async with page.expect_response(_match, timeout=timeout_ms) as resp_info:
-                    await _click_send(page)
+                    await _click_send(page, settle_s=5.0, has_images=bool(images))
                 response = await resp_info.value
                 try:
                     await response.finished()
