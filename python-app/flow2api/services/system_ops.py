@@ -40,6 +40,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "chatgpt": {
         "call_delay_s": 5.0,
+        "call_delay_min_s": 5.0,
+        "call_delay_max_s": 15.0,
         # extension | playwright — playwright giả lập UI chatgpt.com
         "transport": "playwright",
         "cdp_url": "",
@@ -140,13 +142,27 @@ def public_openai_config() -> dict[str, Any]:
 def chatgpt_config() -> dict[str, Any]:
     cfg = load_config()
     cgpt = dict(cfg.get("chatgpt") or {})
-    delay = float(cgpt.get("call_delay_s") if cgpt.get("call_delay_s") is not None else 5.0)
-    delay = max(0.0, min(600.0, delay))
+    legacy = float(cgpt.get("call_delay_s") if cgpt.get("call_delay_s") is not None else 5.0)
+    legacy = max(0.0, min(600.0, legacy))
+    dmin = cgpt.get("call_delay_min_s")
+    dmax = cgpt.get("call_delay_max_s")
+    if dmin is None and dmax is None:
+        delay_min = legacy
+        delay_max = legacy
+    else:
+        delay_min = float(dmin if dmin is not None else legacy)
+        delay_max = float(dmax if dmax is not None else legacy)
+    delay_min = max(0.0, min(600.0, delay_min))
+    delay_max = max(0.0, min(600.0, delay_max))
+    if delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
     transport = str(cgpt.get("transport") or "playwright").strip().lower()
     if transport not in ("playwright", "extension"):
         transport = "playwright"
     return {
-        "call_delay_s": delay,
+        "call_delay_s": delay_max,  # backward compat: max of range
+        "call_delay_min_s": delay_min,
+        "call_delay_max_s": delay_max,
         "transport": transport,
         "cdp_url": str(cgpt.get("cdp_url") or "").strip(),
         "chrome_profile": str(cgpt.get("chrome_profile") or "Default").strip() or "Default",

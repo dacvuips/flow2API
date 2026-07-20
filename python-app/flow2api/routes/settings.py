@@ -39,6 +39,8 @@ class AutostartBody(BaseModel):
 
 class ChatgptSettingsBody(BaseModel):
     call_delay_s: float | None = None
+    call_delay_min_s: float | None = None
+    call_delay_max_s: float | None = None
     transport: str | None = None
     cdp_url: str | None = None
     chrome_profile: str | None = None
@@ -56,8 +58,31 @@ async def get_config(_: int = Depends(auth_key_id)):
 async def save_chatgpt_settings(body: ChatgptSettingsBody, _: int = Depends(auth_key_id)):
     current = system_ops.chatgpt_config()
     patch: dict[str, Any] = {}
-    if body.call_delay_s is not None:
-        patch["call_delay_s"] = max(0.0, min(600.0, float(body.call_delay_s)))
+    # Prefer min/max range; fall back to single call_delay_s for older clients
+    has_range = body.call_delay_min_s is not None or body.call_delay_max_s is not None
+    if has_range:
+        dmin = float(
+            body.call_delay_min_s
+            if body.call_delay_min_s is not None
+            else current.get("call_delay_min_s", current.get("call_delay_s", 5))
+        )
+        dmax = float(
+            body.call_delay_max_s
+            if body.call_delay_max_s is not None
+            else current.get("call_delay_max_s", current.get("call_delay_s", 5))
+        )
+        dmin = max(0.0, min(600.0, dmin))
+        dmax = max(0.0, min(600.0, dmax))
+        if dmax < dmin:
+            dmin, dmax = dmax, dmin
+        patch["call_delay_min_s"] = dmin
+        patch["call_delay_max_s"] = dmax
+        patch["call_delay_s"] = dmax
+    elif body.call_delay_s is not None:
+        delay = max(0.0, min(600.0, float(body.call_delay_s)))
+        patch["call_delay_s"] = delay
+        patch["call_delay_min_s"] = delay
+        patch["call_delay_max_s"] = delay
     if body.transport is not None:
         t = str(body.transport).strip().lower()
         if t not in ("playwright", "extension"):

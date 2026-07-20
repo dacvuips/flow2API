@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from typing import Any, AsyncIterator, Literal
 
@@ -174,10 +175,16 @@ _chatgpt_last_start_at = 0.0
 
 
 async def _await_chatgpt_call_delay() -> float:
-    """Sleep so consecutive ChatGPT calls are spaced by chatgpt.call_delay_s."""
+    """Sleep a random duration in [min, max] between consecutive ChatGPT calls."""
     global _chatgpt_last_start_at
-    delay = float(system_ops.chatgpt_config().get("call_delay_s") or 0)
-    delay = max(0.0, min(600.0, delay))
+    cfg = system_ops.chatgpt_config()
+    dmin = float(cfg.get("call_delay_min_s") if cfg.get("call_delay_min_s") is not None else cfg.get("call_delay_s") or 0)
+    dmax = float(cfg.get("call_delay_max_s") if cfg.get("call_delay_max_s") is not None else cfg.get("call_delay_s") or 0)
+    dmin = max(0.0, min(600.0, dmin))
+    dmax = max(0.0, min(600.0, dmax))
+    if dmax < dmin:
+        dmin, dmax = dmax, dmin
+    delay = random.uniform(dmin, dmax) if dmax > 0 else 0.0
     if delay <= 0:
         async with _chatgpt_delay_lock:
             _chatgpt_last_start_at = time.time()
@@ -187,6 +194,13 @@ async def _await_chatgpt_call_delay() -> float:
         now = time.time()
         wait = delay - (now - _chatgpt_last_start_at)
         if wait > 0:
+            logger.info(
+                "chatgpt call delay random=%.1fs (range %.1f–%.1f) waiting=%.1fs",
+                delay,
+                dmin,
+                dmax,
+                wait,
+            )
             await asyncio.sleep(wait)
         _chatgpt_last_start_at = time.time()
         return max(0.0, wait)
@@ -832,6 +846,14 @@ async def chatgpt_pool_nudge(_: int = Depends(auth_key_id)):
     ensure_scheduler_started()
     nudge_scheduler()
     return {"ok": True, "queue": queue_summary()}
+
+
+@router.post("/kpi/reset")
+async def chatgpt_kpi_reset(_: int = Depends(auth_key_id)):
+    from flow2api.services.chatgpt_counters import reset_counters
+
+    counters = reset_counters()
+    return {"ok": True, "summary": counters.to_dict(), "queue": queue_summary()}
 
 
 class SlotCreateBody(BaseModel):

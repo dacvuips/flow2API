@@ -259,6 +259,8 @@ class ChatgptBroker:
         *,
         kwargs: dict[str, Any] | None = None,
     ) -> PublicChatJob:
+        from flow2api.services import chatgpt_counters
+
         self._purge_public_jobs()
         job_id = str(uuid.uuid4())
         summary = self._public_params_summary(params)
@@ -270,6 +272,10 @@ class ChatgptBroker:
         )
         self._public_jobs[job_id] = job
         self._public_kwargs[job_id] = dict(kwargs or {})
+        try:
+            chatgpt_counters.increment_total()
+        except Exception:
+            pass
         return job
 
     def get_public_job(self, job_id: str) -> PublicChatJob | None:
@@ -356,12 +362,15 @@ class ChatgptBroker:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        from flow2api.services import chatgpt_counters
+
         job = self._public_jobs.get(job_id)
         if not job:
             return
         if job.status == "cancelled":
             self._public_tasks.pop(job_id, None)
             return
+        old = job.status
         if error:
             job.status = "failed"
             job.error = error
@@ -372,11 +381,17 @@ class ChatgptBroker:
             job.result = result or {}
         job.touch()
         self._public_tasks.pop(job_id, None)
+        try:
+            chatgpt_counters.on_status_transition(old, job.status)
+        except Exception:
+            pass
 
     def track_public_task(self, job_id: str, task: asyncio.Task) -> None:
         self._public_tasks[job_id] = task
 
         def _done(t: asyncio.Task) -> None:
+            from flow2api.services import chatgpt_counters
+
             self._public_tasks.pop(job_id, None)
             if t.cancelled():
                 job = self._public_jobs.get(job_id)
@@ -389,9 +404,14 @@ class ChatgptBroker:
                 if exc is not None:
                     job = self._public_jobs.get(job_id)
                     if job and job.status in ("queued", "running"):
+                        old = job.status
                         job.status = "failed"
                         job.error = str(exc)
                         job.touch()
+                        try:
+                            chatgpt_counters.on_status_transition(old, "failed")
+                        except Exception:
+                            pass
 
         task.add_done_callback(_done)
 

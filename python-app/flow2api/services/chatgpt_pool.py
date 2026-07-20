@@ -218,23 +218,32 @@ async def _list_extension_profiles() -> list[dict[str, Any]]:
 
 
 def queue_summary() -> dict[str, Any]:
+    from flow2api.services import chatgpt_counters
+
     broker = get_chatgpt_broker()
-    queued = running = done = failed = 0
+    queued = running = live_done = live_failed = cancelled = 0
     for j in broker.iter_public_jobs():
         if j.status == "queued":
             queued += 1
         elif j.status == "running":
             running += 1
         elif j.status == "done":
-            done += 1
+            live_done += 1
         elif j.status == "failed":
-            failed += 1
+            live_failed += 1
+        elif j.status == "cancelled":
+            cancelled += 1
     settings = get_chatgpt_pool_settings()
+    c = chatgpt_counters.get_counters()
     return {
         "queued": queued,
         "running": running,
-        "done": done,
-        "failed": failed,
+        "done": c.done,
+        "failed": c.failed,
+        "total": c.total,
+        "live_done": live_done,
+        "live_failed": live_failed,
+        "cancelled": cancelled,
         "max_concurrent": settings.max_concurrent,
         "active_slots": active_job_count(),
         "playwright_slots": len(settings.playwright_slots),

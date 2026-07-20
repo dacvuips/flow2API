@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 import time
@@ -839,6 +840,10 @@ async def _wait_images_after_stream_done(
             logger.info("images ready after DONE attempt=%s count=%s", attempt, len(ready))
             return {"text": text, "images": ready}
 
+        try:
+            await _human_scroll_burst(page, rounds=1)
+        except Exception:
+            pass
         await asyncio.sleep(interval_s)
 
     logger.warning("images still missing after DONE wait=%.0fs attempts=%s", max_wait_s, attempt)
@@ -1402,8 +1407,10 @@ async def _js_click_send(page) -> bool:
 async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) -> None:
     # After long prompt (+ image) ChatGPT needs a few seconds before up-arrow accepts click.
     wait_s = max(5.0, float(settle_s or 0)) + (2.0 if has_images else 0.0)
-    logger.info("waiting %.1fs before clicking send arrow (images=%s)", wait_s, has_images)
-    await asyncio.sleep(wait_s)
+    logger.info("waiting %.1fs before clicking send arrow (images=%s) with human scroll", wait_s, has_images)
+    await _idle_with_human_motion(page, wait_s)
+
+    await _dismiss_rate_limit_modal(page)
 
     if has_images:
         try:
@@ -1524,6 +1531,190 @@ async def _upload_images(page, images: list[dict[str, Any]], tmp_dir: Path) -> l
     return paths
 
 
+async def _human_scroll_burst(page, rounds: int = 2) -> None:
+    """Scroll mouse wheel up/down + small moves to look like a human."""
+    try:
+        for _ in range(max(1, rounds)):
+            dy = random.randint(140, 480) * random.choice([1, -1])
+            await page.mouse.wheel(0, dy)
+            await asyncio.sleep(random.uniform(0.12, 0.45))
+            await page.mouse.move(
+                random.randint(180, 980),
+                random.randint(140, 720),
+                steps=random.randint(4, 12),
+            )
+            await asyncio.sleep(random.uniform(0.08, 0.35))
+    except Exception:
+        pass
+
+
+async def _idle_with_human_motion(page, seconds: float) -> None:
+    """Wait while occasionally scrolling — used between actions / before send."""
+    deadline = time.time() + max(0.0, float(seconds or 0))
+    while time.time() < deadline:
+        await _dismiss_rate_limit_modal(page)
+        await _human_scroll_burst(page, rounds=random.randint(1, 2))
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(remaining, random.uniform(0.7, 1.6)))
+
+
+async def _scroll_while_waiting(page, stop: asyncio.Event) -> None:
+    """Background human motion until stop is set (while waiting for ChatGPT reply)."""
+    while not stop.is_set():
+        try:
+            await _human_scroll_burst(page, rounds=1)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=random.uniform(1.2, 2.8))
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _click_new_chat(page) -> bool:
+    """Click sidebar 'New chat' so the next job starts on a fresh conversation."""
+    await _dismiss_rate_limit_modal(page)
+    # Role / text first (matches current ChatGPT sidebar)
+    for name in ("New chat", "Đoạn chat mới", "Chat mới"):
+        for role in ("link", "button"):
+            try:
+                loc = page.get_by_role(role, name=re.compile(rf"^{re.escape(name)}$", re.I)).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=5000)
+                    logger.info("clicked New chat (%s/%s)", role, name)
+                    await asyncio.sleep(0.8)
+                    return True
+            except Exception:
+                pass
+    for sel in (
+        'a:has-text("New chat")',
+        'button:has-text("New chat")',
+        '[data-testid="create-new-chat-button"]',
+        'nav a:has-text("New chat")',
+        'a:has-text("Đoạn chat mới")',
+        'button:has-text("Đoạn chat mới")',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=5000)
+                logger.info("clicked New chat via %s", sel)
+                await asyncio.sleep(0.8)
+                return True
+        except Exception:
+            continue
+    # JS fallback: find sidebar item by text
+    try:
+        ok = await page.evaluate(
+            """() => {
+              const want = ['new chat', 'đoạn chat mới', 'chat mới'];
+              const nodes = [...document.querySelectorAll('a, button, [role="button"], [role="link"]')];
+              for (const el of nodes) {
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!want.some(w => t === w || t.startsWith(w))) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) continue;
+                el.click();
+                return true;
+              }
+              return false;
+            }"""
+        )
+        if ok:
+            logger.info("clicked New chat (js)")
+            await asyncio.sleep(0.8)
+            return True
+    except Exception as exc:
+        logger.warning("New chat click failed: %s", exc)
+    return False
+
+
+async def _ready_for_next_task(page) -> None:
+    """After a job finishes: open New chat and idle briefly with human motion."""
+    try:
+        clicked = await _click_new_chat(page)
+        if not clicked:
+            # Fallback: navigate home composer
+            try:
+                await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+        await _idle_with_human_motion(page, random.uniform(1.2, 2.5))
+    except Exception as exc:
+        logger.warning("ready_for_next_task failed: %s", exc)
+
+
+async def _dismiss_rate_limit_modal(page) -> bool:
+    """Click 'Got it' on ChatGPT 'Too many requests' (and similar) modals."""
+    try:
+        clicked = await page.evaluate(
+            """() => {
+              const texts = ['got it', 'okay', 'ok', 'accept', 'được rồi', 'đã hiểu'];
+              const nodes = [...document.querySelectorAll('button, [role="button"], a')];
+              for (const el of nodes) {
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!t) continue;
+                if (!texts.some(x => t === x || t.includes(x))) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) continue;
+                // Prefer when modal title mentions rate limit
+                const dialog = el.closest('[role="dialog"], [data-testid*="modal"], .modal, [class*="modal"]')
+                  || document.body;
+                const blob = ((dialog && dialog.innerText) || '').toLowerCase();
+                const isRate = /too many requests|making requests too quickly|temporarily limited|rate limit|unusual activity/.test(blob);
+                if (isRate || t === 'got it' || t === 'okay') {
+                  el.click();
+                  return true;
+                }
+              }
+              return false;
+            }"""
+        )
+        if clicked:
+            logger.info("dismissed ChatGPT modal (Got it / rate limit)")
+            await asyncio.sleep(0.6)
+            return True
+    except Exception as exc:
+        logger.debug("dismiss rate-limit modal failed: %s", exc)
+    # Locator fallback
+    for sel in (
+        'button:has-text("Got it")',
+        'button:has-text("Okay")',
+        'button:has-text("OK")',
+        '[role="dialog"] button:has-text("Got it")',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=2000)
+                logger.info("dismissed modal via selector %s", sel)
+                await asyncio.sleep(0.6)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _dismiss_common_modals(page) -> None:
+    await _dismiss_rate_limit_modal(page)
+    for sel in (
+        'button:has-text("Okay")',
+        'button:has-text("Got it")',
+        'button:has-text("Accept")',
+        '[data-testid="modal-close"]',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=1500)
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+
 async def run_playwright_chat(
     *,
     prompt: str = "",
@@ -1569,28 +1760,20 @@ async def run_playwright_chat(
             await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(1.0)
 
-            # Dismiss common modals if present (best-effort)
-            for sel in (
-                'button:has-text("Okay")',
-                'button:has-text("Got it")',
-                'button:has-text("Accept")',
-                '[data-testid="modal-close"]',
-            ):
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click(timeout=1500)
-                except Exception:
-                    pass
+            await _dismiss_common_modals(page)
+            await _dismiss_rate_limit_modal(page)
 
             if images:
                 await _upload_images(page, images, tmp_dir)
                 await _wait_uploads_ready(page, len(images), max_wait_s=90.0)
+                await _dismiss_rate_limit_modal(page)
 
             if prompt:
                 await _fill_prompt(page, prompt)
             elif images:
                 pass
+
+            await _dismiss_rate_limit_modal(page)
 
             # Collect image CDN URLs from network while generating
             net_images: list[dict[str, Any]] = []
@@ -1641,9 +1824,18 @@ async def run_playwright_chat(
                     return False
 
             try:
-                async with page.expect_response(_match, timeout=timeout_ms) as resp_info:
-                    await _click_send(page, settle_s=5.0, has_images=bool(images))
-                response = await resp_info.value
+                scroll_stop = asyncio.Event()
+                scroll_task = asyncio.create_task(_scroll_while_waiting(page, scroll_stop))
+                try:
+                    async with page.expect_response(_match, timeout=timeout_ms) as resp_info:
+                        await _click_send(page, settle_s=5.0, has_images=bool(images))
+                    response = await resp_info.value
+                finally:
+                    scroll_stop.set()
+                    try:
+                        await asyncio.wait_for(scroll_task, timeout=2.0)
+                    except Exception:
+                        scroll_task.cancel()
                 try:
                     await response.finished()
                 except Exception:
@@ -1697,7 +1889,7 @@ async def run_playwright_chat(
                 )
 
                 if stream_done and text and not wait_for_images:
-                    return {
+                    out = {
                         "ok": True,
                         "text": text,
                         "conversationId": conversation_id,
@@ -1712,6 +1904,8 @@ async def run_playwright_chat(
                         "stream_done": True,
                         "slot_id": slot.id,
                     }
+                    await _ready_for_next_task(page)
+                    return out
 
                 if wait_for_images:
                     logger.info(
@@ -1803,7 +1997,7 @@ async def run_playwright_chat(
                         "slot_id": slot.id,
                     }
 
-                return {
+                return_payload = {
                     "ok": True,
                     "text": text if text else ("(đã tạo ảnh)" if out_images else ""),
                     "conversationId": conversation_id,
@@ -1819,6 +2013,8 @@ async def run_playwright_chat(
                     "waited_for_images": wait_for_images,
                     "slot_id": slot.id,
                 }
+                await _ready_for_next_task(page)
+                return return_payload
             finally:
                 try:
                     page.remove_listener("response", _on_response)
@@ -1829,6 +2025,12 @@ async def run_playwright_chat(
             err = str(exc) or "playwright_chat_failed"
             if "Target closed" in err or "has been closed" in err or "launch_failed" in err:
                 await _close_slot_runtime(rt)
+            else:
+                # Still try New chat so the next job is not stuck in a broken thread
+                try:
+                    await _ready_for_next_task(page)
+                except Exception:
+                    pass
             return {"ok": False, "error": err, "slot_id": slot.id}
         finally:
             try:
