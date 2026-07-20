@@ -253,9 +253,13 @@ _PROMPT_SELECTORS = [
 _SEND_SELECTORS = [
     '[data-testid="send-button"]',
     'button[data-testid="send-button"]',
+    'button[aria-label="Send prompt"]',
+    'button[aria-label*="Send prompt" i]',
+    'button[aria-label*="Send message" i]',
     'button[aria-label*="Send" i]',
     'button[aria-label*="Gửi" i]',
-    'button[aria-label*="Send message" i]',
+    'form[data-type="unified-composer"] button[data-testid="send-button"]',
+    'form button[type="submit"]',
 ]
 
 _FILE_INPUT_SELECTORS = [
@@ -1220,17 +1224,184 @@ async def _first_visible(page, selectors: list[str], timeout_ms: int = 15000):
     raise TimeoutError(f"selector_not_found: {selectors[0]}… ({last_err})")
 
 
+async def _read_composer_text(page) -> str:
+    try:
+        return await page.evaluate(
+            """() => {
+              const el = document.querySelector('#prompt-textarea')
+                || document.querySelector('[data-testid="prompt-textarea"]')
+                || document.querySelector('div.ProseMirror[contenteditable="true"]');
+              if (!el) return '';
+              return (el.innerText || el.textContent || '').replace(/\\u00a0/g, ' ').trim();
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+async def _set_composer_text(page, prompt: str) -> bool:
+    """Set ProseMirror/contenteditable text in a way ChatGPT React state accepts."""
+    text = prompt or ""
+    try:
+        ok = await page.evaluate(
+            """(value) => {
+              const el = document.querySelector('#prompt-textarea')
+                || document.querySelector('[data-testid="prompt-textarea"]')
+                || document.querySelector('div.ProseMirror[contenteditable="true"]');
+              if (!el) return false;
+              el.focus();
+              try {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+              } catch (_) {}
+              // Prefer insertText so ProseMirror/React see a real input event
+              let inserted = false;
+              try {
+                inserted = document.execCommand('insertText', false, value);
+              } catch (_) {}
+              if (!inserted) {
+                el.textContent = '';
+                if (el.isContentEditable) {
+                  const p = document.createElement('p');
+                  p.textContent = value;
+                  el.appendChild(p);
+                } else if ('value' in el) {
+                  el.value = value;
+                } else {
+                  el.textContent = value;
+                }
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+              }
+              el.dispatchEvent(new Event('change', {bubbles: true}));
+              return true;
+            }""",
+            text,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
 async def _fill_prompt(page, prompt: str) -> None:
     box = await _first_visible(page, _PROMPT_SELECTORS, timeout_ms=45000)
     await box.click(timeout=5000)
+    # 1) Native Playwright fill (works for plain textarea)
+    filled = False
     try:
         await box.fill(prompt or "")
+        filled = True
     except Exception:
-        # contenteditable / ProseMirror
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
-        if prompt:
-            await page.keyboard.type(prompt, delay=8)
+        filled = False
+    # 2) ProseMirror-safe insert (needed for unified composer)
+    if not filled or len(prompt or "") > 200:
+        await _set_composer_text(page, prompt or "")
+    # 3) Verify React actually accepted text; fallback clipboard paste
+    current = await _read_composer_text(page)
+    want = (prompt or "").strip()
+    if want and (not current or (len(want) > 40 and want[:40] not in current and current[:40] not in want)):
+        try:
+            await box.click(timeout=3000)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            # insert_text is much faster/safer than type(delay=8) for long prompts
+            await page.keyboard.insert_text(prompt or "")
+        except Exception:
+            # last resort: slow type only for short prompts
+            if len(prompt or "") <= 500:
+                await page.keyboard.type(prompt or "", delay=5)
+    # Small settle so send button enables
+    await asyncio.sleep(0.35)
+    current = await _read_composer_text(page)
+    if want and not current:
+        raise TimeoutError("prompt_not_accepted — ChatGPT composer không nhận text (ProseMirror)")
+
+
+async def _find_enabled_send(page):
+    """Locate the black up-arrow send button (not mic / not disabled)."""
+    # Role-based first (most stable across UI redesigns)
+    for name in ("Send prompt", "Send message", "Send", "Gửi"):
+        try:
+            loc = page.get_by_role("button", name=name).first
+            if await loc.count() > 0 and await loc.is_visible():
+                disabled = await loc.get_attribute("disabled")
+                aria = await loc.get_attribute("aria-disabled")
+                if disabled is None and aria not in ("true", "True"):
+                    return loc
+        except Exception:
+            pass
+    for sel in _SEND_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
+                continue
+            if not await loc.is_visible():
+                continue
+            disabled = await loc.get_attribute("disabled")
+            aria = await loc.get_attribute("aria-disabled")
+            if disabled is not None or aria in ("true", "True"):
+                continue
+            return loc
+        except Exception:
+            continue
+    return None
+
+
+async def _click_send(page) -> None:
+    # Wait until send button becomes enabled after composer text settles
+    deadline = time.time() + 25
+    send = None
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            send = await _find_enabled_send(page)
+            if send is not None:
+                break
+        except Exception as exc:
+            last_err = exc
+        await asyncio.sleep(0.25)
+
+    if send is None:
+        # Fallback: Enter in composer (ChatGPT often binds Enter=send)
+        try:
+            box = page.locator("#prompt-textarea, [data-testid='prompt-textarea'], div.ProseMirror[contenteditable='true']").first
+            await box.click(timeout=3000)
+            await page.keyboard.press("Enter")
+            logger.warning("send-button not found — pressed Enter fallback (%s)", last_err)
+            return
+        except Exception as exc:
+            raise TimeoutError(
+                f"send_button_not_found — Không thấy nút mũi tên gửi. "
+                f"Composer text={await _read_composer_text(page)!r:.80}. ({exc or last_err})"
+            ) from exc
+
+    # Try normal click, then force, then JS click, then Enter
+    try:
+        await send.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        await send.click(timeout=8000)
+        return
+    except Exception as exc:
+        last_err = exc
+        logger.warning("send click failed, retry force: %s", exc)
+    try:
+        await send.click(timeout=5000, force=True)
+        return
+    except Exception as exc:
+        last_err = exc
+        logger.warning("send force-click failed, try JS click: %s", exc)
+    try:
+        await send.evaluate("el => el.click()")
+        return
+    except Exception as exc:
+        last_err = exc
+    try:
+        await page.keyboard.press("Enter")
+        logger.warning("send click all failed — pressed Enter (%s)", last_err)
+        return
+    except Exception as exc:
+        raise TimeoutError(f"send_click_failed: {exc or last_err}") from exc
 
 
 async def _upload_images(page, images: list[dict[str, Any]], tmp_dir: Path) -> list[Path]:
@@ -1286,22 +1457,6 @@ async def _upload_images(page, images: list[dict[str, Any]], tmp_dir: Path) -> l
     await file_input.set_input_files([str(p) for p in paths])
     await asyncio.sleep(1.2)
     return paths
-
-
-async def _click_send(page) -> None:
-    send = await _first_visible(page, _SEND_SELECTORS, timeout_ms=20000)
-    # wait until enabled (white up-arrow active)
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        try:
-            disabled = await send.get_attribute("disabled")
-            aria = await send.get_attribute("aria-disabled")
-            if disabled is None and aria not in ("true", "True"):
-                break
-        except Exception:
-            break
-        await asyncio.sleep(0.2)
-    await send.click(timeout=10000)
 
 
 async def run_playwright_chat(
