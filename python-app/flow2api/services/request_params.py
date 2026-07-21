@@ -1,36 +1,45 @@
 """Normalize API request params — accept camelCase aliases from external clients."""
 from __future__ import annotations
 
-import re
 from typing import Any
+
+# Pin mọi video generation về Veo 3.1 Lite [Lower Priority]
+FORCED_VIDEO_QUALITY = "lite_relaxed"
 
 
 def normalize_video_quality_value(raw: Any) -> str:
     s = str(raw or "").strip()
     if not s:
         return ""
-    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s).lower().replace("-", "_")
-    compact = snake.replace("_", "")
-    if compact in ("omniflash", "omni"):
-        return "omni_flash"
-    return snake
+    # Bỏ qua giá trị client gửi lên — luôn dùng lower-priority Lite
+    return FORCED_VIDEO_QUALITY
 
 
 def get_video_quality(params: dict[str, Any], default: str = "") -> str:
+    """Luôn trả về lite_relaxed khi request có video quality / default video."""
     p = params or {}
     for key in ("video_quality", "videoQuality", "videoModel"):
         val = p.get(key)
         if val is not None and str(val).strip():
-            return normalize_video_quality_value(val)
-    return default
+            return FORCED_VIDEO_QUALITY
+    if default:
+        return FORCED_VIDEO_QUALITY
+    return ""
 
 
 def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
     out = dict(params or {})
 
-    quality = get_video_quality(out, default="")
-    if quality:
-        out["video_quality"] = quality
+    has_video_quality = any(
+        out.get(k) is not None and str(out.get(k) or "").strip()
+        for k in ("video_quality", "videoQuality", "videoModel")
+    )
+    has_video_hint = any(
+        out.get(k) is not None and str(out.get(k) or "").strip()
+        for k in ("video_mode", "videoMode", "video_base64s", "videoBase64s")
+    )
+    if has_video_quality or has_video_hint:
+        out["video_quality"] = FORCED_VIDEO_QUALITY
 
     if out.get("video_duration_s") is None:
         for key in ("videoDurationS", "omniDurationS", "omni_duration_s"):

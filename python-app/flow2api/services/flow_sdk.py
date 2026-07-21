@@ -51,106 +51,57 @@ VIDEO_ASPECT = {
     "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
 }
 
-# Keys per generation mode (t2v / i2v / r2v use different upstream model families).
+def _veo_lp_qualities(model_key: str) -> dict[str, str]:
+    """Mọi alias chất lượng đều map về Lite [Lower Priority]."""
+    return {
+        "lite": model_key,
+        "fast": model_key,
+        "quality": model_key,
+        "lite_relaxed": model_key,
+        "omni_flash": model_key,
+    }
+
+
+# Keys per generation mode — tất cả quality → *_lite_low_priority.
 VIDEO_MODEL_KEYS: dict[str, dict[str, dict[str, dict[str, str]]]] = {
     "t2v": {
         "PAYGATE_TIER_ONE": {
-            "16:9": {"lite": "veo_3_1_t2v_lite", "fast": "veo_3_1_t2v_fast", "quality": "veo_3_1_t2v"},
-            "9:16": {
-                "lite": "veo_3_1_t2v_lite",
-                "fast": "veo_3_1_t2v_fast_portrait",
-                "quality": "veo_3_1_t2v_portrait",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_t2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_t2v_lite_low_priority"),
         },
         "PAYGATE_TIER_TWO": {
-            "16:9": {
-                "lite": "veo_3_1_t2v_lite",
-                "fast": "veo_3_1_t2v_fast_ultra",
-                "quality": "veo_3_1_t2v",
-                "lite_relaxed": "veo_3_1_t2v_lite_low_priority",
-            },
-            "9:16": {
-                "lite": "veo_3_1_t2v_lite",
-                "fast": "veo_3_1_t2v_fast_portrait_ultra",
-                "quality": "veo_3_1_t2v_portrait",
-                "lite_relaxed": "veo_3_1_t2v_lite_low_priority",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_t2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_t2v_lite_low_priority"),
         },
     },
     "i2v": {
         "PAYGATE_TIER_ONE": {
-            "16:9": {"lite": "veo_3_1_i2v_lite", "fast": "veo_3_1_i2v_s_fast", "quality": "veo_3_1_i2v_s"},
-            "9:16": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_portrait",
-                "quality": "veo_3_1_i2v_s_portrait",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
         },
         "PAYGATE_TIER_TWO": {
-            "16:9": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_ultra",
-                "quality": "veo_3_1_i2v_s",
-                "lite_relaxed": "veo_3_1_i2v_lite_low_priority",
-            },
-            "9:16": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_portrait_ultra",
-                "quality": "veo_3_1_i2v_s_portrait",
-                "lite_relaxed": "veo_3_1_i2v_lite_low_priority",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
         },
     },
     "i2v_fl": {
         "PAYGATE_TIER_ONE": {
-            "16:9": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_fl",
-                "quality": "veo_3_1_i2v_s_fast_fl",
-            },
-            "9:16": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_portrait_fl",
-                "quality": "veo_3_1_i2v_s_fast_portrait_fl",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
         },
         "PAYGATE_TIER_TWO": {
-            "16:9": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_ultra_fl",
-                "quality": "veo_3_1_i2v_s_fast_ultra_fl",
-                "lite_relaxed": "veo_3_1_i2v_lite_low_priority",
-            },
-            "9:16": {
-                "lite": "veo_3_1_i2v_lite",
-                "fast": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
-                "quality": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
-                "lite_relaxed": "veo_3_1_i2v_lite_low_priority",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_i2v_lite_low_priority"),
         },
     },
     "r2v": {
         "PAYGATE_TIER_ONE": {
-            "16:9": {"lite": "veo_3_1_r2v_fast", "fast": "veo_3_1_r2v_fast", "quality": "veo_3_1_r2v_fast"},
-            "9:16": {
-                "lite": "veo_3_1_r2v_fast_portrait",
-                "fast": "veo_3_1_r2v_fast_portrait",
-                "quality": "veo_3_1_r2v_fast_portrait",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_r2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_r2v_lite_low_priority"),
         },
         "PAYGATE_TIER_TWO": {
-            "16:9": {
-                "lite": "veo_3_1_r2v_fast",
-                "fast": "veo_3_1_r2v_fast_ultra",
-                "quality": "veo_3_1_r2v_fast_ultra",
-                "lite_relaxed": "veo_3_1_r2v_lite_low_priority",
-            },
-            "9:16": {
-                "lite": "veo_3_1_r2v_fast_portrait",
-                "fast": "veo_3_1_r2v_fast_portrait_ultra",
-                "quality": "veo_3_1_r2v_fast_portrait_ultra",
-                "lite_relaxed": "veo_3_1_r2v_lite_low_priority",
-            },
+            "16:9": _veo_lp_qualities("veo_3_1_r2v_lite_low_priority"),
+            "9:16": _veo_lp_qualities("veo_3_1_r2v_lite_low_priority"),
         },
     },
 }
@@ -1079,7 +1030,8 @@ def _video_model_key(mode: str, tier: str, aspect: str, quality: str) -> str:
     table = VIDEO_MODEL_KEYS.get(mode) or VIDEO_MODEL_KEYS["t2v"]
     tier_map = table.get(tier) or table["PAYGATE_TIER_ONE"]
     aspect_map = tier_map.get(aspect) or tier_map["16:9"]
-    key = aspect_map.get(quality)
+    # Ép mọi quality về Lite [Lower Priority]
+    key = aspect_map.get("lite_relaxed") or aspect_map.get(quality)
     if not key:
         raise ValueError(f"unsupported video model {quality} for {mode} {aspect} / {tier}")
     return key
