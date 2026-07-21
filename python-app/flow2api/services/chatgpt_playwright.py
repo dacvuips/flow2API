@@ -1287,9 +1287,63 @@ async def _set_composer_text(page, prompt: str) -> bool:
         return False
 
 
+async def _clear_composer_prefixes(page, box) -> None:
+    """Remove New-chat tool chips like 'Web search' before typing the prompt.
+
+    ChatGPT often inserts a prefix token in the composer; Backspace ~3 times
+    clears it when the caret is at the start of the input.
+    """
+    try:
+        await box.click(timeout=5000)
+    except Exception:
+        pass
+    # Prefer focusing start of composer so Backspace hits the chip
+    try:
+        await page.keyboard.press("Home")
+        await asyncio.sleep(0.08)
+        await page.keyboard.press("Control+Home")
+        await asyncio.sleep(0.08)
+    except Exception:
+        pass
+    # Also try removing chip via its close/remove control if present
+    try:
+        await page.evaluate(
+            """() => {
+              const root = document.querySelector('form[data-type="unified-composer"]')
+                || document.querySelector('form')
+                || document.body;
+              const chips = [...root.querySelectorAll(
+                '[data-testid*="tool"], [class*="chip"], [class*="pill"], button, span'
+              )];
+              for (const el of chips) {
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                if (!t) continue;
+                if (!/(web search|tìm kiếm|search|deep research|study)/.test(t)) continue;
+                // click chip or a child close button
+                const close = el.querySelector('button, [aria-label*="Remove" i], [aria-label*="Close" i], svg');
+                (close || el).click();
+                return true;
+              }
+              return false;
+            }"""
+        )
+        await asyncio.sleep(0.15)
+    except Exception:
+        pass
+    for _ in range(3):
+        try:
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.06)
+        except Exception:
+            break
+    logger.info("cleared composer prefixes with Backspace x3")
+
+
 async def _fill_prompt(page, prompt: str) -> None:
     box = await _first_visible(page, _PROMPT_SELECTORS, timeout_ms=45000)
     await box.click(timeout=5000)
+    # New Chat often has a tool prefix chip (e.g. "Web search") — clear it first
+    await _clear_composer_prefixes(page, box)
     # 1) Native Playwright fill (works for plain textarea)
     filled = False
     try:
@@ -1306,6 +1360,7 @@ async def _fill_prompt(page, prompt: str) -> None:
     if want and (not current or (len(want) > 40 and want[:40] not in current and current[:40] not in want)):
         try:
             await box.click(timeout=3000)
+            await _clear_composer_prefixes(page, box)
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Backspace")
             # insert_text is much faster/safer than type(delay=8) for long prompts
