@@ -481,17 +481,88 @@ def _is_status_placeholder(text: str) -> bool:
     return False
 
 
+def _strip_json_fence(text: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, re.I)
+    if fence and fence.group(1).strip():
+        return fence.group(1).strip()
+    return s
+
+
+def _looks_like_json_payload(text: str) -> bool:
+    s = _strip_json_fence(text)
+    if not s:
+        return False
+    if s[0] in "{[":
+        return True
+    if re.search(r'"(scenes|sceneNumber|cropRegion|motionPrompt)"\s*:', s):
+        return True
+    return False
+
+
+def _is_complete_json(text: str) -> bool:
+    """True only when JSON parses (tránh trả nửa response đang stream)."""
+    s = _strip_json_fence(text)
+    if not s or s[0] not in "{[":
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        pass
+    # Heuristic: balanced braces/brackets and not ending inside a string
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack[-1] != ch:
+                return False
+            stack.pop()
+    return (not in_str) and (not stack) and len(s) >= 2
+
+
 def _is_usable_answer_text(text: str) -> bool:
+    """Có nội dung đáng xét (có thể vẫn đang stream / JSON chưa đóng)."""
     s = str(text or "").strip()
     if not s or _is_status_placeholder(s):
         return False
-    # JSON (có thể trong fence)
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, re.I)
     if fence and fence.group(1).strip():
         return True
     if s.startswith("{") or s.startswith("["):
         return len(s) >= 2
     return len(s) >= 12
+
+
+def _is_answer_complete(text: str) -> bool:
+    """An toàn để trả frontend — JSON phải parse được, không cắt giữa chừng."""
+    if not _is_usable_answer_text(text):
+        return False
+    if _looks_like_json_payload(text):
+        return _is_complete_json(text)
+    # Plain text: reject obvious mid-stream cut (ends with open quote / trailing comma)
+    s = str(text or "").strip()
+    if s.endswith((",", ":", "\\")):
+        return False
+    if s.count('"') % 2 == 1:
+        return False
+    return True
 
 
 def _extract_json_if_any(text: str) -> str:
@@ -504,11 +575,16 @@ def _extract_json_if_any(text: str) -> str:
         if inner:
             return inner
     if s.startswith("{") or s.startswith("["):
+        # Prefer largest parseable prefix/suffix
+        if _is_complete_json(s):
+            return s
         return s
     for opener, closer in (("{", "}"), ("[", "]")):
         a, b = s.find(opener), s.rfind(closer)
         if a >= 0 and b > a:
-            return s[a : b + 1]
+            chunk = s[a : b + 1]
+            if _is_complete_json(chunk):
+                return chunk
     return s
 
 
@@ -518,7 +594,9 @@ def _clean_assistant_text(text: str) -> str:
     if not s:
         return ""
     # Primary leak from ChatGPT SSE ops — remove every occurrence of "append"
-    s = s.replace("append", "")
+    # Only strip standalone op tokens when they appear as SSE junk, not inside JSON keys.
+    # Safe global replace of bare SSE op name that ChatGPT injects between tokens:
+    s = re.sub(r"(?i)(?<![A-Za-z0-9_])append(?![A-Za-z0-9_])", "", s)
     # Rare whole-token leaks (word boundary only — avoid breaking normal words)
     s = re.sub(r"(?i)\b(patch|truncate)\b", "", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
@@ -599,7 +677,6 @@ async def _page_result_stats(page) -> dict[str, Any]:
               const last = assistantNodes[assistantNodes.length - 1] || null;
               const roots = [];
               if (last) roots.push(last);
-              // /images gallery often sits outside classic assistant bubble
               const main = document.querySelector('main') || document.body;
               roots.push(main);
 
@@ -608,7 +685,6 @@ async def _page_result_stats(page) -> dict[str, Any]:
                 const md = last.querySelector('.markdown, [class*="markdown"]') || last;
                 text = (md.innerText || '').trim();
               } else {
-                // fallback: largest text block in main
                 text = (main.innerText || '').trim().slice(0, 20000);
               }
 
@@ -619,24 +695,68 @@ async def _page_result_stats(page) -> dict[str, Any]:
                   const s = img.currentSrc || img.src || '';
                   if (!s || seen.has(s)) continue;
                   if (/avatar|icon|emoji|logo|spinner|profile|favicon|\\/assets\\/|\\.svg($|\\?)/i.test(s)) continue;
-                  // skip tiny UI icons
                   const w = img.naturalWidth || img.width || 0;
                   const h = img.naturalHeight || img.height || 0;
                   if ((w && w < 64) || (h && h < 64)) continue;
-                  // Prefer real result images
                   if (!/oaiusercontent|filesystem\\.site|oaidalle|blob\\.core\\.windows\\.net|\\/files\\/download\\/|estuary\\/content|content\\?id=file_|^blob:/i.test(s)) continue;
                   seen.add(s);
                   imgs.push(s);
                 }
               }
-              const busy = !!document.querySelector(
-                'button[aria-label*="Stop" i], button[data-testid="stop-button"]'
+
+              const stopBtn = document.querySelector(
+                'button[data-testid="stop-button"], button[aria-label*="Stop generating" i], button[aria-label*="Stop" i]'
               );
-              return { textLen: text.length, imgCount: imgs.length, busy, sample: text.slice(0, 80) };
+              const sendBtn = document.querySelector('[data-testid="send-button"]');
+              const speechBtn = document.querySelector('[data-testid="composer-speech-button"]');
+
+              // Status lines: Thinking / Analyzing / Đang suy nghĩ — vẫn đang chạy
+              const statusRe = /^(thinking|analyzing|searching|working|reasoning|đang\\s*suy\\s*nghĩ|đang\\s*phân\\s*tích|đang\\s*tìm)\\b/i;
+              let statusBusy = false;
+              let statusText = '';
+              for (const el of document.querySelectorAll(
+                '[data-testid*="thinking"], [class*="thinking"], [class*="result-streaming"], ' +
+                '[aria-live], [data-message-author-role="assistant"]'
+              )) {
+                const t = ((el.innerText || el.textContent || '')).trim().split('\\n')[0] || '';
+                if (t && statusRe.test(t) && t.length < 120) {
+                  statusBusy = true;
+                  statusText = t.slice(0, 80);
+                  break;
+                }
+              }
+              // Streaming cursor / result-streaming class
+              const streaming = !!document.querySelector(
+                '.result-streaming, [class*="result-streaming"], [data-testid*="streaming"]'
+              );
+
+              const busy = !!(stopBtn || statusBusy || streaming);
+              // UI "DONE": Stop đã tắt + composer sẵn sàng gửi lại
+              const uiDone = !busy && (!!sendBtn || !!speechBtn || text.length > 20);
+
+              return {
+                textLen: text.length,
+                imgCount: imgs.length,
+                busy,
+                stop: !!stopBtn,
+                statusBusy,
+                streaming,
+                uiDone,
+                statusText,
+                sample: text.slice(0, 80),
+              };
             }"""
         )
     except Exception:
-        return {"textLen": 0, "imgCount": 0, "busy": False}
+        return {
+            "textLen": 0,
+            "imgCount": 0,
+            "busy": False,
+            "uiDone": False,
+            "stop": False,
+            "statusBusy": False,
+            "streaming": False,
+        }
 
 
 async def _wait_generation_done(
@@ -645,37 +765,57 @@ async def _wait_generation_done(
     max_wait_s: float = 120.0,
     want_images: bool = False,
     min_images: int = 1,
-) -> None:
-    """Wait until ChatGPT finishes (Stop gone + text/images stable)."""
+    require_ui_done: bool = True,
+) -> dict[str, Any]:
+    """Chờ ChatGPT UI xong: hết Stop / Thinking / streaming (= hiển thị DONE)."""
     deadline = time.time() + max_wait_s
     last_sig = None
     stable = 0
     saw_busy = False
+    last_info: dict[str, Any] = {}
     while time.time() < deadline:
         info = await _page_result_stats(page)
-        busy = bool(info.get("busy"))
+        last_info = info if isinstance(info, dict) else {}
+        busy = bool(last_info.get("busy"))
+        ui_done = bool(last_info.get("uiDone"))
         if busy:
             saw_busy = True
-        text_len = int(info.get("textLen") or 0)
-        img_count = int(info.get("imgCount") or 0)
-        sig = (text_len, img_count, busy)
+        text_len = int(last_info.get("textLen") or 0)
+        img_count = int(last_info.get("imgCount") or 0)
+        sig = (text_len, img_count, busy, ui_done)
         has_payload = text_len > 20 or img_count >= min_images
         if want_images:
             has_payload = img_count >= min_images or text_len > 40
 
-        if not busy and has_payload:
+        # Bắt buộc: không còn Stop/Thinking/streaming
+        ready = (not busy) and has_payload and (ui_done if require_ui_done else True)
+        if ready:
             if sig == last_sig:
                 stable += 1
-                # images: need a bit more settle time
-                need = 4 if want_images else 3
+                need = 5 if want_images else 4
                 if stable >= need:
-                    await asyncio.sleep(1.2)
-                    return
+                    logger.info(
+                        "UI DONE — stop=%s statusBusy=%s streaming=%s textLen=%s stable=%s",
+                        last_info.get("stop"),
+                        last_info.get("statusBusy"),
+                        last_info.get("streaming"),
+                        text_len,
+                        stable,
+                    )
+                    await asyncio.sleep(0.8)
+                    return last_info
             else:
                 stable = 0
         else:
             stable = 0
-            # If never saw Stop and already have images, don't spin forever
+            if busy:
+                logger.debug(
+                    "UI still generating stop=%s status=%r streaming=%s textLen=%s",
+                    last_info.get("stop"),
+                    last_info.get("statusText"),
+                    last_info.get("streaming"),
+                    text_len,
+                )
             if (
                 want_images
                 and not busy
@@ -683,10 +823,48 @@ async def _wait_generation_done(
                 and (saw_busy or time.time() + 25 > deadline)
             ):
                 stable += 1
-                if stable >= 2:
-                    return
+                if stable >= 3:
+                    return last_info
         last_sig = sig
         await asyncio.sleep(0.7)
+
+    logger.warning(
+        "UI DONE wait timeout — busy=%s uiDone=%s textLen=%s status=%r",
+        last_info.get("busy"),
+        last_info.get("uiDone"),
+        last_info.get("textLen"),
+        last_info.get("statusText"),
+    )
+    return last_info
+
+
+async def _wait_ui_done_before_return(
+    page,
+    *,
+    text: str,
+    max_wait_s: float = 180.0,
+) -> str:
+    """Không trả kết quả khi UI còn Stop/Thinking — chờ DONE rồi scrape lại text dài hơn."""
+    logger.info(
+        "chờ UI DONE trước khi trả kết quả (len=%s complete=%s)",
+        len(text or ""),
+        _is_answer_complete(text or ""),
+    )
+    await _wait_generation_done(
+        page,
+        max_wait_s=max_wait_s,
+        want_images=False,
+        require_ui_done=True,
+    )
+    # Sau DONE: lấy bản text dài nhất từ DOM (tránh bản SSE cắt sớm)
+    try:
+        scraped = await _scrape_result_media(page)
+        scraped_text = _normalize_answer_text(scraped.get("text") or "")
+        if _is_usable_answer_text(scraped_text) and len(scraped_text) >= len(text or ""):
+            return scraped_text
+    except Exception:
+        pass
+    return text or ""
 
 
 async def _scrape_result_media(page) -> dict[str, Any]:
@@ -1103,6 +1281,23 @@ async def _poll_conversation_detail(
                 return {"text": text, "images": images, "messageId": None}
             continue
 
+        if _is_answer_complete(text):
+            mid = None
+            for msg in reversed(slice_msgs):
+                if _is_thought_message(msg):
+                    continue
+                role = ((msg.get("author") or {}) if isinstance(msg.get("author"), dict) else {}).get(
+                    "role"
+                )
+                if role == "assistant" and msg.get("id"):
+                    mid = str(msg["id"])
+                    break
+            return {"text": text, "images": ready_imgs or images, "messageId": mid}
+
+        # Incomplete JSON / still streaming — keep polling conversation API
+        if _is_usable_answer_text(text) and not _is_answer_complete(text):
+            continue
+
         if _is_usable_answer_text(text):
             mid = None
             for msg in reversed(slice_msgs):
@@ -1225,6 +1420,8 @@ async def _await_after_handoff(
     images = list(seed_images or [])
     message_id = seed_message_id
     deadline = time.time() + max_wait_s
+    last_len = len(text)
+    stable_rounds = 0
 
     if topic_id or resume_token:
         resumed = await _try_resume_sse(
@@ -1232,30 +1429,40 @@ async def _await_after_handoff(
             topic_id=topic_id,
             resume_token=resume_token,
             conversation_id=conversation_id,
-            timeout_s=min(45.0, max_wait_s),
+            timeout_s=min(60.0, max_wait_s),
         )
         if resumed.get("text") and _is_usable_answer_text(str(resumed["text"])):
-            text = str(resumed["text"])
+            cand = _normalize_answer_text(str(resumed["text"]))
+            if len(cand) >= len(text):
+                text = cand
         if resumed.get("messageId"):
             message_id = resumed.get("messageId") or message_id
         images = _merge_images(images, resumed.get("images") or [])
         if resumed.get("conversationId"):
             conversation_id = resumed.get("conversationId") or conversation_id
-        if _is_usable_answer_text(text) and not want_images:
-            return {
-                "text": text,
-                "images": images,
-                "messageId": message_id,
-                "conversationId": conversation_id,
-            }
+        # Không thoát sớm sau resume SSE — vẫn phải chờ UI DONE bên dưới
+        if _is_answer_complete(text) and not want_images:
+            logger.info(
+                "resume SSE có text complete len=%s — vẫn chờ UI DONE",
+                len(text),
+            )
 
     while time.time() < deadline:
         try:
             await _wait_generation_done(
                 page,
-                max_wait_s=min(8.0, max(2.0, deadline - time.time())),
+                max_wait_s=min(12.0, max(2.0, deadline - time.time())),
                 want_images=want_images,
             )
+        except Exception:
+            pass
+
+        busy = False
+        ui_done = False
+        try:
+            stats = await _page_result_stats(page)
+            busy = bool(stats.get("busy"))
+            ui_done = bool(stats.get("uiDone"))
         except Exception:
             pass
 
@@ -1284,16 +1491,88 @@ async def _await_after_handoff(
                 message_id = detail.get("messageId") or message_id
             images = _merge_images(images, detail.get("images") or [])
 
-        if _is_usable_answer_text(text) and (not want_images or images):
+        # Stability: length unchanged across rounds while UI DONE
+        if len(text) == last_len and not busy and ui_done:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_len = len(text)
+
+        complete = _is_answer_complete(text)
+        # Chỉ thoát khi UI DONE (hết Stop/Thinking) + JSON/text đủ + ổn định
+        if (
+            complete
+            and ui_done
+            and not busy
+            and (not want_images or images)
+            and stable_rounds >= 2
+        ):
+            logger.info(
+                "handoff wait UI DONE len=%s json=%s stable=%s",
+                len(text),
+                _looks_like_json_payload(text),
+                stable_rounds,
+            )
             break
+        if busy or not ui_done:
+            logger.info(
+                "handoff wait: chưa UI DONE busy=%s uiDone=%s len=%s — tiếp tục",
+                busy,
+                ui_done,
+                len(text),
+            )
+        elif _looks_like_json_payload(text) and not complete:
+            logger.info(
+                "handoff wait: incomplete JSON len=%s — tiếp tục chờ",
+                len(text),
+            )
         await asyncio.sleep(1.2)
+
+    if _looks_like_json_payload(text) and not _is_answer_complete(text):
+        logger.warning(
+            "handoff wait ended with incomplete JSON len=%s preview=%r",
+            len(text),
+            text[:120],
+        )
 
     return {
         "text": text if _is_usable_answer_text(text) else "",
         "images": images,
         "messageId": message_id,
         "conversationId": conversation_id,
+        "complete": _is_answer_complete(text),
     }
+
+
+def _content_path_relevant(path: str) -> bool:
+    p = str(path or "")
+    return (not p) or ("/content/parts/" in p) or p.endswith("/parts/0") or p == "/message/content/parts/0"
+
+
+def _apply_delta_op_to_text(current: str, op: dict[str, Any]) -> str:
+    """Apply ChatGPT SSE delta op (append/replace/truncate/patch) onto assistant text."""
+    if not isinstance(op, dict):
+        return current
+    o = op.get("o")
+    p = str(op.get("p") or "")
+    v = op.get("v")
+    if o == "patch" and isinstance(v, list):
+        out = current
+        for sub in v:
+            if isinstance(sub, dict):
+                out = _apply_delta_op_to_text(out, sub)
+        return out
+    if not _content_path_relevant(p):
+        return current
+    if o == "append" and isinstance(v, str):
+        return current if v in _SSE_OP_NAMES else (current + v)
+    if o == "replace" and isinstance(v, str):
+        return "" if v in _SSE_OP_NAMES else v
+    if o == "truncate":
+        if isinstance(v, int) and v >= 0:
+            return current[:v]
+        return ""
+    return current
 
 
 def _extract_text_from_delta_ops(ops: Any) -> str:
@@ -1301,17 +1580,8 @@ def _extract_text_from_delta_ops(ops: Any) -> str:
         return ""
     out = ""
     for op in ops:
-        if not isinstance(op, dict):
-            continue
-        if op.get("o") == "append" and isinstance(op.get("v"), str):
-            chunk = op["v"]
-            if chunk in _SSE_OP_NAMES:
-                continue
-            p = str(op.get("p") or "")
-            if (not p) or ("/content/parts/" in p) or p == "/message/content/parts/0":
-                out += chunk
-        elif op.get("o") == "patch" and isinstance(op.get("v"), list):
-            out += _extract_text_from_delta_ops(op["v"])
+        if isinstance(op, dict):
+            out = _apply_delta_op_to_text(out, op)
     return out
 
 
@@ -1332,15 +1602,12 @@ def _extract_text_from_event(data: dict[str, Any]) -> str:
         return ""
 
     # Never use operation name fields as content
-    if data.get("o") in _SSE_OP_NAMES and not isinstance(data.get("v"), (str, list)):
+    if data.get("o") in _SSE_OP_NAMES and not isinstance(data.get("v"), (str, list, int)):
         return ""
 
-    # {"o":"patch","v":[...]} or {"o":"append","v":"chunk"}
-    if data.get("o") == "patch" and isinstance(data.get("v"), list):
-        return _extract_text_from_delta_ops(data["v"])
-    if data.get("o") == "append" and isinstance(data.get("v"), str):
-        chunk = data["v"]
-        return "" if chunk in _SSE_OP_NAMES else chunk
+    # {"o":"patch","v":[...]} or {"o":"append|replace|truncate","v":...}
+    if data.get("o") in ("patch", "append", "replace", "truncate"):
+        return _apply_delta_op_to_text("", data)
 
     # Compact append: {"v":"chunk"} without o/p — skip bare op names
     if (
@@ -1508,16 +1775,35 @@ def _parse_sse_body(body: str) -> dict[str, Any]:
                     if texts:
                         candidate = "".join(texts)
                         if not _is_status_placeholder(candidate):
-                            assistant_text = candidate
+                            # Prefer longer snapshot (streaming may send partial then full)
+                            if len(candidate) >= len(assistant_text):
+                                assistant_text = candidate
                             _collect_images_from_parts(parts, images)
-                        if data.get("o") not in ("append", "patch") and not (
+                        if data.get("o") not in ("append", "patch", "replace", "truncate") and not (
                             isinstance(data.get("v"), str)
                         ):
                             continue
 
-            piece = _extract_text_from_event(data)
-            if piece and piece not in _SSE_OP_NAMES and not _is_status_placeholder(piece):
-                assistant_text += piece
+            # Delta ops must mutate assistant_text (replace/truncate ≠ append)
+            if data.get("o") in ("patch", "append", "replace", "truncate"):
+                before_len = len(assistant_text)
+                assistant_text = _apply_delta_op_to_text(assistant_text, data)
+                if _is_status_placeholder(assistant_text):
+                    assistant_text = ""
+                elif len(assistant_text) < before_len and data.get("o") == "append":
+                    # defensive: append should not shrink
+                    pass
+            else:
+                piece = _extract_text_from_event(data)
+                if piece and piece not in _SSE_OP_NAMES and not _is_status_placeholder(piece):
+                    # Avoid double-append when piece equals a full snapshot already applied
+                    if piece != assistant_text:
+                        if assistant_text and piece.startswith(assistant_text):
+                            assistant_text = piece
+                        elif not (assistant_text and assistant_text.endswith(piece)):
+                            assistant_text += piece
+                        elif len(piece) > len(assistant_text):
+                            assistant_text = piece
 
             # Images via patch ops
             if data.get("o") == "patch" and isinstance(data.get("v"), list):
@@ -2506,21 +2792,22 @@ async def run_playwright_chat(
                 )
 
                 # stream_handoff + [DONE] bootstrap ≠ final answer
-                # (Thinking / Analyzing image cũng chưa phải kết quả)
+                # (Thinking / Analyzing image / JSON chưa đóng cũng chưa phải kết quả)
                 need_wait = (
                     handoff
-                    or not _is_usable_answer_text(text)
+                    or not _is_answer_complete(text)
                     or _is_status_placeholder(parsed.get("text") or "")
                 )
                 if need_wait and not wait_for_images:
                     logger.info(
                         "slot=%s conversation handoff/placeholder — chờ final "
-                        "handoff=%s topic=%s conversation_id=%s text=%r",
+                        "handoff=%s topic=%s conversation_id=%s text=%r complete=%s",
                         slot.id,
                         handoff,
                         (parsed.get("handoff_topic_id") or "")[:40],
                         (conversation_id or "")[:12],
                         str(parsed.get("text") or "")[:60],
+                        _is_answer_complete(text),
                     )
                     waited = await _await_after_handoff(
                         page,
@@ -2530,7 +2817,7 @@ async def run_playwright_chat(
                         seed_text=text,
                         seed_images=_merge_images(out_images, net_images),
                         seed_message_id=message_id,
-                        max_wait_s=min(240.0, max(120.0, timeout_s)),
+                        max_wait_s=min(300.0, max(180.0, timeout_s)),
                         want_images=False,
                     )
                     text = _normalize_answer_text(waited.get("text") or text)
@@ -2540,10 +2827,19 @@ async def run_playwright_chat(
                     if waited.get("conversationId"):
                         conversation_id = waited.get("conversationId") or conversation_id
                     # Final answer sẵn → coi như stream done thật
-                    if _is_usable_answer_text(text):
+                    if _is_answer_complete(text):
                         stream_done = True
 
-                if stream_done and _is_usable_answer_text(text) and not wait_for_images:
+                # Luôn chờ UI DONE (hết Stop / Thinking / streaming) trước khi trả —
+                # SSE [DONE] bootstrap ≠ ChatGPT đã hiển thị xong trên màn hình.
+                text = await _wait_ui_done_before_return(
+                    page,
+                    text=text,
+                    max_wait_s=min(240.0, max(90.0, timeout_s)),
+                )
+                text = _normalize_answer_text(text)
+
+                if stream_done and _is_answer_complete(text) and not wait_for_images:
                     out = {
                         "ok": True,
                         "text": text,
@@ -2561,6 +2857,61 @@ async def run_playwright_chat(
                     }
                     await _ready_for_next_task(page)
                     return out
+
+                # JSON/text vẫn cắt — poll thêm trước khi trả
+                if (
+                    not wait_for_images
+                    and _is_usable_answer_text(text)
+                    and not _is_answer_complete(text)
+                ):
+                    logger.info(
+                        "slot=%s answer incomplete (json/stream) len=%s — chờ thêm",
+                        slot.id,
+                        len(text),
+                    )
+                    waited2 = await _await_after_handoff(
+                        page,
+                        conversation_id=conversation_id,
+                        topic_id=parsed.get("handoff_topic_id"),
+                        resume_token=parsed.get("resume_token"),
+                        seed_text=text,
+                        seed_images=_merge_images(out_images, net_images),
+                        seed_message_id=message_id,
+                        max_wait_s=min(180.0, max(90.0, timeout_s * 0.5)),
+                        want_images=False,
+                    )
+                    cand = _normalize_answer_text(waited2.get("text") or "")
+                    if len(cand) >= len(text):
+                        text = cand
+                    out_images = _merge_images(
+                        out_images, waited2.get("images") or [], net_images
+                    )
+                    if waited2.get("messageId"):
+                        message_id = waited2.get("messageId") or message_id
+                    text = await _wait_ui_done_before_return(
+                        page,
+                        text=text,
+                        max_wait_s=min(120.0, max(60.0, timeout_s * 0.4)),
+                    )
+                    text = _normalize_answer_text(text)
+                    if _is_answer_complete(text) and not wait_for_images:
+                        out = {
+                            "ok": True,
+                            "text": text,
+                            "conversationId": conversation_id,
+                            "messageId": message_id,
+                            "images": _merge_images(out_images, net_images),
+                            "files": [],
+                            "uploadedImages": [],
+                            "endpoint": response.url,
+                            "model": None,
+                            "via": "playwright",
+                            "page_url": target_url,
+                            "stream_done": True,
+                            "slot_id": slot.id,
+                        }
+                        await _ready_for_next_task(page)
+                        return out
 
                 if wait_for_images:
                     logger.info(
@@ -2631,6 +2982,16 @@ async def run_playwright_chat(
                 text = _normalize_answer_text(text)
                 if _is_status_placeholder(text):
                     text = ""
+                # Final gate: chờ UI DONE rồi scrape lại (tránh trả khi còn Stop/Thinking)
+                if _is_usable_answer_text(text) or wait_for_images:
+                    text = await _wait_ui_done_before_return(
+                        page,
+                        text=text,
+                        max_wait_s=min(180.0, max(60.0, timeout_s * 0.5)),
+                    )
+                    text = _normalize_answer_text(text)
+                    if _is_status_placeholder(text):
+                        text = ""
                 out_images = _filter_result_images(_merge_images(out_images, net_images))
 
                 if wait_for_images or out_images:
