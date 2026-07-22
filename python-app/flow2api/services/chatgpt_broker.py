@@ -342,6 +342,9 @@ class ChatgptBroker:
             want = status.strip().lower()
             if want == "active":
                 jobs = [j for j in jobs if j.status in ("queued", "running")]
+            elif want in ("failed", "error", "errors"):
+                # cancelled cũng là lỗi — hiện cùng filter Lỗi trên dashboard
+                jobs = [j for j in jobs if j.status in ("failed", "cancelled")]
             else:
                 jobs = [j for j in jobs if j.status == want]
         jobs.sort(key=lambda j: j.created_at, reverse=True)
@@ -368,12 +371,21 @@ class ChatgptBroker:
         if not job:
             return
         if job.status == "cancelled":
+            # Giữ cancelled; đảm bảo error luôn có để frontend nhận lỗi
+            if not job.error:
+                job.error = error or "cancelled"
             self._public_tasks.pop(job_id, None)
             return
         old = job.status
         if error:
-            job.status = "failed"
-            job.error = error
+            err = str(error)
+            # CancelledError / explicit cancel → status cancelled (vẫn là lỗi khi poll)
+            if err.strip().lower() in ("cancelled", "canceled", "cancellederror"):
+                job.status = "cancelled"
+                job.error = "cancelled"
+            else:
+                job.status = "failed"
+                job.error = err
             job.result = result
         else:
             job.status = "done"
@@ -396,9 +408,14 @@ class ChatgptBroker:
             if t.cancelled():
                 job = self._public_jobs.get(job_id)
                 if job and job.status in ("queued", "running"):
+                    old = job.status
                     job.status = "cancelled"
                     job.error = "cancelled"
                     job.touch()
+                    try:
+                        chatgpt_counters.on_status_transition(old, "cancelled")
+                    except Exception:
+                        pass
             else:
                 exc = t.exception()
                 if exc is not None:

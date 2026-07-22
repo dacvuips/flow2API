@@ -566,7 +566,11 @@ def public_job_payload(job_id: str) -> dict[str, Any]:
     payload = job.to_dict(include_result=True)
     if isinstance(payload.get("result"), dict):
         payload["result"] = sanitize_chatgpt_result_for_poll(payload["result"])
-    payload["ok"] = job.status != "failed"
+    # cancelled = lỗi (giống failed) — client poll phải nhận ok:false + error
+    terminal_err = job.status in ("failed", "cancelled")
+    payload["ok"] = not terminal_err
+    if terminal_err and not payload.get("error"):
+        payload["error"] = job.error or job.status
     if job.status == "done" and isinstance(job.result, dict):
         # Flatten common fields for convenient poll clients
         safe_result = sanitize_chatgpt_result_for_poll(job.result) or {}

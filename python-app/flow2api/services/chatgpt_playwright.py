@@ -944,10 +944,6 @@ async def _wait_images_after_stream_done(
             logger.info("images ready after DONE attempt=%s count=%s", attempt, len(ready))
             return {"text": text, "images": ready}
 
-        try:
-            await _human_scroll_burst(page, rounds=1)
-        except Exception:
-            pass
         await asyncio.sleep(interval_s)
 
     logger.warning("images still missing after DONE wait=%.0fs attempts=%s", max_wait_s, attempt)
@@ -1721,7 +1717,7 @@ async def _fill_prompt(page, prompt: str) -> None:
 
 
 async def _find_enabled_send(page):
-    """Locate the black up-arrow send button (not mic / not disabled)."""
+    """Locate the black up-arrow send button (composer bottom-right, not mic)."""
     for name in ("Send prompt", "Send message", "Send", "Gửi"):
         try:
             loc = page.get_by_role("button", name=re.compile(rf"^{re.escape(name)}$", re.I)).first
@@ -1755,59 +1751,169 @@ async def _find_enabled_send(page):
 
 
 async def _js_click_send(page) -> bool:
-    """Direct DOM click on composer send arrow — most reliable for ChatGPT redesign."""
+    """Click composer bottom-right up-arrow (black circle) — avoid mic / High menu."""
     try:
-        return bool(
-            await page.evaluate(
-                """() => {
-                  const root = document.querySelector('form[data-type="unified-composer"]')
-                    || document.querySelector('form')
-                    || document.body;
-                  const buttons = [...root.querySelectorAll('button')];
-                  const labelOf = (el) =>
-                    ((el.getAttribute('aria-label') || '') + ' '
-                      + (el.getAttribute('data-testid') || '') + ' '
-                      + (el.title || '')).toLowerCase();
-                  const bad = (el) =>
-                    el.disabled
-                    || el.getAttribute('aria-disabled') === 'true'
-                    || /dictat|microphone|voice|speech|attach|upload|plus|medium|model/.test(labelOf(el));
-                  const isSend = (el) => {
-                    const t = labelOf(el);
-                    return el.getAttribute('data-testid') === 'send-button'
-                      || /send prompt|send message|^send$|gửi/.test(t);
+        result = await page.evaluate(
+            """() => {
+              const form = document.querySelector('form[data-type="unified-composer"]')
+                || document.querySelector('form:has(#prompt-textarea)')
+                || document.querySelector('form:has([data-testid="prompt-textarea"])')
+                || document.querySelector('form:has(div.ProseMirror)')
+                || document.querySelector('form');
+              if (!form) return { ok: false, reason: 'no_form' };
+
+              const labelOf = (el) =>
+                ((el.getAttribute('aria-label') || '') + ' '
+                  + (el.getAttribute('data-testid') || '') + ' '
+                  + (el.getAttribute('title') || '') + ' '
+                  + (el.innerText || '')).toLowerCase();
+              const isBad = (el) => {
+                if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return true;
+                const t = labelOf(el);
+                return /dictat|microphone|voice|speech|attach|upload|plus|file|photo|image|high|model|reason/.test(t);
+              };
+              const isSendLabel = (el) => {
+                const t = labelOf(el);
+                return el.getAttribute('data-testid') === 'send-button'
+                  || /send prompt|send message|^send$|gửi/.test(t);
+              };
+              const hasUpArrowSvg = (el) => {
+                const svg = el.querySelector('svg');
+                if (!svg) return false;
+                const html = (svg.innerHTML || '').toLowerCase();
+                // ChatGPT send: lucide arrow-up (M12 19V5 / l7-7 etc). Avoid mic waveform SVGs.
+                if (/mic|audio|wave|circle.*cx/.test(html) && !/m12 19|l7-7|7 12/.test(html)) return false;
+                return /m12 19|v5|l7-7|arrow.?up|send/.test(html)
+                  || (svg.querySelectorAll('path, polyline, line').length > 0
+                      && !/dictat|microphone|voice/.test(labelOf(el)));
+              };
+
+              // 1) Explicit send testid / aria
+              let hit = [...form.querySelectorAll('button')].find(b => isSendLabel(b) && !isBad(b));
+              if (hit) {
+                hit.focus();
+                hit.click();
+                return { ok: true, via: 'label', label: labelOf(hit).slice(0, 60) };
+              }
+
+              // 2) Bottom-right round control with up-arrow SVG (exclude mic)
+              const formRect = form.getBoundingClientRect();
+              const cands = [...form.querySelectorAll('button')]
+                .filter(b => !isBad(b))
+                .map(b => {
+                  const r = b.getBoundingClientRect();
+                  return {
+                    b, r,
+                    right: r.right,
+                    bottom: r.bottom,
+                    w: r.width,
+                    h: r.height,
+                    up: hasUpArrowSvg(b),
+                    distRight: formRect.right - r.right,
+                    distBottom: formRect.bottom - r.bottom,
                   };
-                  let hit = buttons.find(b => isSend(b) && !bad(b));
-                  if (!hit) {
-                    // rightmost small enabled button in composer (black up-arrow)
-                    const cands = buttons
-                      .filter(b => !bad(b))
-                      .map(b => ({b, r: b.getBoundingClientRect()}))
-                      .filter(x => x.r.width >= 24 && x.r.height >= 24 && x.r.width <= 64)
-                      .sort((a, c) => c.r.right - a.r.right);
-                    hit = cands[0] && isSend(cands[0].b) ? cands[0].b
-                      : (cands.find(x => isSend(x.b)) || {}).b
-                      || null;
-                    // If still none, take rightmost circular toolbar btn that is not mic
-                    if (!hit && cands.length) hit = cands[0].b;
-                  }
-                  if (!hit) return false;
-                  hit.focus();
-                  hit.click();
-                  return true;
-                }"""
-            )
+                })
+                .filter(x =>
+                  x.w >= 28 && x.w <= 64 && x.h >= 28 && x.h <= 64
+                  && x.r.top >= formRect.top
+                  && x.distBottom >= -8 && x.distBottom <= 80
+                  && x.distRight >= -8 && x.distRight <= 120
+                )
+                .sort((a, c) => (a.distRight - c.distRight) || (a.distBottom - c.distBottom));
+
+              hit = (cands.find(x => x.up) || cands[0] || {}).b || null;
+              if (!hit) {
+                return {
+                  ok: false,
+                  reason: 'no_send_btn',
+                  buttons: [...form.querySelectorAll('button')].slice(0, 12).map(b => ({
+                    label: labelOf(b).slice(0, 40),
+                    disabled: !!b.disabled,
+                    aria: b.getAttribute('aria-disabled'),
+                    w: Math.round(b.getBoundingClientRect().width),
+                    h: Math.round(b.getBoundingClientRect().height),
+                  })),
+                };
+              }
+              hit.focus();
+              hit.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+              hit.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+              hit.click();
+              hit.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+              hit.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));
+              return {
+                ok: true,
+                via: 'geo-arrow',
+                label: labelOf(hit).slice(0, 60),
+                rect: (() => {
+                  const r = hit.getBoundingClientRect();
+                  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+                })(),
+              };
+            }"""
         )
+        ok = bool(result and result.get("ok"))
+        if ok:
+            logger.info("js send click ok via=%s label=%s", result.get("via"), result.get("label"))
+        else:
+            logger.warning("js send click miss: %s", result)
+        return ok
     except Exception as exc:
         logger.warning("js click send failed: %s", exc)
         return False
 
 
+async def _click_send_by_point(page) -> bool:
+    """Last-resort: mouse click center of detected send button rect."""
+    try:
+        box = await page.evaluate(
+            """() => {
+              const form = document.querySelector('form[data-type="unified-composer"]')
+                || document.querySelector('form:has(div.ProseMirror)')
+                || document.querySelector('form');
+              if (!form) return null;
+              const btn = form.querySelector('[data-testid="send-button"]')
+                || [...form.querySelectorAll('button')].find(b =>
+                    /send prompt|send message|^send$/i.test(b.getAttribute('aria-label') || '')
+                  );
+              let hit = btn;
+              if (!hit) {
+                const formRect = form.getBoundingClientRect();
+                const cands = [...form.querySelectorAll('button')]
+                  .filter(b => !b.disabled && b.getAttribute('aria-disabled') !== 'true')
+                  .map(b => ({ b, r: b.getBoundingClientRect() }))
+                  .filter(x => x.r.width >= 28 && x.r.width <= 64 && x.r.height >= 28 && x.r.height <= 64)
+                  .filter(x => formRect.right - x.r.right <= 100)
+                  .sort((a, c) => c.r.right - a.r.right);
+                hit = cands[0] && cands[0].b;
+              }
+              if (!hit) return null;
+              const r = hit.getBoundingClientRect();
+              return { x: r.left + r.width / 2, y: r.top + r.height / 2, disabled: !!hit.disabled };
+            }"""
+        )
+        if not box or box.get("disabled"):
+            return False
+        await page.mouse.click(float(box["x"]), float(box["y"]))
+        logger.info("send arrow clicked (mouse point %.0f,%.0f)", box["x"], box["y"])
+        return True
+    except Exception as exc:
+        logger.warning("point click send failed: %s", exc)
+        return False
+
+
 async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) -> None:
-    # After long prompt (+ image) ChatGPT needs a few seconds before up-arrow accepts click.
+    # After long prompt (+ image) ChatGPT needs a few seconds before up-arrow enables.
     wait_s = max(5.0, float(settle_s or 0)) + (2.0 if has_images else 0.0)
-    logger.info("waiting %.1fs before clicking send arrow (images=%s) with human scroll", wait_s, has_images)
-    await _idle_with_human_motion(page, wait_s)
+    logger.info("waiting %.1fs before clicking send arrow (images=%s) — no scroll", wait_s, has_images)
+    # Plain wait only (no page scroll — scroll can steal focus / miss the arrow)
+    deadline_wait = time.time() + wait_s
+    while time.time() < deadline_wait:
+        await _dismiss_rate_limit_modal(page)
+        remaining = deadline_wait - time.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(remaining, 0.8))
 
     await _dismiss_rate_limit_modal(page)
 
@@ -1817,6 +1923,15 @@ async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) 
         except Exception:
             pass
 
+    # Ensure composer still focused before looking for enabled send
+    try:
+        box = page.locator(
+            "#prompt-textarea, [data-testid='prompt-textarea'], div.ProseMirror[contenteditable='true']"
+        ).first
+        await box.click(timeout=2000)
+    except Exception:
+        pass
+
     deadline = time.time() + 25
     send = None
     last_err: Exception | None = None
@@ -1824,7 +1939,7 @@ async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) 
         try:
             send = await _find_enabled_send(page)
             if send is not None:
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.4)
                 if await _find_enabled_send(page) is not None:
                     break
                 send = None
@@ -1832,46 +1947,49 @@ async def _click_send(page, *, settle_s: float = 5.0, has_images: bool = False) 
             last_err = exc
         await asyncio.sleep(0.25)
 
-    logger.info("clicking ChatGPT send arrow…")
+    composer_preview = ""
+    try:
+        composer_preview = (await _read_composer_text(page))[:80]
+    except Exception:
+        pass
+    logger.info("clicking ChatGPT send arrow… composer=%r", composer_preview)
 
-    # 1) JS click inside composer (most reliable with image + long prompt)
+    # 1) JS click bottom-right up-arrow (most reliable)
     if await _js_click_send(page):
-        logger.info("send arrow clicked (js composer)")
         await asyncio.sleep(0.4)
         return
 
+    # 2) Playwright locator click (no scroll_into_view — avoids scrolling textarea)
     if send is not None:
         try:
-            await send.scroll_into_view_if_needed(timeout=3000)
-        except Exception:
-            pass
-        try:
-            await send.click(timeout=8000)
-            logger.info("send arrow clicked (normal)")
+            await send.click(timeout=8000, force=True)
+            logger.info("send arrow clicked (force locator)")
             return
         except Exception as exc:
             last_err = exc
-            logger.warning("send click failed, retry force: %s", exc)
-        try:
-            await send.click(timeout=5000, force=True)
-            logger.info("send arrow clicked (force)")
-            return
-        except Exception as exc:
-            last_err = exc
+            logger.warning("send locator click failed: %s", exc)
 
-    # Fallback: Enter in composer
+    # 3) Coordinate click on computed button center
+    if await _click_send_by_point(page):
+        await asyncio.sleep(0.3)
+        return
+
+    # 4) Fallback: Ctrl+Enter / Enter in composer
     try:
         box = page.locator(
             "#prompt-textarea, [data-testid='prompt-textarea'], div.ProseMirror[contenteditable='true']"
         ).first
         await box.click(timeout=3000)
-        await page.keyboard.press("Enter")
+        try:
+            await page.keyboard.press("Control+Enter")
+        except Exception:
+            await page.keyboard.press("Enter")
         logger.warning("send click fallback — pressed Enter (%s)", last_err)
         return
     except Exception as exc:
         raise TimeoutError(
-            f"send_button_not_found — Không nhấn được nút mũi tên gửi. "
-            f"Composer text={await _read_composer_text(page)!r:.80}. ({exc or last_err})"
+            f"send_button_not_found — Không nhấn được nút mũi tên gửi (góc dưới phải). "
+            f"Composer text={composer_preview!r}. ({exc or last_err})"
         ) from exc
 
 
@@ -1930,46 +2048,15 @@ async def _upload_images(page, images: list[dict[str, Any]], tmp_dir: Path) -> l
     return paths
 
 
-async def _human_scroll_burst(page, rounds: int = 2) -> None:
-    """Scroll mouse wheel up/down + small moves to look like a human."""
-    try:
-        for _ in range(max(1, rounds)):
-            dy = random.randint(140, 480) * random.choice([1, -1])
-            await page.mouse.wheel(0, dy)
-            await asyncio.sleep(random.uniform(0.12, 0.45))
-            await page.mouse.move(
-                random.randint(180, 980),
-                random.randint(140, 720),
-                steps=random.randint(4, 12),
-            )
-            await asyncio.sleep(random.uniform(0.08, 0.35))
-    except Exception:
-        pass
-
-
-async def _idle_with_human_motion(page, seconds: float) -> None:
-    """Wait while occasionally scrolling — used between actions / before send."""
+async def _idle_plain(page, seconds: float) -> None:
+    """Wait without scrolling (scroll was interfering with composer / send arrow)."""
     deadline = time.time() + max(0.0, float(seconds or 0))
     while time.time() < deadline:
         await _dismiss_rate_limit_modal(page)
-        await _human_scroll_burst(page, rounds=random.randint(1, 2))
         remaining = deadline - time.time()
         if remaining <= 0:
             break
-        await asyncio.sleep(min(remaining, random.uniform(0.7, 1.6)))
-
-
-async def _scroll_while_waiting(page, stop: asyncio.Event) -> None:
-    """Background human motion until stop is set (while waiting for ChatGPT reply)."""
-    while not stop.is_set():
-        try:
-            await _human_scroll_burst(page, rounds=1)
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=random.uniform(1.2, 2.8))
-        except asyncio.TimeoutError:
-            continue
+        await asyncio.sleep(min(remaining, 0.8))
 
 
 async def _click_new_chat(page) -> bool:
@@ -2031,7 +2118,7 @@ async def _click_new_chat(page) -> bool:
 
 
 async def _ready_for_next_task(page) -> None:
-    """After a job finishes: open New chat and idle briefly with human motion."""
+    """After a job finishes: open New chat and idle briefly (no scroll)."""
     try:
         clicked = await _click_new_chat(page)
         if not clicked:
@@ -2041,7 +2128,7 @@ async def _ready_for_next_task(page) -> None:
                 await asyncio.sleep(0.8)
             except Exception:
                 pass
-        await _idle_with_human_motion(page, random.uniform(1.2, 2.5))
+        await _idle_plain(page, random.uniform(1.2, 2.5))
     except Exception as exc:
         logger.warning("ready_for_next_task failed: %s", exc)
 
@@ -2223,18 +2310,9 @@ async def run_playwright_chat(
                     return False
 
             try:
-                scroll_stop = asyncio.Event()
-                scroll_task = asyncio.create_task(_scroll_while_waiting(page, scroll_stop))
-                try:
-                    async with page.expect_response(_match, timeout=timeout_ms) as resp_info:
-                        await _click_send(page, settle_s=5.0, has_images=bool(images))
-                    response = await resp_info.value
-                finally:
-                    scroll_stop.set()
-                    try:
-                        await asyncio.wait_for(scroll_task, timeout=2.0)
-                    except Exception:
-                        scroll_task.cancel()
+                async with page.expect_response(_match, timeout=timeout_ms) as resp_info:
+                    await _click_send(page, settle_s=5.0, has_images=bool(images))
+                response = await resp_info.value
                 try:
                     await response.finished()
                 except Exception:
