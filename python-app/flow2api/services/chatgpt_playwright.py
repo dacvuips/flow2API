@@ -792,7 +792,7 @@ async def _wait_generation_done(
         if ready:
             if sig == last_sig:
                 stable += 1
-                need = 5 if want_images else 4
+                need = 3 if want_images else 2
                 if stable >= need:
                     logger.info(
                         "UI DONE — stop=%s statusBusy=%s streaming=%s textLen=%s stable=%s",
@@ -838,25 +838,41 @@ async def _wait_generation_done(
     return last_info
 
 
+async def _is_ui_already_done(page) -> bool:
+    """True khi ChatGPT UI đã xong (hết Stop/Thinking/streaming)."""
+    try:
+        info = await _page_result_stats(page)
+        return bool(info.get("uiDone")) and not bool(info.get("busy"))
+    except Exception:
+        return False
+
+
 async def _wait_ui_done_before_return(
     page,
     *,
     text: str,
     max_wait_s: float = 180.0,
 ) -> str:
-    """Không trả kết quả khi UI còn Stop/Thinking — chờ DONE rồi scrape lại text dài hơn."""
-    logger.info(
-        "chờ UI DONE trước khi trả kết quả (len=%s complete=%s)",
-        len(text or ""),
-        _is_answer_complete(text or ""),
-    )
-    await _wait_generation_done(
-        page,
-        max_wait_s=max_wait_s,
-        want_images=False,
-        require_ui_done=True,
-    )
-    # Sau DONE: lấy bản text dài nhất từ DOM (tránh bản SSE cắt sớm)
+    """Chờ UI DONE rồi scrape text — bỏ qua nếu UI đã xong (tránh chờ trùng ~3–5s)."""
+    already = await _is_ui_already_done(page)
+    if already and _is_answer_complete(text):
+        logger.info(
+            "UI đã DONE — bỏ qua chờ, scrape lại (len=%s)",
+            len(text or ""),
+        )
+    else:
+        logger.info(
+            "chờ UI DONE trước khi trả kết quả (len=%s complete=%s already=%s)",
+            len(text or ""),
+            _is_answer_complete(text or ""),
+            already,
+        )
+        await _wait_generation_done(
+            page,
+            max_wait_s=max_wait_s,
+            want_images=False,
+            require_ui_done=True,
+        )
     try:
         scraped = await _scrape_result_media(page)
         scraped_text = _normalize_answer_text(scraped.get("text") or "")
@@ -865,6 +881,20 @@ async def _wait_ui_done_before_return(
     except Exception:
         pass
     return text or ""
+
+
+def _schedule_ready_for_next_task(page) -> None:
+    """New chat + idle chạy nền — không chặn trả done cho frontend."""
+    async def _run() -> None:
+        try:
+            await _ready_for_next_task(page)
+        except Exception as exc:
+            logger.warning("background ready_for_next_task failed: %s", exc)
+
+    try:
+        asyncio.create_task(_run())
+    except Exception as exc:
+        logger.warning("schedule ready_for_next_task failed: %s", exc)
 
 
 async def _scrape_result_media(page) -> dict[str, Any]:
@@ -2543,17 +2573,16 @@ async def _click_new_chat(page) -> bool:
 
 
 async def _ready_for_next_task(page) -> None:
-    """After a job finishes: open New chat and idle briefly (no scroll)."""
+    """After a job finishes: open New chat (background — không chặn trả kết quả)."""
     try:
         clicked = await _click_new_chat(page)
         if not clicked:
-            # Fallback: navigate home composer
             try:
-                await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(0.8)
+                await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(0.4)
             except Exception:
                 pass
-        await _idle_plain(page, random.uniform(1.2, 2.5))
+        await _idle_plain(page, random.uniform(0.3, 0.8))
     except Exception as exc:
         logger.warning("ready_for_next_task failed: %s", exc)
 
@@ -2830,13 +2859,21 @@ async def run_playwright_chat(
                     if _is_answer_complete(text):
                         stream_done = True
 
-                # Luôn chờ UI DONE (hết Stop / Thinking / streaming) trước khi trả —
-                # SSE [DONE] bootstrap ≠ ChatGPT đã hiển thị xong trên màn hình.
-                text = await _wait_ui_done_before_return(
-                    page,
-                    text=text,
-                    max_wait_s=min(240.0, max(90.0, timeout_s)),
-                )
+                # Chờ UI DONE một lần (sau handoff nếu có) — bỏ qua nếu UI đã xong
+                if not (await _is_ui_already_done(page) and _is_answer_complete(text)):
+                    text = await _wait_ui_done_before_return(
+                        page,
+                        text=text,
+                        max_wait_s=min(240.0, max(90.0, timeout_s)),
+                    )
+                else:
+                    try:
+                        scraped = await _scrape_result_media(page)
+                        st = _normalize_answer_text(scraped.get("text") or "")
+                        if _is_usable_answer_text(st) and len(st) >= len(text):
+                            text = st
+                    except Exception:
+                        pass
                 text = _normalize_answer_text(text)
 
                 if stream_done and _is_answer_complete(text) and not wait_for_images:
@@ -2855,7 +2892,7 @@ async def run_playwright_chat(
                         "stream_done": True,
                         "slot_id": slot.id,
                     }
-                    await _ready_for_next_task(page)
+                    _schedule_ready_for_next_task(page)
                     return out
 
                 # JSON/text vẫn cắt — poll thêm trước khi trả
@@ -2888,11 +2925,6 @@ async def run_playwright_chat(
                     )
                     if waited2.get("messageId"):
                         message_id = waited2.get("messageId") or message_id
-                    text = await _wait_ui_done_before_return(
-                        page,
-                        text=text,
-                        max_wait_s=min(120.0, max(60.0, timeout_s * 0.4)),
-                    )
                     text = _normalize_answer_text(text)
                     if _is_answer_complete(text) and not wait_for_images:
                         out = {
@@ -2910,7 +2942,7 @@ async def run_playwright_chat(
                             "stream_done": True,
                             "slot_id": slot.id,
                         }
-                        await _ready_for_next_task(page)
+                        _schedule_ready_for_next_task(page)
                         return out
 
                 if wait_for_images:
@@ -2982,12 +3014,15 @@ async def run_playwright_chat(
                 text = _normalize_answer_text(text)
                 if _is_status_placeholder(text):
                     text = ""
-                # Final gate: chờ UI DONE rồi scrape lại (tránh trả khi còn Stop/Thinking)
-                if _is_usable_answer_text(text) or wait_for_images:
+                # Final gate chỉ khi chưa UI DONE (fallback path — tránh chờ trùng lần 3)
+                if (
+                    (_is_usable_answer_text(text) or wait_for_images)
+                    and not await _is_ui_already_done(page)
+                ):
                     text = await _wait_ui_done_before_return(
                         page,
                         text=text,
-                        max_wait_s=min(180.0, max(60.0, timeout_s * 0.5)),
+                        max_wait_s=min(60.0, max(20.0, timeout_s * 0.25)),
                     )
                     text = _normalize_answer_text(text)
                     if _is_status_placeholder(text):
@@ -3077,7 +3112,7 @@ async def run_playwright_chat(
                     "waited_for_images": wait_for_images,
                     "slot_id": slot.id,
                 }
-                await _ready_for_next_task(page)
+                _schedule_ready_for_next_task(page)
                 return return_payload
             finally:
                 try:
@@ -3092,7 +3127,7 @@ async def run_playwright_chat(
             else:
                 # Still try New chat so the next job is not stuck in a broken thread
                 try:
-                    await _ready_for_next_task(page)
+                    _schedule_ready_for_next_task(page)
                 except Exception:
                     pass
             return {"ok": False, "error": err, "slot_id": slot.id}
