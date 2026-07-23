@@ -1417,10 +1417,11 @@ def is_get_media_404_failure(
         data = entry.get("data")
         if isinstance(data, dict):
             err = data.get("error")
-            if isinstance(err, dict) and int(err.get("code") or 0) == 404:
-                return True
-            if str(err.get("status") or "").upper() == "NOT_FOUND":
-                return True
+            if isinstance(err, dict):
+                if int(err.get("code") or 0) == 404:
+                    return True
+                if str(err.get("status") or "").upper() == "NOT_FOUND":
+                    return True
     return False
 
 
@@ -1445,10 +1446,11 @@ def is_http_404_failure(
         data = entry.get("data")
         if isinstance(data, dict):
             err = data.get("error")
-            if isinstance(err, dict) and int(err.get("code") or 0) == 404:
-                return True
-            if str(err.get("status") or "").upper() == "NOT_FOUND":
-                return True
+            if isinstance(err, dict):
+                if int(err.get("code") or 0) == 404:
+                    return True
+                if str(err.get("status") or "").upper() == "NOT_FOUND":
+                    return True
     return False
 
 
