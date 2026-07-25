@@ -60,19 +60,29 @@ Worker profile **không** tự mint captcha trên tab Flow của mình. Token l�
 ### Luồng request
 
 ```
-Worker Bridge  →  agent.request_captcha(action)  →  broker chọn Center (LRU)
+Worker Bridge  →  agent.request_captcha(action, bridge_profile_id)  →  broker chọn Center **đã gắn** với Bridge đó (LRU trong nhóm)
 Center mint    →  POST /result { commandId, token }
 Agent gửi WS   →  api_request { captchaToken }  →  Bridge inject vào body → Google API
 ```
 
 `commandId` UUID đảm bảo token về đúng request/profile worker.
 
-### Nhiều Center / chuyển đổi
+### Nhiều Center / gắn cặp cố định
 
-- Broker tự chọn center online, không cooldown, LRU (center lâu chưa mint)
-- API 403 từ Google → broker enqueue **hard_reset** (xóa cookie anchor + reload tab Flow)
+Broker **gắn cứng** từng Captcha Center với Bridge (call API) theo thứ tự ổn định (label → id), **không chồng chéo**:
+
+| Center | Bridge | Kết quả |
+|--------|--------|---------|
+| 3 | 3 | C1↔B1, C2↔B2, C3↔B3 (1:1) |
+| 3 | 2 | C1↔B1, C2↔B2, C3↔B2 (thừa gắn vào Bridge cuối) |
+| 2 | 3 | C1↔B1, C2↔B2, C2↔B3 (thừa gắn vào Center cuối) |
+
+- Mỗi Bridge chỉ xin token từ Center đã gắn với nó (LRU trong nhóm nếu 1 Bridge có nhiều Center)
+- API 403 từ Google → hard_reset **Center đã gắn** với Bridge đó (không nhảy sang Center lạ)
 - Hard reset định kỳ: 20 solve hoặc 10 phút/center
-- Stats: Dashboard hoặc `GET http://127.0.0.1:1994/api/internal/captcha/stats`
+- Dashboard (Tasks → Profiles): panel **Gắn cặp reCAPTCHA ↔ API** + chip Bridge hiện `reCAPTCHA: …`
+- Stats API: `GET http://127.0.0.1:1994/api/internal/captcha/stats` (có `pairings`, `bridge_to_centers`)
+- Health: `/api/health` → `captcha` + mỗi profile có `paired_center_labels`
 
 ### Timing (từ veo3-captcha-extension)
 

@@ -51,6 +51,11 @@ Bridge profile (worker)          Python agent (127.0.0.1:1994)
 
 Có thể chạy **nhiều profile Center** (mỗi profile 1 tab Flow). Giữ **1 tab Flow** / profile Center.
 
+Agent **gắn cố định** Center ↔ Bridge (sort theo label/id, không chồng chéo):
+- 3 Center + 3 Bridge → 1:1
+- 3 Center + 2 Bridge → C1↔B1, C2↔B2, C3↔B2
+- Xem trên Dashboard (Tasks → Profiles) hoặc `/api/internal/captcha/stats` field `pairings`
+
 ## Thiết lập Bridge (profile worker)
 
 1. Popup → mode **Bridge** (mặc định).

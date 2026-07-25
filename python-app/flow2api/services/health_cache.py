@@ -15,11 +15,58 @@ _cache: dict[str, Any] = {"payload": None, "at": 0.0}
 _refresh_lock = asyncio.Lock()
 
 
+def _captcha_public_stats() -> dict[str, Any]:
+    try:
+        from flow2api.services.captcha_broker import get_captcha_broker
+
+        return get_captcha_broker().stats()
+    except Exception:
+        return {
+            "centers": [],
+            "online_count": 0,
+            "pending_count": 0,
+            "queued_count": 0,
+            "pairings": [],
+            "bridge_to_centers": {},
+            "center_to_bridges": {},
+            "pairing_center_count": 0,
+            "pairing_bridge_count": 0,
+        }
+
+
+def _enrich_profiles_with_captcha(
+    profiles: list[dict[str, Any]],
+    captcha: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Gắn thông tin Center reCAPTCHA đã cặp vào từng Bridge profile."""
+    centers_by_id = {
+        str(c.get("center_id") or ""): c
+        for c in (captcha.get("centers") or [])
+        if c.get("center_id")
+    }
+    bridge_to_centers = captcha.get("bridge_to_centers") or {}
+    out: list[dict[str, Any]] = []
+    for p in profiles:
+        row = dict(p)
+        pid = str(row.get("profile_id") or "")
+        cids = list(bridge_to_centers.get(pid) or [])
+        labels: list[str] = []
+        for cid in cids:
+            c = centers_by_id.get(cid) or {}
+            labels.append(str(c.get("label") or cid[:8]))
+        row["paired_center_ids"] = cids
+        row["paired_center_labels"] = labels
+        row["captcha_pair_label"] = " · ".join(labels) if labels else ""
+        out.append(row)
+    return out
+
+
 def _build_health_sync() -> dict[str, Any]:
     pool = get_extension_pool()
     worker_cfg = get_worker_settings()
     worker = get_worker()
-    profiles = pool.list_public()
+    captcha = _captcha_public_stats()
+    profiles = _enrich_profiles_with_captcha(pool.list_public(), captcha)
     first_ready = pool.first_ready()
     stats = activity.summary_stats()
     queued = activity.count_queued()
@@ -36,6 +83,7 @@ def _build_health_sync() -> dict[str, Any]:
             "profiles_offline_gen": pool.offline_gen_count(),
         },
         "profiles": profiles,
+        "captcha": captcha,
         "extension": {
             "connected": pool.any_connected(),
             "flow_key_present": bool(first_ready and first_ready.flow_key),

@@ -51,7 +51,25 @@ let centerAbortPoll = null;
 
 // ── Config ─────────────────────────────────────────────────────────────
 
-async function centerLoadConfig() {
+async function centerFetchSecretFromAgent() {
+  try {
+    const resp = await fetch(`${centerBridgeBase}/api/internal/captcha/secret`, {
+      method: 'GET',
+    });
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    if (!data?.secret) return false;
+    centerBridgeSecret = String(data.secret);
+    await chrome.storage.local.set({ centerBridgeSecret });
+    centerConfigMissing = !centerBridgeBase || !centerBridgeSecret;
+    console.log('[Center] Auto-loaded secret from agent loopback');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function centerLoadConfig({ forceSecretRefresh = false } = {}) {
   const stored = await chrome.storage.local.get([
     'centerBridgeBase',
     'centerBridgeSecret',
@@ -68,26 +86,34 @@ async function centerLoadConfig() {
   }
   centerConfigMissing = !centerBridgeBase || !centerBridgeSecret;
 
-  // Nếu secret chưa có, thử auto-fetch từ agent loopback (không cần user paste).
-  if (!centerBridgeSecret) {
-    try {
-      const resp = await fetch(`${centerBridgeBase}/api/internal/captcha/secret`, {
-        method: 'GET',
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data?.secret) {
-          centerBridgeSecret = String(data.secret);
-          await chrome.storage.local.set({ centerBridgeSecret });
-          centerConfigMissing = false;
-          console.log('[Center] Auto-loaded secret from agent loopback');
-        }
-      }
-    } catch (e) {
-      /* offline → user tự set qua popup */
-    }
+  // Secret trống hoặc force refresh (sau 401 / agent restart) → lấy lại từ loopback.
+  if (forceSecretRefresh || !centerBridgeSecret) {
+    await centerFetchSecretFromAgent();
   }
   centerUpdateBadge();
+}
+
+async function centerEnsurePolling(reason = '') {
+  if (centerStopFlag) return false;
+  if (centerConfigMissing) {
+    await centerLoadConfig({ forceSecretRefresh: true });
+  }
+  if (centerConfigMissing) {
+    console.warn('[Center] ensurePolling skipped — config missing', reason || '');
+    centerUpdateBadge();
+    return false;
+  }
+  if (!centerIsPolling) {
+    console.log('[Center] starting poll loop', reason ? `(${reason})` : '');
+    await centerPostJson('/api/internal/captcha/event', {
+      centerId,
+      type: 'extension_ready',
+      label: centerLabel,
+      version: CENTER_EXTENSION_VERSION,
+    });
+    void centerPollLoop();
+  }
+  return true;
 }
 
 function centerUpdateBadge() {
@@ -449,9 +475,21 @@ async function centerPollLoop() {
         centerConsecutivePollErrors = 0;
         void chrome.storage.session.set({ centerLastPollOkAt: Date.now() });
       } else if (resp.status === 401) {
-        console.error('[Center] poll HTTP 401 — sai secret');
-        centerConfigMissing = true;
-        centerUpdateBadge();
+        console.error('[Center] poll HTTP 401 — sai secret, thử lấy lại từ agent');
+        centerBridgeSecret = '';
+        try {
+          await chrome.storage.local.remove('centerBridgeSecret');
+        } catch (_) {
+          /* ignore */
+        }
+        await centerLoadConfig({ forceSecretRefresh: true });
+        if (centerConfigMissing) {
+          centerUpdateBadge();
+          centerConsecutivePollErrors += 1;
+        } else {
+          console.log('[Center] secret refreshed after 401 — tiếp tục poll');
+          centerConsecutivePollErrors = 0;
+        }
       } else {
         console.warn('[Center] poll HTTP', resp.status);
         centerConsecutivePollErrors += 1;
@@ -513,22 +551,31 @@ async function centerEnsureFlowTab() {
 
 async function centerStart() {
   centerStopFlag = false;
-  await centerLoadConfig();
+  await centerLoadConfig({ forceSecretRefresh: false });
   chrome.alarms.create(CENTER_ALARM_KEEPALIVE, { periodInMinutes: CENTER_KEEPALIVE_MIN });
 
   await centerEnsureFlowTab();
 
-  if (centerConfigMissing) {
-    console.warn('[Center] config missing — chờ user set secret qua popup');
-    return;
+  const started = await centerEnsurePolling('start');
+  if (!started) {
+    console.warn('[Center] config missing — sẽ retry trên keepalive khi agent sẵn sàng');
   }
-  await centerPostJson('/api/internal/captcha/event', {
-    centerId,
-    type: 'extension_ready',
-    label: centerLabel,
-    version: CENTER_EXTENSION_VERSION,
-  });
-  if (!centerIsPolling) void centerPollLoop();
+}
+
+async function centerRestart(reason = 'manual') {
+  console.log('[Center] restart:', reason);
+  centerStopFlag = true;
+  try {
+    centerAbortPoll?.abort();
+  } catch (_) {
+    /* ignore */
+  }
+  // Cho poll loop thoát hẳn trước khi start lại
+  await new Promise((r) => setTimeout(r, 50));
+  centerIsPolling = false;
+  centerStopFlag = false;
+  centerConsecutivePollErrors = 0;
+  await centerStart();
 }
 
 function centerStop() {
@@ -552,7 +599,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     centerBridgeBase = String(changes.centerBridgeBase.newValue || CENTER_DEFAULT_BASE).replace(/\/+$/, '');
     refreshed = true;
   }
-  if (changes.centerBridgeSecret && typeof changes.centerBridgeSecret.newValue === 'string') {
+  if (changes.centerBridgeSecret) {
     centerBridgeSecret = String(changes.centerBridgeSecret.newValue || '');
     refreshed = true;
   }
@@ -560,12 +607,21 @@ chrome.storage.onChanged.addListener((changes, area) => {
     centerLabel = String(changes.centerLabel.newValue || '');
     refreshed = true;
   }
+  if (changes.f2apiExtMode) {
+    const mode = changes.f2apiExtMode.newValue === 'center' ? 'center' : 'bridge';
+    if (mode === 'center') {
+      void centerRestart('mode→center');
+    } else {
+      centerStop();
+    }
+    return;
+  }
   if (!refreshed) return;
-  const wasMissing = centerConfigMissing;
   centerConfigMissing = !centerBridgeBase || !centerBridgeSecret;
   centerUpdateBadge();
-  if (wasMissing && !centerConfigMissing && !centerIsPolling) {
-    void centerPollLoop();
+  // Luôn resume poll khi config hợp lệ — không chỉ khi wasMissing
+  if (!centerConfigMissing && !centerStopFlag) {
+    void centerEnsurePolling('storage-change');
   }
 });
 
@@ -573,7 +629,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== CENTER_ALARM_KEEPALIVE || centerStopFlag) return;
-  if (centerConfigMissing) return;
+
+  // Khôi phục trạng thái chết: thiếu secret / poll dừng / agent vừa lên lại
+  if (centerConfigMissing || !centerIsPolling) {
+    await centerLoadConfig({ forceSecretRefresh: centerConfigMissing });
+    const started = await centerEnsurePolling(
+      centerConfigMissing ? 'keepalive-recover-config' : 'keepalive-recover-poll',
+    );
+    if (!started) return;
+  }
+
   const tab = await centerFindFlowTab();
   void centerPostJson('/api/internal/captcha/event', {
     centerId,
@@ -588,4 +653,5 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 self.__centerLoop = {
   start: centerStart,
   stop: centerStop,
+  restart: centerRestart,
 };

@@ -204,16 +204,25 @@ document.querySelectorAll('input[name="mode"]').forEach((r) => {
 $('btn-mode-cancel')?.addEventListener('click', () => refreshModePanel());
 
 $('btn-mode-apply')?.addEventListener('click', async () => {
-  if (selectedMode === currentMode) {
-    setHint('center-hint', 'Không có thay đổi.', 'ok');
-    return;
+  try {
+    // Luôn lưu config Center + reload — kể cả khi mode không đổi.
+    // Trước đây early-return "Không có thay đổi" khiến Center chết sau khi
+    // tắt profile không bao giờ được khởi động lại bằng nút Áp dụng.
+    if (selectedMode === 'center') {
+      await saveCenterConfig(false);
+    }
+    await chrome.storage.local.set({ f2apiExtMode: selectedMode });
+    setHint(
+      'center-hint',
+      selectedMode === currentMode
+        ? 'Đang reload để khởi động lại…'
+        : 'Đã đổi mode — đang reload…',
+      'ok',
+    );
+    chrome.runtime.reload();
+  } catch (e) {
+    setHint('center-hint', `Lỗi áp dụng: ${e?.message || e}`, 'err');
   }
-  await chrome.storage.local.set({ f2apiExtMode: selectedMode });
-  // Save current Center config nếu đang chuyển vào center
-  if (selectedMode === 'center') {
-    await saveCenterConfig(false);
-  }
-  chrome.runtime.reload();
 });
 
 $('btn-center-save')?.addEventListener('click', async () => {
@@ -241,7 +250,15 @@ $('btn-center-test')?.addEventListener('click', async () => {
       setHint('center-hint', 'Chưa có secret — chạy agent trước hoặc paste secret.', 'err');
       return;
     }
-    const resp = await fetch(`${base}/api/internal/captcha/stats`);
+    // Persist secret ngay khi Test OK — để Center tự poll lại mà không cần Apply
+    await chrome.storage.local.set({
+      centerBridgeBase: base,
+      centerBridgeSecret: useSecret,
+      centerLabel: ($('center-label')?.value || '').trim(),
+    });
+    const resp = await fetch(`${base}/api/internal/captcha/stats`, {
+      headers: { 'x-center-secret': useSecret },
+    });
     if (resp.ok) {
       const d = await resp.json();
       setHint(

@@ -1775,6 +1775,23 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return true;
   }
 
+  if (msg.type === 'RESTART_CENTER') {
+    (async () => {
+      const mode = await getExtensionMode();
+      if (mode !== 'center') {
+        reply({ ok: false, error: 'not_center_mode' });
+        return;
+      }
+      if (self.__centerLoop?.restart) {
+        await self.__centerLoop.restart('popup');
+        reply({ ok: true });
+      } else {
+        reply({ ok: false, error: 'center_loop_unavailable' });
+      }
+    })().catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
   return true;
 });
 
