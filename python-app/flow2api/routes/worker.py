@@ -141,7 +141,12 @@ async def update_profile_dispatch(
         raise HTTPException(400, "invalid_profile_id") from exc
     from flow2api.services import system_ops
 
+    await system_ops.push_dispatch_to_profile(profile_id, body.enabled)
     await system_ops.push_proxy_to_extensions()
+    try:
+        system_ops.ensure_launch_script()
+    except Exception:
+        pass
     events.publish(
         "profile_dispatch_changed",
         {"profile_id": profile_id, "enabled": body.enabled},

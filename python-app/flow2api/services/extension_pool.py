@@ -1064,10 +1064,14 @@ class ExtensionPool:
             session.attach_ws(ws)
             self._ws_to_profile[id(ws)] = pid
         await session.send_json({"type": "callback_secret", "secret": self.callback_secret})
-        from flow2api.services.system_ops import _extension_push_config
+        from flow2api.services.system_ops import _extension_push_config, push_dispatch_to_session
 
         try:
             await session.send_json({"type": "system_push_config", "config": _extension_push_config()})
+        except Exception:
+            pass
+        try:
+            await push_dispatch_to_session(session)
         except Exception:
             pass
         from flow2api.services.system_ops import push_proxy_to_session

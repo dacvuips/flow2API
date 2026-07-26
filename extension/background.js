@@ -32,6 +32,8 @@ let profileId        = null; // Unique per Chrome profile (chrome.storage.local)
 let callbackSecret   = null; // Auth secret received from agent on WS connect
 let state            = 'off'; // off | idle | running
 let manualDisconnect = false;
+/** When false, do not auto-open Flow tabs/windows (dashboard "ngừng nhận job"). */
+let dispatchEnabled  = true;
 let metrics = {
   tokenCapturedAt: null,
   requestCount:    0,
@@ -478,6 +480,29 @@ async function getExtensionMode() {
   return f2apiExtMode === 'center' ? 'center' : 'bridge';
 }
 
+async function setDispatchEnabled(enabled, { source = 'agent' } = {}) {
+  const next = enabled !== false;
+  dispatchEnabled = next;
+  await chrome.storage.local.set({ dispatchEnabled: next });
+  console.log('[Flow2API] dispatchEnabled =', next, `(${source})`);
+  if (next) {
+    // Re-enabled: resume token keepalive; open Flow only if none exists.
+    try {
+      const flowTabs = await chrome.tabs.query({ url: flowUrls });
+      if (!flowTabs.length) {
+        await openFlowTabResilient(false, { force: true });
+      }
+    } catch (e) {
+      console.warn('[Flow2API] reopen Flow after re-enable failed:', e?.message || e);
+    }
+    ensureFreshFlowToken('dispatch_reenabled').catch(() => {});
+  }
+}
+
+function isAutoOpenAllowed() {
+  return dispatchEnabled !== false;
+}
+
 async function init() {
   const mode = await getExtensionMode();
   console.log('[Flow2API] Extension mode =', mode);
@@ -500,26 +525,35 @@ async function init() {
   // extensions on the profile that hold the `storage` permission.
   // The agent replays user_info on every WS reconnect anyway via
   // fetchAndPushUserInfo(token), so persistence buys nothing.
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'profileId', 'flowUrl']);
+  const data = await chrome.storage.local.get([
+    'flowKey', 'metrics', 'callbackSecret', 'profileId', 'flowUrl', 'dispatchEnabled',
+  ]);
   if (data.flowKey)        flowKey        = data.flowKey;
   if (data.metrics)        Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  dispatchEnabled = data.dispatchEnabled !== false;
   profileId = data.profileId || await getOrCreateProfileId();
   await loadCapturedFlowApiHeaders();
   connectToAgent();
   try {
     const flowTabs = await chrome.tabs.query({ url: flowUrls });
     if (!flowTabs.length) {
-      const url = data.flowUrl || FLOW_URL;
-      await openFlowTabResilient(false);
-      console.log('[Flow2API] Auto-open Flow on startup:', url);
+      if (!isAutoOpenAllowed()) {
+        console.log('[Flow2API] Skip auto-open Flow — dispatch disabled');
+      } else {
+        const url = data.flowUrl || FLOW_URL;
+        await openFlowTabResilient(false);
+        console.log('[Flow2API] Auto-open Flow on startup:', url);
+      }
     }
   } catch (e) {
     console.warn('[Flow2API] Auto-open Flow failed:', e?.message || e);
   }
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
   chrome.alarms.create('flowWatchdog', { periodInMinutes: 2 });
-  ensureFreshFlowToken('startup');
+  if (isAutoOpenAllowed()) {
+    ensureFreshFlowToken('startup');
+  }
 }
 
 // Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬ Token Capture Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬Ă¢â€â‚¬
@@ -696,7 +730,7 @@ function connectToAgent() {
             await chrome.tabs.update(tabs[0].id, { active: true });
             tabId = tabs[0].id;
           } else {
-            const tab = await openFlowTabResilient(true);
+            const tab = await openFlowTabResilient(true, { force: true });
             tabId = tab?.id ?? null;
           }
           sendToAgent({
@@ -727,7 +761,14 @@ function connectToAgent() {
           console.log('[Flow2API] please_resend_userinfo: no token captured yet');
         }
       } else if (msg.type === 'system_force_refresh') {
-        refreshAllFlowTabs().catch((e) => console.warn('[Flow2API] force refresh failed', e));
+        if (!isAutoOpenAllowed()) {
+          console.log('[Flow2API] Skip force refresh — dispatch disabled');
+        } else {
+          refreshAllFlowTabs().catch((e) => console.warn('[Flow2API] force refresh failed', e));
+        }
+      } else if (msg.type === 'system_set_dispatch') {
+        setDispatchEnabled(msg.enabled !== false, { source: 'system_set_dispatch' })
+          .catch((e) => console.warn('[Flow2API] setDispatchEnabled failed', e));
       } else if (msg.type === 'system_set_proxy') {
         applyProxyConfig(msg.proxyUrl || '');
         chrome.storage.local.set({ proxyUrl: msg.proxyUrl || '' });
@@ -1169,14 +1210,23 @@ function extractProjectIdFromBody(body) {
  * context to attach to; `chrome.windows.create` spawns a fresh window
  * and tab in one call. Falls back through both paths so we recover from
  * "all-windows-closed but service-worker-still-alive" silently.
+ *
+ * @param {boolean} active
+ * @param {{ force?: boolean }} [opts] force=true bypasses dispatch-disabled gate
+ *   (explicit user/agent open). Auto paths must leave force unset/false.
  */
-async function openFlowTabResilient(active = false) {
+async function openFlowTabResilient(active = false, opts = {}) {
+  const force = !!(opts && opts.force);
+  if (!force && !isAutoOpenAllowed()) {
+    console.log('[Flow2API] Blocked auto-open Flow — dispatch disabled');
+    return null;
+  }
   try {
     return await chrome.tabs.create({ url: FLOW_URL, active });
   } catch (e) {
     const msg = e?.message || '';
     if (!msg.includes('No current window')) throw e;
-    console.log('[Flow2API] No Chrome window Ă¢â‚¬â€ spawning a fresh one for Flow');
+    console.log('[Flow2API] No Chrome window — spawning a fresh one for Flow');
     const win = await chrome.windows.create({
       url: FLOW_URL,
       focused: false,
@@ -1243,6 +1293,7 @@ async function captureTokenFromFlowTab() {
 async function runFlowWatchdog() {
   if (_flowWatchdogRunning) return;
   if (state === 'running') return;
+  if (!isAutoOpenAllowed()) return;
 
   const now = Date.now();
   const tokenAge = metrics.tokenCapturedAt ? now - metrics.tokenCapturedAt : Infinity;
@@ -1321,7 +1372,7 @@ async function refreshTokenViaAuthSession(forceOpen = false) {
     }
     _openingFlowTab = true;
     try {
-      await openFlowTabResilient(forceOpen);
+      await openFlowTabResilient(forceOpen, { force: !!forceOpen });
       await sleep(3000);
       tabs = await chrome.tabs.query({ url: flowUrls });
     } catch (e) {
@@ -1757,8 +1808,8 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
           await chrome.tabs.update(tabs[0].id, { active: true });
           reply({ ok: true, tabId: tabs[0].id });
         } else {
-          // User-initiated Ă¢â€ â€™ focus the new window so they can see it.
-          const tab = await openFlowTabResilient(true);
+          // User-initiated → focus the new window so they can see it.
+          const tab = await openFlowTabResilient(true, { force: true });
           reply({ ok: true, tabId: tab?.id });
         }
       } catch (e) {

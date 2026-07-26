@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -236,6 +237,153 @@ def list_chrome_profiles() -> list[str]:
     return found
 
 
+_UUID_RE = re.compile(
+    rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.I,
+)
+
+
+def _extension_profile_id_from_chrome_dir(profile_dir: Path) -> str | None:
+    """Best-effort read of Flow2API profileId from Chrome extension LevelDB logs."""
+    settings = profile_dir / "Local Extension Settings"
+    if not settings.is_dir():
+        return None
+    try:
+        ext_dirs = [p for p in settings.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    for ext_dir in ext_dirs:
+        files: list[Path] = []
+        try:
+            files.extend(ext_dir.glob("*.log"))
+            files.extend(ext_dir.glob("*.ldb"))
+        except OSError:
+            continue
+        for path in files:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            idx = 0
+            while True:
+                found = data.find(b"profileId", idx)
+                if found < 0:
+                    break
+                window = data[found : found + 96]
+                match = _UUID_RE.search(window)
+                if match:
+                    return match.group().decode("ascii")
+                # Also accept non-uuid ids like p-<timestamp>-...
+                ascii_chunk = ""
+                try:
+                    ascii_chunk = window.decode("latin-1", errors="ignore")
+                except Exception:
+                    ascii_chunk = ""
+                for token in ascii_chunk.replace("\x00", " ").split():
+                    if token.startswith("p-") and len(token) >= 8:
+                        return token[:64]
+                idx = found + 1
+    return None
+
+
+def list_launchable_chrome_profiles() -> list[str]:
+    """Chrome User Data dirs to open — skip profiles with dispatch disabled."""
+    from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+    root = _user_data_dir()
+    launchable: list[str] = []
+    skipped: list[str] = []
+    for name in list_chrome_profiles():
+        pid = _extension_profile_id_from_chrome_dir(root / name)
+        if pid and not is_profile_dispatch_enabled(pid):
+            skipped.append(name)
+            continue
+        launchable.append(name)
+    if skipped:
+        logger.info("launch skip dispatch-disabled chrome profiles: %s", ", ".join(skipped))
+    return launchable
+
+
+def ensure_launch_script(profiles: list[str] | None = None) -> Path:
+    _ensure_storage()
+    cfg = load_config()
+    flow_url = str(cfg.get("flow_url") or _FLOW_URL_DEFAULT).replace('"', "")
+    bat = _launch_bat_path()
+    names = list(profiles) if profiles is not None else list_launchable_chrome_profiles()
+    # Sanitize profile directory names for the bat file
+    safe_names: list[str] = []
+    for name in names:
+        clean = str(name or "").strip()
+        if not clean or any(ch in clean for ch in '<>:"|?*'):
+            continue
+        if clean != "Default" and not clean.startswith("Profile "):
+            continue
+        safe_names.append(clean)
+
+    open_blocks: list[str] = []
+    for prof in safe_names:
+        open_blocks.append(
+            f"""echo Opening {prof}
+start "" "%CHROME_PATH%" --profile-directory="{prof}" --hide-crash-restore-bubble --disable-session-crashed-bubble "%FLOW_URL%"
+ping 127.0.0.1 -n 3 > nul
+"""
+        )
+    open_body = "\n".join(open_blocks) if open_blocks else "echo No launchable profiles\n"
+
+    content = f"""@echo off
+setlocal enabledelayedexpansion
+title Flow2API — Launch Chrome Profiles
+
+set "CHROME_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+if not exist "%CHROME_PATH%" set "CHROME_PATH=C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+if not exist "%CHROME_PATH%" set "CHROME_PATH=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
+if not exist "%CHROME_PATH%" (
+  echo Chrome not found
+  exit /b 1
+)
+
+set "FLOW_URL={flow_url}"
+
+{open_body}
+echo Done.
+"""
+    bat.write_text(content, encoding="utf-8", newline="\r\n")
+    return bat
+
+
+def launch_all_profiles() -> dict[str, Any]:
+    profiles = list_launchable_chrome_profiles()
+    all_profiles = list_chrome_profiles()
+    skipped = [p for p in all_profiles if p not in profiles]
+    if not all_profiles:
+        return {"ok": False, "error": "no_chrome_profiles", "message": "Không tìm thấy Chrome profile nào"}
+    if not profiles:
+        return {
+            "ok": False,
+            "error": "all_profiles_disabled",
+            "message": "Tất cả Chrome profile đang ngừng nhận job — không mở lại",
+            "profiles": [],
+            "skipped": skipped,
+        }
+    if not _chrome_paths():
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+    bat = ensure_launch_script(profiles)
+    subprocess.Popen(
+        ["cmd", "/c", str(bat)],
+        cwd=str(_SCRIPTS_DIR),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    msg = f"Đã kích hoạt {len(profiles)} Chrome profile → Flow"
+    if skipped:
+        msg += f" (bỏ qua {len(skipped)} profile đã tắt nhận job)"
+    return {
+        "ok": True,
+        "message": msg,
+        "profiles": profiles,
+        "skipped": skipped,
+    }
+
+
 def cdp_endpoint_alive(cdp_url: str = "http://127.0.0.1:9222") -> bool:
     url = (cdp_url or "").strip().rstrip("/")
     if not url:
@@ -455,65 +603,6 @@ def launch_all_playwright_slots(*, start_url: str = "https://chatgpt.com/") -> d
         "total": len(results),
         "results": results,
         "message": f"Đã mở {ok_n}/{len(results)} Chrome CDP slot.",
-    }
-
-
-def ensure_launch_script() -> Path:
-    _ensure_storage()
-    cfg = load_config()
-    flow_url = str(cfg.get("flow_url") or _FLOW_URL_DEFAULT).replace('"', "")
-    bat = _launch_bat_path()
-    content = f"""@echo off
-setlocal enabledelayedexpansion
-title Flow2API — Launch Chrome Profiles
-
-set "CHROME_PATH=C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" set "CHROME_PATH=%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
-if not exist "%CHROME_PATH%" (
-  echo Chrome not found
-  exit /b 1
-)
-
-set "USER_DATA=%LOCALAPPDATA%\\Google\\Chrome\\User Data"
-set "FLOW_URL={flow_url}"
-
-if exist "%USER_DATA%\\Default\\Preferences" (
-  echo Opening Default
-  start "" "%CHROME_PATH%" --profile-directory="Default" --hide-crash-restore-bubble --disable-session-crashed-bubble "%FLOW_URL%"
-  ping 127.0.0.1 -n 3 > nul
-)
-
-for /D %%D in ("%USER_DATA%\\Profile *") do (
-  if exist "%%D\\Preferences" (
-    set "prof=%%~nxD"
-    echo Opening !prof!
-    start "" "%CHROME_PATH%" --profile-directory="!prof!" --hide-crash-restore-bubble --disable-session-crashed-bubble "%FLOW_URL%"
-    ping 127.0.0.1 -n 3 > nul
-  )
-)
-echo Done.
-"""
-    bat.write_text(content, encoding="utf-8", newline="\r\n")
-    return bat
-
-
-def launch_all_profiles() -> dict[str, Any]:
-    bat = ensure_launch_script()
-    profiles = list_chrome_profiles()
-    if not profiles:
-        return {"ok": False, "error": "no_chrome_profiles", "message": "Không tìm thấy Chrome profile nào"}
-    if not _chrome_paths():
-        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
-    subprocess.Popen(
-        ["cmd", "/c", str(bat)],
-        cwd=str(_SCRIPTS_DIR),
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    return {
-        "ok": True,
-        "message": f"Đã kích hoạt {len(profiles)} Chrome profile → Flow",
-        "profiles": profiles,
     }
 
 
@@ -811,8 +900,21 @@ async def broadcast_system(payload: dict) -> None:
 
 
 async def force_refresh_all() -> dict[str, Any]:
-    await broadcast_system({"type": "system_force_refresh"})
-    return {"ok": True, "message": "Đã gửi lệnh F5 toàn bộ tab Flow"}
+    from flow2api.services.extension_pool import get_extension_pool
+    from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+    sent = 0
+    for session in get_extension_pool().list_sessions():
+        if session.profile_id.startswith("_") or not session.connected:
+            continue
+        if not is_profile_dispatch_enabled(session.profile_id):
+            continue
+        try:
+            await session.send_json({"type": "system_force_refresh"})
+            sent += 1
+        except Exception as exc:
+            logger.warning("force refresh failed %s: %s", session.profile_id[:8], exc)
+    return {"ok": True, "message": f"Đã gửi lệnh F5 tới {sent} profile đang nhận job"}
 
 
 async def apply_proxy_to_session(session: Any, proxy_url: str) -> None:
@@ -863,6 +965,27 @@ async def push_proxy_to_extensions(*, defer_if_busy: bool = True) -> None:
             idx += 1
         else:
             await push_proxy_to_session(session, defer_if_busy=defer_if_busy)
+
+
+async def push_dispatch_to_session(session: Any, enabled: bool | None = None) -> None:
+    """Tell one extension whether auto-open Flow / watchdog is allowed."""
+    from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+    if enabled is None:
+        enabled = is_profile_dispatch_enabled(session.profile_id)
+    try:
+        await session.send_json({"type": "system_set_dispatch", "enabled": bool(enabled)})
+    except Exception as exc:
+        logger.warning("dispatch push failed %s: %s", session.profile_id[:8], exc)
+
+
+async def push_dispatch_to_profile(profile_id: str, enabled: bool) -> None:
+    from flow2api.services.extension_pool import get_extension_pool
+
+    session = get_extension_pool().get(profile_id)
+    if not session or not session.connected:
+        return
+    await push_dispatch_to_session(session, enabled)
 
 
 def _extension_push_config() -> dict[str, Any]:
