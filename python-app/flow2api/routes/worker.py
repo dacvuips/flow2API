@@ -129,6 +129,74 @@ async def redistribute_captcha_pairs(_=Depends(_auth_key_id)):
     return {"ok": True, "captcha": captcha, "profiles": profiles}
 
 
+@router.delete("/captcha/centers/{center_id}")
+async def delete_captcha_center(center_id: str, _=Depends(_auth_key_id)):
+    """Xóa Captcha Center khỏi dashboard (ẩn đến khi Quét lại)."""
+    from flow2api.services.captcha_broker import get_captcha_broker
+    from flow2api.services.health_cache import (
+        _enrich_profiles_with_captcha,
+        invalidate_health_cache,
+    )
+
+    broker = get_captcha_broker()
+    try:
+        result = broker.unregister_center(center_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    captcha = broker.stats()
+    invalidate_health_cache()
+    profiles = _enrich_profiles_with_captcha(get_extension_pool().list_public(), captcha)
+    return {**result, "captcha": captcha, "profiles": profiles}
+
+
+@router.post("/captcha/rediscover")
+async def rediscover_captcha_centers(_=Depends(_auth_key_id)):
+    """Lấy lại Captcha Center đang online đã bị xóa."""
+    from flow2api.services.captcha_broker import get_captcha_broker
+    from flow2api.services.health_cache import (
+        _enrich_profiles_with_captcha,
+        invalidate_health_cache,
+    )
+
+    broker = get_captcha_broker()
+    result = broker.rediscover_online_centers()
+    captcha = broker.stats()
+    invalidate_health_cache()
+    profiles = _enrich_profiles_with_captcha(get_extension_pool().list_public(), captcha)
+    return {**result, "captcha": captcha, "profiles": profiles}
+
+
+@router.delete("/profiles/{profile_id}")
+async def delete_flow_profile(profile_id: str, _=Depends(_auth_key_id)):
+    """Xóa profile generate khỏi dashboard (ẩn đến khi Quét profile online)."""
+    from flow2api.services.health_cache import invalidate_health_cache
+
+    pool = get_extension_pool()
+    try:
+        result = await pool.remove_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    invalidate_health_cache()
+    return {**result, "profiles": pool.list_public()}
+
+
+@router.post("/profiles/rediscover")
+async def rediscover_flow_profiles(_=Depends(_auth_key_id)):
+    """Lấy lại profile generate đang online đã bị xóa."""
+    from flow2api.services.captcha_broker import get_captcha_broker
+    from flow2api.services.health_cache import (
+        _enrich_profiles_with_captcha,
+        invalidate_health_cache,
+    )
+
+    pool = get_extension_pool()
+    result = pool.rediscover_online_profiles()
+    captcha = get_captcha_broker().stats()
+    invalidate_health_cache()
+    profiles = _enrich_profiles_with_captcha(result.get("profiles") or pool.list_public(), captcha)
+    return {**result, "profiles": profiles, "captcha": captcha}
+
+
 @router.put("/profile-limits/{profile_id}")
 async def update_one_profile_limit(
     profile_id: str,

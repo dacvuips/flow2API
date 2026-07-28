@@ -26,6 +26,8 @@ class WorkerSettings:
     profile_credit_allowed: list[str] = field(default_factory=list)
     profile_image_allowed: list[str] = field(default_factory=list)
     profile_video_allowed: list[str] = field(default_factory=list)
+    profile_forgotten: list[str] = field(default_factory=list)
+    captcha_center_forgotten: list[str] = field(default_factory=list)
 
     def normalized(self) -> WorkerSettings:
         mc = max(1, min(_MAX_CONCURRENT_CAP, int(self.max_concurrent or 1)))
@@ -57,6 +59,16 @@ class WorkerSettings:
             for pid in self.profile_video_allowed:
                 if pid and not str(pid).startswith("_"):
                     video_allowed.append(str(pid))
+        forgotten: list[str] = []
+        if isinstance(self.profile_forgotten, list):
+            for pid in self.profile_forgotten:
+                if pid and not str(pid).startswith("_"):
+                    forgotten.append(str(pid))
+        captcha_forgotten: list[str] = []
+        if isinstance(self.captcha_center_forgotten, list):
+            for cid in self.captcha_center_forgotten:
+                if cid and not str(cid).startswith("_"):
+                    captcha_forgotten.append(str(cid))
         return WorkerSettings(
             max_concurrent=mc,
             task_stagger_s=stagger,
@@ -66,6 +78,8 @@ class WorkerSettings:
             profile_credit_allowed=sorted(set(credit_allowed)),
             profile_image_allowed=sorted(set(image_allowed)),
             profile_video_allowed=sorted(set(video_allowed)),
+            profile_forgotten=sorted(set(forgotten)),
+            captcha_center_forgotten=sorted(set(captcha_forgotten)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -79,6 +93,8 @@ class WorkerSettings:
             "profile_credit_allowed": list(n.profile_credit_allowed),
             "profile_image_allowed": list(n.profile_image_allowed),
             "profile_video_allowed": list(n.profile_video_allowed),
+            "profile_forgotten": list(n.profile_forgotten),
+            "captcha_center_forgotten": list(n.captcha_center_forgotten),
         }
 
 
@@ -124,6 +140,12 @@ def _load_file() -> WorkerSettings | None:
     video_allowed = raw.get("profile_video_allowed") or []
     if not isinstance(video_allowed, list):
         video_allowed = []
+    forgotten = raw.get("profile_forgotten") or []
+    if not isinstance(forgotten, list):
+        forgotten = []
+    captcha_forgotten = raw.get("captcha_center_forgotten") or []
+    if not isinstance(captcha_forgotten, list):
+        captcha_forgotten = []
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
@@ -133,6 +155,8 @@ def _load_file() -> WorkerSettings | None:
         profile_credit_allowed=[str(x) for x in credit_allowed],
         profile_image_allowed=[str(x) for x in image_allowed],
         profile_video_allowed=[str(x) for x in video_allowed],
+        profile_forgotten=[str(x) for x in forgotten],
+        captcha_center_forgotten=[str(x) for x in captcha_forgotten],
     ).normalized()
 
 
@@ -165,7 +189,76 @@ def is_profile_dispatch_enabled(profile_id: str) -> bool:
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
         return False
-    return pid not in get_worker_settings().profile_dispatch_disabled
+    settings = get_worker_settings()
+    if pid in settings.profile_forgotten:
+        return False
+    return pid not in settings.profile_dispatch_disabled
+
+
+def is_profile_forgotten(profile_id: str) -> bool:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_forgotten
+
+
+def forget_profile(profile_id: str) -> WorkerSettings:
+    """Ẩn profile khỏi dashboard/dispatch cho đến khi rediscover."""
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    forgotten = [x for x in current.profile_forgotten if x != pid]
+    forgotten.append(pid)
+    limits = dict(current.profile_limits)
+    limits.pop(pid, None)
+    disabled = [x for x in current.profile_dispatch_disabled if x != pid]
+    credit = [x for x in current.profile_credit_allowed if x != pid]
+    image = [x for x in current.profile_image_allowed if x != pid]
+    video = [x for x in current.profile_video_allowed if x != pid]
+    return save_worker_settings(
+        profile_forgotten=forgotten,
+        profile_limits=limits,
+        profile_dispatch_disabled=disabled,
+        profile_credit_allowed=credit,
+        profile_image_allowed=image,
+        profile_video_allowed=video,
+    )
+
+
+def unforget_profile(profile_id: str) -> WorkerSettings:
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    forgotten = [x for x in current.profile_forgotten if x != pid]
+    return save_worker_settings(profile_forgotten=forgotten)
+
+
+def is_captcha_center_forgotten(center_id: str) -> bool:
+    cid = str(center_id or "").strip()
+    if not cid:
+        return False
+    return cid in get_worker_settings().captcha_center_forgotten
+
+
+def forget_captcha_center(center_id: str) -> WorkerSettings:
+    cid = str(center_id or "").strip()
+    if not cid:
+        raise ValueError("invalid_center_id")
+    current = get_worker_settings()
+    forgotten = [x for x in current.captcha_center_forgotten if x != cid]
+    forgotten.append(cid)
+    return save_worker_settings(captcha_center_forgotten=forgotten)
+
+
+def unforget_captcha_center(center_id: str) -> WorkerSettings:
+    cid = str(center_id or "").strip()
+    if not cid:
+        raise ValueError("invalid_center_id")
+    current = get_worker_settings()
+    forgotten = [x for x in current.captcha_center_forgotten if x != cid]
+    return save_worker_settings(captcha_center_forgotten=forgotten)
 
 
 def set_profile_dispatch_enabled(profile_id: str, enabled: bool) -> WorkerSettings:
@@ -249,6 +342,20 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                     str(x)
                     for x in raw_video
                     if x and not str(x).startswith("_")
+                ]
+        if "profile_forgotten" in fields:
+            raw_forgotten = fields["profile_forgotten"]
+            if isinstance(raw_forgotten, list):
+                data["profile_forgotten"] = [
+                    str(x)
+                    for x in raw_forgotten
+                    if x and not str(x).startswith("_")
+                ]
+        if "captcha_center_forgotten" in fields:
+            raw_cf = fields["captcha_center_forgotten"]
+            if isinstance(raw_cf, list):
+                data["captcha_center_forgotten"] = [
+                    str(x) for x in raw_cf if x and not str(x).startswith("_")
                 ]
         out = WorkerSettings(**data).normalized()
         return _write_settings(out)

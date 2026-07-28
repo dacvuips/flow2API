@@ -406,6 +406,34 @@ def clear_access_token(profile_id: str) -> None:
 
 
 
+def delete_profile_row(profile_id: str) -> bool:
+
+    """Xóa hẳn dòng FlowProfile khỏi DB. Trả True nếu đã xóa."""
+
+    pid = str(profile_id or "").strip()
+
+    if not pid:
+
+        return False
+
+    with SessionLocal() as db:
+
+        row = db.get(FlowProfile, pid)
+
+        if not row:
+
+            return False
+
+        db.delete(row)
+
+        db.commit()
+
+        return True
+
+
+
+
+
 def clear_all_access_tokens() -> None:
 
     with SessionLocal() as db:

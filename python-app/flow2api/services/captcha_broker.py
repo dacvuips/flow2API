@@ -11,8 +11,8 @@ Chính sách:
 - Gắn cặp cố định Center ↔ Bridge (không chồng chéo): sort ổn định theo label/id,
   1:1 khi số lượng bằng nhau; bên thừa gắn hết vào phần tử cuối của bên ít hơn.
   VD 3 Center + 2 Bridge → C1↔B1, C2↔B2, C3↔B2.
-- Chỉ gắn cặp Center/Bridge đang online — Center offline (ghost) không chiếm slot,
-  tránh 2 Bridge kẹt mãi với Center cũ khi thêm Center mới.
+- Chỉ gắn cặp Center online với Bridge đang online VÀ đang nhận job
+  (dispatch_enabled). Profile offline / ngừng phân bổ không chiếm slot.
 - Trong nhóm center đã gắn với Bridge: LRU + skip cooldown.
 - Khi có request: đánh thức long-poll các center gắn với Bridge đó, chờ sẵn sàng
   (cooldown / hard_reset / đăng ký lại sau agent restart) trước khi fail.
@@ -345,14 +345,21 @@ class CaptchaBroker:
         items.sort(key=lambda s: (str(s.label or "").lower(), s.center_id))
         return items
 
-    def _sorted_bridge_entries(self, *, online_only: bool = False) -> list[dict[str, Any]]:
+    def _sorted_bridge_entries(
+        self,
+        *,
+        online_only: bool = False,
+        dispatch_only: bool = False,
+    ) -> list[dict[str, Any]]:
         """Bridge (call API) profiles từ ExtensionPool — sort ổn định theo label/id."""
         try:
             from flow2api.services.extension_pool import get_extension_pool
+            from flow2api.services.worker_settings import is_profile_dispatch_enabled
 
             sessions = get_extension_pool().list_sessions()
         except Exception:
             sessions = []
+            is_profile_dispatch_enabled = None  # type: ignore[assignment]
         entries: list[dict[str, Any]] = []
         for s in sessions:
             pid = str(getattr(s, "profile_id", "") or "").strip()
@@ -365,11 +372,18 @@ class CaptchaBroker:
             online = bool(getattr(s, "connected", False))
             if online_only and not online:
                 continue
+            try:
+                dispatch = bool(is_profile_dispatch_enabled(pid)) if is_profile_dispatch_enabled else True
+            except Exception:
+                dispatch = True
+            if dispatch_only and not dispatch:
+                continue
             entries.append({
                 "profile_id": pid,
                 "label": label,
                 "online": online,
                 "ready": bool(s.is_ready()) if hasattr(s, "is_ready") else False,
+                "dispatch_enabled": dispatch,
             })
         entries.sort(key=lambda e: (str(e.get("label") or "").lower(), e["profile_id"]))
         return entries
@@ -399,8 +413,67 @@ class CaptchaBroker:
             logger.info("captcha-center pruned (offline): %s (label=%s)", cid[:12], st.label)
         return removed
 
+    def unregister_center(self, center_id: str) -> dict[str, Any]:
+        """Xóa Captcha Center khỏi dashboard (forget) — poll vẫn chạy ẩn đến khi quét lại."""
+        cid = str(center_id or "").strip()
+        if not cid:
+            raise ValueError("invalid_center_id")
+        from flow2api.services.worker_settings import forget_captcha_center
+
+        st = self._centers.get(cid)
+        was_online = bool(st and st.is_online())
+        label = st.label if st else cid[:8]
+        for cmd_id, pending in list(self._pending.items()):
+            if pending.center_id != cid:
+                continue
+            self._pending.pop(cmd_id, None)
+            fut = pending.future
+            if not fut.done():
+                fut.set_exception(RuntimeError("CAPTCHA_CENTER_REMOVED"))
+        # Xóa queue command; giữ CenterState nếu đang online để Quét lại lấy ngay
+        queue = self._queues.get(cid)
+        if queue is not None:
+            queue.clear()
+        if not was_online:
+            self._centers.pop(cid, None)
+            self._queues.pop(cid, None)
+            self._events.pop(cid, None)
+        forget_captcha_center(cid)
+        logger.info("captcha-center unregistered: %s (label=%s online=%s)", cid[:12], label, was_online)
+        return {
+            "ok": True,
+            "center_id": cid,
+            "label": label,
+            "was_online": was_online,
+        }
+
+    def rediscover_online_centers(self) -> dict[str, Any]:
+        """Lấy lại Captcha Center đang online đã bị xóa (forgotten)."""
+        from flow2api.services.worker_settings import (
+            get_worker_settings,
+            unforget_captcha_center,
+        )
+
+        forgotten = list(get_worker_settings().captcha_center_forgotten)
+        restored: list[str] = []
+        now = time.time()
+        for cid in forgotten:
+            st = self._centers.get(cid)
+            if st and st.is_online(now):
+                unforget_captcha_center(cid)
+                restored.append(cid)
+        # Center đang poll nhưng chưa có trong _centers? Không xảy ra — poll luôn _ensure_center.
+        # Center online mới (chưa forgotten) đã hiện sẵn.
+        self.prune_offline_centers()
+        return {
+            "ok": True,
+            "restored": restored,
+            "restored_count": len(restored),
+            "online_count": sum(1 for s in self._centers.values() if s.is_online(now)),
+        }
+
     def redistribute(self) -> dict[str, Any]:
-        """Phân bổ lại cặp Center ↔ Bridge: prune ghost + tính lại cặp online."""
+        """Phân bổ lại cặp Center ↔ Bridge: prune ghost + gắn lại (online + nhận job)."""
         pruned = self.prune_offline_centers()
         stats = self.stats()
         stats["pruned_center_ids"] = pruned
@@ -415,36 +488,37 @@ class CaptchaBroker:
         return stats
 
     def compute_pairings(self) -> dict[str, Any]:
-        """Map Center ↔ Bridge cố định (không chồng chéo), ưu tiên online.
+        """Map Center ↔ Bridge cố định (không chồng chéo).
 
-        Center/Bridge offline không chiếm slot gắn cặp — khi thêm Center mới,
-        các Bridge online được chia lại ngay (không cần restart agent).
+        Chỉ gắn cặp Center online với Bridge đang online VÀ đang nhận job
+        (dispatch_enabled). Profile offline / ngừng phân bổ / đã xóa không chiếm slot.
         """
-        all_bridges = self._sorted_bridge_entries(online_only=False)
-        online_centers = self._sorted_center_entries(online_only=True)
-        online_bridges = [b for b in all_bridges if b.get("online")]
+        from flow2api.services.worker_settings import is_captcha_center_forgotten
 
-        # Gắn cặp chỉ giữa bên đang online; fallback all nếu chưa có ai online
-        # (giữ hiển thị / tránh rỗng hoàn toàn khi mọi thứ vừa restart).
-        centers = online_centers or self._sorted_center_entries(online_only=False)
-        bridges = online_bridges or all_bridges
+        all_bridges = self._sorted_bridge_entries(online_only=False, dispatch_only=False)
+        online_centers = [
+            c for c in self._sorted_center_entries(online_only=True)
+            if not is_captcha_center_forgotten(c.center_id)
+        ]
+        eligible_bridges = [
+            b for b in all_bridges
+            if b.get("online") and b.get("dispatch_enabled")
+        ]
+
+        centers = online_centers
+        bridges = eligible_bridges
 
         center_ids = [c.center_id for c in centers]
         bridge_ids = [b["profile_id"] for b in bridges]
         center_label = {c.center_id: c.label for c in centers}
-        # Label/online map từ mọi bridge (kể cả offline) để enrich pair rows
         bridge_label = {b["profile_id"]: b["label"] for b in all_bridges}
         bridge_online = {b["profile_id"]: b["online"] for b in all_bridges}
         bridge_ready = {b["profile_id"]: b["ready"] for b in all_bridges}
-        for b in bridges:
-            bridge_label.setdefault(b["profile_id"], b["label"])
-            bridge_online.setdefault(b["profile_id"], b["online"])
-            bridge_ready.setdefault(b["profile_id"], b["ready"])
+        bridge_dispatch = {b["profile_id"]: b.get("dispatch_enabled", True) for b in all_bridges}
         now = time.time()
 
         raw_pairs = compute_fixed_pairs(center_ids, bridge_ids)
         pairs: list[dict[str, Any]] = []
-        # bridge_to_centers gồm cả bridge offline (list rỗng) để UI không mất profile
         bridge_to_centers: dict[str, list[str]] = {b["profile_id"]: [] for b in all_bridges}
         for bid in bridge_ids:
             bridge_to_centers.setdefault(bid, [])
@@ -467,6 +541,7 @@ class CaptchaBroker:
                 "bridge_label": bridge_label.get(bid) or bid[:8],
                 "bridge_online": bool(bridge_online.get(bid)),
                 "bridge_ready": bool(bridge_ready.get(bid)),
+                "bridge_dispatch_enabled": bool(bridge_dispatch.get(bid, True)),
             })
 
         return {
@@ -539,10 +614,14 @@ class CaptchaBroker:
 
     def pick_center(self, bridge_profile_id: str = "") -> str | None:
         now = time.time()
+        from flow2api.services.worker_settings import is_captcha_center_forgotten
+
         preferred = self.paired_center_ids_for_bridge(bridge_profile_id)
         preferred_set = set(preferred) if preferred is not None else None
         candidates: list[CenterState] = []
         for st in self._centers.values():
+            if is_captcha_center_forgotten(st.center_id):
+                continue
             if preferred_set is not None and st.center_id not in preferred_set:
                 continue
             if not st.is_online(now):
@@ -678,9 +757,13 @@ class CaptchaBroker:
 
     def stats(self) -> dict:
         now = time.time()
+        from flow2api.services.worker_settings import is_captcha_center_forgotten
+
         pairing = self.compute_pairings()
         centers = []
         for st in self._centers.values():
+            if is_captcha_center_forgotten(st.center_id):
+                continue
             paired_bridges = pairing["center_to_bridges"].get(st.center_id) or []
             bridge_labels = []
             for bid in paired_bridges:
