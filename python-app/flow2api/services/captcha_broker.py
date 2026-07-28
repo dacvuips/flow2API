@@ -11,6 +11,8 @@ Chính sách:
 - Gắn cặp cố định Center ↔ Bridge (không chồng chéo): sort ổn định theo label/id,
   1:1 khi số lượng bằng nhau; bên thừa gắn hết vào phần tử cuối của bên ít hơn.
   VD 3 Center + 2 Bridge → C1↔B1, C2↔B2, C3↔B2.
+- Chỉ gắn cặp Center/Bridge đang online — Center offline (ghost) không chiếm slot,
+  tránh 2 Bridge kẹt mãi với Center cũ khi thêm Center mới.
 - Trong nhóm center đã gắn với Bridge: LRU + skip cooldown.
 - Khi có request: đánh thức long-poll các center gắn với Bridge đó, chờ sẵn sàng
   (cooldown / hard_reset / đăng ký lại sau agent restart) trước khi fail.
@@ -18,6 +20,7 @@ Chính sách:
   báo API 403 (từ Google) — hard_reset ưu tiên center đã gắn với Bridge đó.
 - Routing: mỗi request có commandId (uuid) — pending Future track theo commandId
   nên response chỉ resolve đúng caller (không lẫn profile Bridge).
+- Dashboard có nút "Phân bổ lại" → prune Center offline + tính lại cặp.
 """
 from __future__ import annotations
 
@@ -334,12 +337,15 @@ class CaptchaBroker:
 
     # ── Fixed Center ↔ Bridge pairing ───────────────────────────────────
 
-    def _sorted_center_entries(self) -> list[CenterState]:
+    def _sorted_center_entries(self, *, online_only: bool = False) -> list[CenterState]:
+        now = time.time()
         items = list(self._centers.values())
+        if online_only:
+            items = [s for s in items if s.is_online(now)]
         items.sort(key=lambda s: (str(s.label or "").lower(), s.center_id))
         return items
 
-    def _sorted_bridge_entries(self) -> list[dict[str, Any]]:
+    def _sorted_bridge_entries(self, *, online_only: bool = False) -> list[dict[str, Any]]:
         """Bridge (call API) profiles từ ExtensionPool — sort ổn định theo label/id."""
         try:
             from flow2api.services.extension_pool import get_extension_pool
@@ -356,30 +362,92 @@ class CaptchaBroker:
                 label = str(s.display_name() if hasattr(s, "display_name") else "") or pid[:8]
             except Exception:
                 label = pid[:8]
+            online = bool(getattr(s, "connected", False))
+            if online_only and not online:
+                continue
             entries.append({
                 "profile_id": pid,
                 "label": label,
-                "online": bool(getattr(s, "connected", False)),
+                "online": online,
                 "ready": bool(s.is_ready()) if hasattr(s, "is_ready") else False,
             })
         entries.sort(key=lambda e: (str(e.get("label") or "").lower(), e["profile_id"]))
         return entries
 
+    def prune_offline_centers(self) -> list[str]:
+        """Xóa Center offline khỏi registry (ghost không còn heartbeat).
+
+        Hủy pending request gắn với center bị prune. Trả về danh sách center_id đã xóa.
+        """
+        now = time.time()
+        removed: list[str] = []
+        for cid, st in list(self._centers.items()):
+            if st.is_online(now):
+                continue
+            # Fail pending requests đang chờ center này
+            for cmd_id, pending in list(self._pending.items()):
+                if pending.center_id != cid:
+                    continue
+                self._pending.pop(cmd_id, None)
+                fut = pending.future
+                if not fut.done():
+                    fut.set_exception(RuntimeError("CAPTCHA_CENTER_PRUNED"))
+            self._centers.pop(cid, None)
+            self._queues.pop(cid, None)
+            self._events.pop(cid, None)
+            removed.append(cid)
+            logger.info("captcha-center pruned (offline): %s (label=%s)", cid[:12], st.label)
+        return removed
+
+    def redistribute(self) -> dict[str, Any]:
+        """Phân bổ lại cặp Center ↔ Bridge: prune ghost + tính lại cặp online."""
+        pruned = self.prune_offline_centers()
+        stats = self.stats()
+        stats["pruned_center_ids"] = pruned
+        stats["pruned_count"] = len(pruned)
+        stats["redistributed"] = True
+        logger.info(
+            "captcha redistribute: pruned=%d online_centers=%d pairs=%d",
+            len(pruned),
+            stats.get("online_count", 0),
+            len(stats.get("pairings") or []),
+        )
+        return stats
+
     def compute_pairings(self) -> dict[str, Any]:
-        """Map Center ↔ Bridge cố định (không chồng chéo)."""
-        centers = self._sorted_center_entries()
-        bridges = self._sorted_bridge_entries()
+        """Map Center ↔ Bridge cố định (không chồng chéo), ưu tiên online.
+
+        Center/Bridge offline không chiếm slot gắn cặp — khi thêm Center mới,
+        các Bridge online được chia lại ngay (không cần restart agent).
+        """
+        all_bridges = self._sorted_bridge_entries(online_only=False)
+        online_centers = self._sorted_center_entries(online_only=True)
+        online_bridges = [b for b in all_bridges if b.get("online")]
+
+        # Gắn cặp chỉ giữa bên đang online; fallback all nếu chưa có ai online
+        # (giữ hiển thị / tránh rỗng hoàn toàn khi mọi thứ vừa restart).
+        centers = online_centers or self._sorted_center_entries(online_only=False)
+        bridges = online_bridges or all_bridges
+
         center_ids = [c.center_id for c in centers]
         bridge_ids = [b["profile_id"] for b in bridges]
         center_label = {c.center_id: c.label for c in centers}
-        bridge_label = {b["profile_id"]: b["label"] for b in bridges}
-        bridge_online = {b["profile_id"]: b["online"] for b in bridges}
-        bridge_ready = {b["profile_id"]: b["ready"] for b in bridges}
+        # Label/online map từ mọi bridge (kể cả offline) để enrich pair rows
+        bridge_label = {b["profile_id"]: b["label"] for b in all_bridges}
+        bridge_online = {b["profile_id"]: b["online"] for b in all_bridges}
+        bridge_ready = {b["profile_id"]: b["ready"] for b in all_bridges}
+        for b in bridges:
+            bridge_label.setdefault(b["profile_id"], b["label"])
+            bridge_online.setdefault(b["profile_id"], b["online"])
+            bridge_ready.setdefault(b["profile_id"], b["ready"])
         now = time.time()
 
         raw_pairs = compute_fixed_pairs(center_ids, bridge_ids)
         pairs: list[dict[str, Any]] = []
-        bridge_to_centers: dict[str, list[str]] = {bid: [] for bid in bridge_ids}
+        # bridge_to_centers gồm cả bridge offline (list rỗng) để UI không mất profile
+        bridge_to_centers: dict[str, list[str]] = {b["profile_id"]: [] for b in all_bridges}
+        for bid in bridge_ids:
+            bridge_to_centers.setdefault(bid, [])
         center_to_bridges: dict[str, list[str]] = {cid: [] for cid in center_ids}
 
         for cid, bid in raw_pairs:

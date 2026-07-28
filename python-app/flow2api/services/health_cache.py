@@ -15,6 +15,12 @@ _cache: dict[str, Any] = {"payload": None, "at": 0.0}
 _refresh_lock = asyncio.Lock()
 
 
+def invalidate_health_cache() -> None:
+    """Force next /api/health to rebuild (e.g. after captcha redistribute)."""
+    _cache["payload"] = None
+    _cache["at"] = 0.0
+
+
 def _captcha_public_stats() -> dict[str, Any]:
     try:
         from flow2api.services.captcha_broker import get_captcha_broker

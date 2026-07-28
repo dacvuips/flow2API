@@ -114,6 +114,21 @@ async def nudge_worker(_=Depends(_auth_key_id)):
     return await worker.nudge()
 
 
+@router.post("/captcha/redistribute")
+async def redistribute_captcha_pairs(_=Depends(_auth_key_id)):
+    """Phân bổ lại cặp Captcha Center ↔ Bridge (prune Center offline + gắn lại)."""
+    from flow2api.services.captcha_broker import get_captcha_broker
+    from flow2api.services.health_cache import (
+        _enrich_profiles_with_captcha,
+        invalidate_health_cache,
+    )
+
+    captcha = get_captcha_broker().redistribute()
+    invalidate_health_cache()
+    profiles = _enrich_profiles_with_captcha(get_extension_pool().list_public(), captcha)
+    return {"ok": True, "captcha": captcha, "profiles": profiles}
+
+
 @router.put("/profile-limits/{profile_id}")
 async def update_one_profile_limit(
     profile_id: str,
