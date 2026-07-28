@@ -554,14 +554,21 @@ class ExtensionSession:
                 action=action, bridge_profile_id=self.profile_id, timeout=30.0
             )
         except RuntimeError as exc:
+            err = str(exc or "")
             logger.warning(
                 "captcha broker failed profile=%s action=%s: %s",
-                self.profile_id[:8], action, exc,
+                self.profile_id[:8], action, err,
             )
+            if "TIMEOUT" in err.upper():
+                msg = "Captcha Center online nhưng không trả token kịp (timeout) — kiểm tra tab Flow của Center"
+            elif "NO_CAPTCHA_CENTER" in err.upper():
+                msg = f"Không chọn được Captcha Center — {err}"
+            else:
+                msg = f"Captcha broker lỗi: {err}"
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
+                msg,
                 level="error",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
@@ -575,7 +582,7 @@ class ExtensionSession:
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                "Không có Captcha Center online — cần ít nhất 1 profile mode Center",
+                f"Captcha broker exception: {exc}",
                 level="error",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
