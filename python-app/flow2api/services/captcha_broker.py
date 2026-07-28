@@ -11,8 +11,8 @@ Chính sách:
 - Gắn cặp cố định Center ↔ Bridge (không chồng chéo): sort ổn định theo label/id,
   1:1 khi số lượng bằng nhau; bên thừa gắn hết vào phần tử cuối của bên ít hơn.
   VD 3 Center + 2 Bridge → C1↔B1, C2↔B2, C3↔B2.
-- Chỉ gắn cặp Center online với Bridge đang online VÀ đang nhận job
-  (dispatch_enabled). Profile offline / ngừng phân bổ không chiếm slot.
+- Chỉ gắn cặp Center online với Bridge đang nhận job VÀ sẵn sàng (ready),
+  gồm cả offline-gen / Direct HTTP — không bắt buộc extension WS online.
 - Trong nhóm center đã gắn với Bridge: LRU + skip cooldown.
 - Khi có request: đánh thức long-poll các center gắn với Bridge đó, chờ sẵn sàng
   (cooldown / hard_reset / đăng ký lại sau agent restart) trước khi fail.
@@ -490,8 +490,9 @@ class CaptchaBroker:
     def compute_pairings(self) -> dict[str, Any]:
         """Map Center ↔ Bridge cố định (không chồng chéo).
 
-        Chỉ gắn cặp Center online với Bridge đang online VÀ đang nhận job
-        (dispatch_enabled). Profile offline / ngừng phân bổ / đã xóa không chiếm slot.
+        Gắn cặp Center online với Bridge đang nhận job VÀ sẵn sàng chạy
+        (ready — gồm cả offline-gen / Direct HTTP). Không bắt buộc WS online,
+        vì gen vẫn cần reCAPTCHA khi Chrome đã tắt.
         """
         from flow2api.services.worker_settings import is_captcha_center_forgotten
 
@@ -500,9 +501,10 @@ class CaptchaBroker:
             c for c in self._sorted_center_entries(online_only=True)
             if not is_captcha_center_forgotten(c.center_id)
         ]
+        # Nhận job + ready (online WS hoặc offline-gen đều được)
         eligible_bridges = [
             b for b in all_bridges
-            if b.get("online") and b.get("dispatch_enabled")
+            if b.get("dispatch_enabled") and b.get("ready")
         ]
 
         centers = online_centers
@@ -553,16 +555,19 @@ class CaptchaBroker:
         }
 
     def paired_center_ids_for_bridge(self, bridge_profile_id: str) -> list[str] | None:
-        """Danh sách center gắn với Bridge. None = chưa giới hạn (không có bridge id)."""
+        """Danh sách center gắn với Bridge. None = không giới hạn (mọi center online)."""
         bid = str(bridge_profile_id or "").strip()
         if not bid:
             return None
         pairing = self.compute_pairings()
         mapped = pairing["bridge_to_centers"].get(bid)
-        if mapped is not None:
+        if mapped:
             return list(mapped)
-        # Bridge chưa có trong pool (race) — không giới hạn để tránh kẹt request
-        if pairing["center_count"] and pairing["bridge_count"]:
+        # Bridge chưa nằm trong cặp (offline-gen / race) nhưng vẫn còn Center online
+        # → không giới hạn, tránh NO_CAPTCHA_CENTER khi UI hiện 1 Center / 0 liên kết.
+        if pairing.get("center_count"):
+            return None
+        if mapped is not None:
             return []
         return None
 
