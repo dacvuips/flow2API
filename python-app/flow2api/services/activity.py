@@ -9,6 +9,27 @@ from flow2api.db.models import RequestRecord, SessionLocal
 from flow2api.services import task_counters
 
 
+def sanitize_utf8(value: Any) -> Any:
+    """Strip lone Unicode surrogates so SQLite/utf-8 never raises UnicodeEncodeError."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+            return value
+        except UnicodeEncodeError:
+            return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {str(k): sanitize_utf8(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_utf8(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_utf8(v) for v in value)
+    return value
+
+
+def _dumps(data: Any) -> str:
+    return json.dumps(sanitize_utf8(data), ensure_ascii=False)
+
+
 def create_request(
     rid: str,
     req_type: str,
@@ -23,9 +44,9 @@ def create_request(
             id=rid,
             type=req_type,
             status="queued",
-            prompt=prompt,
-            model=model,
-            params_json=json.dumps(params, ensure_ascii=False),
+            prompt=sanitize_utf8(str(prompt or "")),
+            model=sanitize_utf8(str(model or "")),
+            params_json=_dumps(params),
             api_key_id=api_key_id,
         )
         db.add(row)
@@ -46,7 +67,7 @@ def requeue_request(rid: str, params: dict[str, Any]) -> Optional[RequestRecord]
             return None
         old_status = row.status
         row.status = "queued"
-        row.params_json = json.dumps(params, ensure_ascii=False)
+        row.params_json = _dumps(params)
         row.result_json = "{}"
         row.error = None
         row.updated_at = datetime.utcnow()
@@ -67,10 +88,12 @@ def update_request(rid: str, **fields: Any) -> None:
         old_status = row.status
         for k, v in fields.items():
             if k == "result" and isinstance(v, dict):
-                row.result_json = json.dumps(v, ensure_ascii=False)
+                row.result_json = _dumps(v)
             elif k == "params" and isinstance(v, dict):
-                row.params_json = json.dumps(v, ensure_ascii=False)
+                row.params_json = _dumps(v)
             elif hasattr(row, k):
+                if isinstance(v, str):
+                    v = sanitize_utf8(v)
                 setattr(row, k, v)
         row.updated_at = datetime.utcnow()
         db.commit()

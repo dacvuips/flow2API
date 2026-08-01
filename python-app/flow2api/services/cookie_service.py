@@ -117,6 +117,52 @@ def build_cookie_header(cookies: Any) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in deduped if c.get("name") and c.get("value"))
 
 
+def _extract_cookies_expires_at(cookies_data: Any) -> Optional["datetime"]:
+    """Tìm expires lớn nhất trong danh sách cookies (Unix timestamp từ CDP/Playwright)."""
+    from datetime import datetime
+    if not isinstance(cookies_data, list):
+        return None
+    # Ưu tiên cookies xác thực Google
+    priority_names = {"__Secure-1PSID", "__Secure-3PSID", "SAPISID", "SID", "SSID", "HSID"}
+    best: Optional[float] = None
+    for c in cookies_data:
+        if not isinstance(c, dict):
+            continue
+        exp = c.get("expires") or c.get("expiry")
+        if exp is None:
+            continue
+        try:
+            ts = float(exp)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0 or ts < 1e9:
+            continue  # session cookie hoặc invalid
+        name = str(c.get("name") or "")
+        if name in priority_names:
+            if best is None or ts > best:
+                best = ts
+    if best is None:
+        # fallback: max của tất cả cookies có expires
+        for c in cookies_data:
+            if not isinstance(c, dict):
+                continue
+            exp = c.get("expires") or c.get("expiry")
+            if exp is None:
+                continue
+            try:
+                ts = float(exp)
+            except (TypeError, ValueError):
+                continue
+            if ts > 1e9 and (best is None or ts > best):
+                best = ts
+    if best is None:
+        return None
+    try:
+        return datetime.utcfromtimestamp(best)
+    except (OSError, OverflowError):
+        return None
+
+
 def save_profile_cookies(profile_id: str, cookies: Any) -> None:
     pid = str(profile_id or "").strip()
     if not pid or cookies is None:
@@ -125,11 +171,18 @@ def save_profile_cookies(profile_id: str, cookies: Any) -> None:
         payload = cookies.strip()
         if not payload:
             return
+        try:
+            import json as _json
+            cookies_data = _json.loads(payload)
+        except Exception:
+            cookies_data = None
     else:
+        cookies_data = cookies
         payload = json.dumps(cookies, ensure_ascii=False)
     if not payload:
         return
     enc = encrypt_token(payload)
+    cookies_exp = _extract_cookies_expires_at(cookies_data)
     with SessionLocal() as db:
         row = db.get(FlowProfile, pid)
         if not row:
@@ -137,6 +190,8 @@ def save_profile_cookies(profile_id: str, cookies: Any) -> None:
             db.add(row)
         row.cookies_enc = enc
         row.cookies_captured_at = _utcnow()
+        if cookies_exp is not None:
+            row.cookies_expires_at = cookies_exp
         row.updated_at = _utcnow()
         db.commit()
     logger.info("profile cookies saved profile=%s bytes=%s", pid[:12], len(payload))

@@ -30,6 +30,7 @@ from flow2api.services.flow_sdk import (
     is_extension_disconnect_error,
     is_extension_timeout_error,
     is_http_403_failure,
+    is_http_429_failure,
     is_policy_rejection_failure,
     is_prominent_people_filter_failure,
     is_trpc_401_failure,
@@ -102,9 +103,47 @@ class WorkerController:
     def _prune_running(self) -> None:
         done = [rid for rid, task in self._running.items() if task.done()]
         for rid in done:
-            self._running.pop(rid, None)
+            task = self._running.pop(rid, None)
             self._running_since.pop(rid, None)
             self._cancelled.discard(rid)
+            # Safety net: task crashed before marking failed/queued → đừng để treo running 20p
+            if task is None:
+                continue
+            try:
+                exc = task.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                exc = None
+            if not exc:
+                continue
+            row = activity.get_request(rid)
+            if not row or row.status != "running":
+                continue
+            msg = format_api_error(exc).strip() or type(exc).__name__
+            logger.error("running task died uncleanly rid=%s err=%s", rid[:8], msg)
+            activity.update_request(
+                rid,
+                status=f"failed: {msg}",
+                error=msg,
+                result={"error": msg},
+            )
+            append_request_log(rid, "worker", f"Job aborted: {msg}", level="error")
+            events.publish("request_finished", {"id": rid, "status": "failed"})
+
+    def _requeue_no_profile(self, rid: str, params: dict[str, Any], *, reason: str) -> None:
+        """Đưa task về queued khi không gán được profile (tránh treo running → timeout 20m)."""
+        params = dict(params or {})
+        params.pop("running_started_at", None)
+        # Chờ ngắn rồi scheduler thử lại khi có slot profile
+        params["retry_not_before"] = time.time() + 2.0
+        activity.update_request(rid, status="queued", params=params, error=None)
+        append_request_log(
+            rid,
+            "worker",
+            f"Chưa gán được profile ({reason}) — về hàng đợi",
+            level="warn",
+        )
+        events.publish("request_finished", {"id": rid, "status": "queued"})
+        logger.warning("requeue no profile rid=%s reason=%s", rid[:8], reason)
 
     def request_cancel(self, rid: str) -> None:
         self._cancelled.add(rid)
@@ -242,6 +281,7 @@ class WorkerController:
             actions.append("scheduler_restarted")
 
         pool = get_extension_pool()
+        pool.hydrate_db_profiles()
         drift = pool.reconcile_active_jobs(self._count_running_by_profile())
         if drift:
             actions.append("active_jobs_reconciled")
@@ -559,6 +599,24 @@ class WorkerController:
             rid[:8],
             failed_profile[:12] or "-",
         )
+        # Auto CDP: 403/429 → ngừng job profile lỗi + mở CDP Gen kế tiếp (standby)
+        if failed_profile and (
+            "403" in label or "429" in label or "reCAPTCHA" in label
+        ):
+            self._trigger_next_cdp_on_block(failed_profile, label)
+
+    def _trigger_next_cdp_on_block(self, failed_profile_id: str, reason: str) -> None:
+        try:
+            from flow2api.services.flow_cdp_auto import on_profile_http_block
+
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                on_profile_http_block(failed_profile_id, reason=reason)
+            )
+        except RuntimeError:
+            logger.debug("no running loop for CDP auto trigger")
+        except Exception as exc:
+            logger.warning("trigger next CDP failed: %s", exc)
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
@@ -581,7 +639,10 @@ class WorkerController:
         started = 0
         pool = get_extension_pool()
         if slots > 0 and pool.ready_count() == 0:
-            return 0
+            # Hydrate DB profiles mỗi tick khi pool rỗng (bắt direct-lane offline gen)
+            pool.hydrate_db_profiles()
+            if pool.ready_count() == 0:
+                return 0
         if slots > 0 and not pool.has_available_profile():
             return 0
         if slots > 0:
@@ -615,260 +676,292 @@ class WorkerController:
         return started
 
     async def _run_job(self, rid: str) -> None:
-        row = activity.get_request(rid)
-        if not row:
-            return
-        params = normalize_request_params(json.loads(row.params_json or "{}"))
-        profile_id = self._assign_profile(rid, params, row.type)
+        profile_id = ""
         pool = get_extension_pool()
-        pool.job_started(profile_id)
-        bind_task_profile(profile_id)
-        client = get_flow_client()
-        client.trace_request_id = rid
-        begin_api_trace(rid)
-        append_request_log(
-            rid,
-            "worker",
-            f"Job started type={row.type} model={row.model or '-'}",
-            level="info",
-            data={"profile_id": profile_id},
-        )
+        client = None
+        began_trace = False
         try:
-            self._raise_if_cancelled(rid)
-            await self._process_one(rid)
-        except RequestCancelled:
-            end_api_trace(rid)
-            cur = activity.get_request(rid)
-            if cur and cur.status == "queued":
-                raise
-            append_request_log(rid, "worker", "Job canceled", level="warn")
-            if cur and cur.status == "running":
-                activity.update_request(
-                    rid,
-                    status="failed: canceled",
-                    error="canceled",
-                    result={"error": "canceled"},
-                )
-            events.publish("request_finished", {"id": rid, "status": "canceled"})
-        except asyncio.CancelledError:
-            end_api_trace(rid)
-            cur = activity.get_request(rid)
-            if cur and (
-                cur.status == "queued" or cur.status.startswith("failed:")
-            ):
-                raise
-            if cur and cur.status == "running":
-                activity.update_request(
-                    rid,
-                    status=f"failed: {TASK_TIMEOUT_ERROR}",
-                    error=TASK_TIMEOUT_ERROR_MSG,
-                    result={"error": TASK_TIMEOUT_ERROR_MSG},
-                )
-                append_request_log(
-                    rid,
-                    "worker",
-                    TASK_TIMEOUT_ERROR_MSG,
-                    level="warn",
-                )
-                events.publish("request_finished", {"id": rid, "status": "failed"})
-            raise
-        except Exception as exc:
-            cur = activity.get_request(rid)
-            if cur and (
-                cur.status.startswith("failed:")
-                or cur.error in (TASK_TIMEOUT_ERROR, TASK_TIMEOUT_ERROR_MSG, "canceled")
-            ):
+            row = activity.get_request(rid)
+            if not row:
                 return
-            api_trace = end_api_trace(rid)
-            msg = format_api_error(exc).strip() or "unknown_error"
-            cur = activity.get_request(rid)
-            retry_params = json.loads(cur.params_json or "{}") if cur else {}
-            recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
-            if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
-                delay_s = flow_sdk.recaptcha_retry_delay(recaptcha_retry)
-                retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                append_request_log(
-                    rid,
-                    "worker",
-                    (
-                        f"reCAPTCHA retry {recaptcha_retry + 1}/{RECAPTCHA_RETRY_MAX} "
-                        f"— chờ {delay_s:.1f}s"
-                    ),
-                    level="warn",
-                    profile_id=str(
-                        retry_params.get("profile_id")
-                        or retry_params.get("retry_exclude_profile_id")
-                        or ""
-                    )
-                    or None,
-                    profile_email=str(retry_params.get("profile_email") or "") or None,
-                )
+            if row.status != "running":
                 return
-            if flow_sdk.is_recaptcha_error(msg):
-                self._handle_profile_error_switch(
-                    rid,
-                    retry_params,
-                    msg,
-                    label="reCAPTCHA 403",
-                    reset_recaptcha_retries=True,
-                )
+            params = normalize_request_params(json.loads(row.params_json or "{}"))
+            try:
+                profile_id = self._assign_profile(rid, params, row.type)
+            except Exception as exc:
+                reason = format_api_error(exc).strip() or type(exc).__name__
+                self._requeue_no_profile(rid, params, reason=reason)
                 return
-            if is_policy_rejection_failure(exc, msg, api_trace):
-                msg = POLICY_REJECTION_ERROR_MSG
-            upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
-            if (
-                is_upload_image_internal_failure(exc, msg, api_trace)
-                and upload_internal_retry < RECAPTCHA_RETRY_MAX
-            ):
-                delay_s = flow_sdk.recaptcha_retry_delay(upload_internal_retry)
-                retry_params["upload_internal_retry_count"] = upload_internal_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "upload_image internal error retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    upload_internal_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            extension_timeout_retry = int(retry_params.get("extension_timeout_retry_count") or 0)
-            if (
-                is_extension_timeout_error(msg, exc)
-                and extension_timeout_retry < RECAPTCHA_RETRY_MAX
-            ):
-                delay_s = flow_sdk.recaptcha_retry_delay(extension_timeout_retry)
-                retry_params["extension_timeout_retry_count"] = extension_timeout_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "extension_timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    extension_timeout_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            extension_disconnect_retry = int(
-                retry_params.get("extension_disconnect_retry_count") or 0
-            )
-            if (
-                is_extension_disconnect_error(msg, exc)
-                and extension_disconnect_retry < RECAPTCHA_RETRY_MAX
-            ):
-                delay_s = flow_sdk.recaptcha_retry_delay(extension_disconnect_retry)
-                retry_params["extension_disconnect_retry_count"] = extension_disconnect_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                logger.warning(
-                    "extension_disconnected retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    extension_disconnect_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            trpc_401_retry = int(retry_params.get("trpc_401_retry_count") or 0)
-            if is_trpc_401_failure(exc, msg, api_trace) and trpc_401_retry < RECAPTCHA_RETRY_MAX:
-                delay_s = flow_sdk.recaptcha_retry_delay(trpc_401_retry)
-                retry_params["trpc_401_retry_count"] = trpc_401_retry + 1
-                retry_params["retry_not_before"] = time.time() + delay_s
-                retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
-                append_request_log(
-                    rid,
-                    "worker",
-                    (
-                        f"TRPC_401 retry {trpc_401_retry + 1}/{RECAPTCHA_RETRY_MAX} "
-                        f"— chờ {delay_s:.1f}s"
-                    ),
-                    level="warn",
-                    profile_id=str(
-                        retry_params.get("profile_id")
-                        or retry_params.get("retry_exclude_profile_id")
-                        or ""
-                    )
-                    or None,
-                )
-                logger.warning(
-                    "TRPC_401 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                    trpc_401_retry + 1,
-                    RECAPTCHA_RETRY_MAX,
-                    rid[:8],
-                    delay_s,
-                    str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
-                )
-                return
-            if is_http_403_failure(exc, msg, api_trace):
-                self._handle_profile_error_switch(
-                    rid,
-                    retry_params,
-                    msg,
-                    label="HTTP 403",
-                )
-                return
-            if isinstance(exc, FlowApiError):
-                logger.error(
-                    "worker failed rid=%s step=%s err=%s api_trace=%s",
-                    rid,
-                    exc.step,
-                    msg,
-                    len(api_trace),
-                )
-            else:
-                logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
-            display_msg = flow_sdk.sanitize_public_error(
-                msg,
-                exc if isinstance(exc, FlowApiError) else None,
-                request_type=str(cur.type or "") if cur else "",
-            )
-            append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
-            fail_result: dict = {
-                "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
-                "error": display_msg,
-                "debug_version": 2,
-            }
-            if isinstance(exc, FlowApiError) and exc.step:
-                fail_result["api_step"] = exc.step
-            if api_trace:
-                fail_result["api_attempts"] = api_trace
-                if not fail_result.get("api_step"):
-                    fail_result["api_step"] = api_trace[-1].get("label") or "api_error"
-            if isinstance(exc, FlowApiError):
-                if not fail_result.get("api_step"):
-                    fail_result["api_step"] = exc.step
-                if exc.attempts and not fail_result.get("api_attempts"):
-                    fail_result["api_attempts"] = exc.attempts
-                elif exc.raw and not fail_result.get("api_last_response"):
-                    from flow2api.services.flow_sdk import compact_api_response
 
-                    fail_result["api_last_response"] = compact_api_response(
-                        exc.raw, exc.step or "api_error"
-                    )
-            activity.update_request(
-                rid,
-                status=f"failed: {display_msg}",
-                error=display_msg,
-                result=fail_result,
-            )
-            events.publish("request_finished", {"id": rid, "status": "failed"})
-        else:
-            api_trace = end_api_trace(rid)
+            pool.job_started(profile_id)
+            bind_task_profile(profile_id)
+            client = get_flow_client()
+            client.trace_request_id = rid
+            begin_api_trace(rid)
+            began_trace = True
             append_request_log(
                 rid,
                 "worker",
-                "Job completed",
+                f"Job started type={row.type} model={row.model or '-'}",
                 level="info",
-                data={"api_calls": len(api_trace)} if api_trace else None,
+                data={"profile_id": profile_id},
             )
+            try:
+                self._raise_if_cancelled(rid)
+                await self._process_one(rid)
+            except RequestCancelled:
+                end_api_trace(rid)
+                began_trace = False
+                cur = activity.get_request(rid)
+                if cur and cur.status == "queued":
+                    raise
+                append_request_log(rid, "worker", "Job canceled", level="warn")
+                if cur and cur.status == "running":
+                    activity.update_request(
+                        rid,
+                        status="failed: canceled",
+                        error="canceled",
+                        result={"error": "canceled"},
+                    )
+                events.publish("request_finished", {"id": rid, "status": "canceled"})
+            except asyncio.CancelledError:
+                end_api_trace(rid)
+                began_trace = False
+                cur = activity.get_request(rid)
+                if cur and (
+                    cur.status == "queued" or cur.status.startswith("failed:")
+                ):
+                    raise
+                if cur and cur.status == "running":
+                    activity.update_request(
+                        rid,
+                        status=f"failed: {TASK_TIMEOUT_ERROR}",
+                        error=TASK_TIMEOUT_ERROR_MSG,
+                        result={"error": TASK_TIMEOUT_ERROR_MSG},
+                    )
+                    append_request_log(
+                        rid,
+                        "worker",
+                        TASK_TIMEOUT_ERROR_MSG,
+                        level="warn",
+                    )
+                    events.publish("request_finished", {"id": rid, "status": "failed"})
+                raise
+            except Exception as exc:
+                cur = activity.get_request(rid)
+                if cur and (
+                    cur.status.startswith("failed:")
+                    or cur.error in (TASK_TIMEOUT_ERROR, TASK_TIMEOUT_ERROR_MSG, "canceled")
+                ):
+                    return
+                api_trace = end_api_trace(rid)
+                began_trace = False
+                msg = format_api_error(exc).strip() or "unknown_error"
+                cur = activity.get_request(rid)
+                retry_params = json.loads(cur.params_json or "{}") if cur else {}
+                recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
+                if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
+                    delay_s = flow_sdk.recaptcha_retry_delay(recaptcha_retry)
+                    retry_params["recaptcha_retry_count"] = recaptcha_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    append_request_log(
+                        rid,
+                        "worker",
+                        (
+                            f"reCAPTCHA retry {recaptcha_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                            f"— chờ {delay_s:.1f}s"
+                        ),
+                        level="warn",
+                        profile_id=str(
+                            retry_params.get("profile_id")
+                            or retry_params.get("retry_exclude_profile_id")
+                            or ""
+                        )
+                        or None,
+                        profile_email=str(retry_params.get("profile_email") or "") or None,
+                    )
+                    return
+                if flow_sdk.is_recaptcha_error(msg):
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="reCAPTCHA 403",
+                        reset_recaptcha_retries=True,
+                    )
+                    return
+                if is_policy_rejection_failure(exc, msg, api_trace):
+                    msg = POLICY_REJECTION_ERROR_MSG
+                upload_internal_retry = int(retry_params.get("upload_internal_retry_count") or 0)
+                if (
+                    is_upload_image_internal_failure(exc, msg, api_trace)
+                    and upload_internal_retry < RECAPTCHA_RETRY_MAX
+                ):
+                    delay_s = flow_sdk.recaptcha_retry_delay(upload_internal_retry)
+                    retry_params["upload_internal_retry_count"] = upload_internal_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    logger.warning(
+                        "upload_image internal error retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                        upload_internal_retry + 1,
+                        RECAPTCHA_RETRY_MAX,
+                        rid[:8],
+                        delay_s,
+                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    )
+                    return
+                extension_timeout_retry = int(retry_params.get("extension_timeout_retry_count") or 0)
+                if (
+                    is_extension_timeout_error(msg, exc)
+                    and extension_timeout_retry < RECAPTCHA_RETRY_MAX
+                ):
+                    delay_s = flow_sdk.recaptcha_retry_delay(extension_timeout_retry)
+                    retry_params["extension_timeout_retry_count"] = extension_timeout_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    logger.warning(
+                        "extension_timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                        extension_timeout_retry + 1,
+                        RECAPTCHA_RETRY_MAX,
+                        rid[:8],
+                        delay_s,
+                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    )
+                    return
+                extension_disconnect_retry = int(
+                    retry_params.get("extension_disconnect_retry_count") or 0
+                )
+                if (
+                    is_extension_disconnect_error(msg, exc)
+                    and extension_disconnect_retry < RECAPTCHA_RETRY_MAX
+                ):
+                    delay_s = flow_sdk.recaptcha_retry_delay(extension_disconnect_retry)
+                    retry_params["extension_disconnect_retry_count"] = extension_disconnect_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    logger.warning(
+                        "extension_disconnected retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                        extension_disconnect_retry + 1,
+                        RECAPTCHA_RETRY_MAX,
+                        rid[:8],
+                        delay_s,
+                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    )
+                    return
+                trpc_401_retry = int(retry_params.get("trpc_401_retry_count") or 0)
+                if is_trpc_401_failure(exc, msg, api_trace) and trpc_401_retry < RECAPTCHA_RETRY_MAX:
+                    delay_s = flow_sdk.recaptcha_retry_delay(trpc_401_retry)
+                    retry_params["trpc_401_retry_count"] = trpc_401_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    append_request_log(
+                        rid,
+                        "worker",
+                        (
+                            f"TRPC_401 retry {trpc_401_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                            f"— chờ {delay_s:.1f}s"
+                        ),
+                        level="warn",
+                        profile_id=str(
+                            retry_params.get("profile_id")
+                            or retry_params.get("retry_exclude_profile_id")
+                            or ""
+                        )
+                        or None,
+                    )
+                    logger.warning(
+                        "TRPC_401 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                        trpc_401_retry + 1,
+                        RECAPTCHA_RETRY_MAX,
+                        rid[:8],
+                        delay_s,
+                        str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
+                    )
+                    return
+                if is_http_403_failure(exc, msg, api_trace):
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="HTTP 403",
+                    )
+                    return
+                if is_http_429_failure(exc, msg, api_trace):
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="HTTP 429",
+                    )
+                    return
+                if isinstance(exc, FlowApiError):
+                    logger.error(
+                        "worker failed rid=%s step=%s err=%s api_trace=%s",
+                        rid,
+                        exc.step,
+                        msg,
+                        len(api_trace),
+                    )
+                else:
+                    logger.exception("worker failed rid=%s api_trace=%s", rid, len(api_trace))
+                display_msg = flow_sdk.sanitize_public_error(
+                    msg,
+                    exc if isinstance(exc, FlowApiError) else None,
+                    request_type=str(cur.type or "") if cur else "",
+                )
+                append_request_log(rid, "worker", f"Job failed: {msg}", level="error", data={"api_trace": api_trace})
+                fail_result: dict = {
+                    "hint": "Mo tab labs.google Flow, Extension OK; thu model Lite hoac Fast",
+                    "error": display_msg,
+                    "debug_version": 2,
+                }
+                if isinstance(exc, FlowApiError) and exc.step:
+                    fail_result["api_step"] = exc.step
+                if api_trace:
+                    fail_result["api_attempts"] = api_trace
+                    if not fail_result.get("api_step"):
+                        fail_result["api_step"] = api_trace[-1].get("label") or "api_error"
+                if isinstance(exc, FlowApiError):
+                    if not fail_result.get("api_step"):
+                        fail_result["api_step"] = exc.step
+                    if exc.attempts and not fail_result.get("api_attempts"):
+                        fail_result["api_attempts"] = exc.attempts
+                    elif exc.raw and not fail_result.get("api_last_response"):
+                        from flow2api.services.flow_sdk import compact_api_response
+
+                        fail_result["api_last_response"] = compact_api_response(
+                            exc.raw, exc.step or "api_error"
+                        )
+                activity.update_request(
+                    rid,
+                    status=f"failed: {display_msg}",
+                    error=display_msg,
+                    result=fail_result,
+                )
+                events.publish("request_finished", {"id": rid, "status": "failed"})
+            else:
+                api_trace = end_api_trace(rid)
+                began_trace = False
+                append_request_log(
+                    rid,
+                    "worker",
+                    "Job completed",
+                    level="info",
+                    data={"api_calls": len(api_trace)} if api_trace else None,
+                )
         finally:
-            client.trace_request_id = None
+            if began_trace:
+                try:
+                    end_api_trace(rid)
+                except Exception:
+                    pass
+            if client is not None:
+                client.trace_request_id = None
             unbind_task_profile()
-            pool.job_finished(profile_id)
+            if profile_id:
+                pool.job_finished(profile_id)
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:

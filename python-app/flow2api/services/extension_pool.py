@@ -6,6 +6,7 @@ import contextvars
 import json
 import logging
 import secrets
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -163,6 +164,7 @@ class ExtensionSession:
                 from flow2api.services.flow_profile_service import save_access_token
 
                 expires_raw = data.get("expiresAt") or data.get("accessTokenExpires")
+                logger.info("token_captured profile=%s expiresAt=%r", self.profile_id[:12], expires_raw)
                 save_access_token(
                     self.profile_id,
                     token,
@@ -957,32 +959,40 @@ class ExtensionPool:
         self._ws_to_profile: dict[int, str] = {}
         self._rr_index: int = 0
         self._lock = asyncio.Lock()
+        # Protect _sessions across asyncio thread + health to_thread / hydrate.
+        self._sessions_lock = threading.RLock()
         self.hydrate_db_profiles()
+
+    def _sessions_snapshot(self) -> list[ExtensionSession]:
+        with self._sessions_lock:
+            return list(self._sessions.values())
 
     def hydrate_db_profiles(self) -> None:
         """Restore profile sessions from DB so direct-lane gen works without Chrome WS."""
         from flow2api.services.flow_profile_service import list_all_profile_rows
         from flow2api.services.worker_settings import is_profile_forgotten
 
-        for row in list_all_profile_rows():
-            pid = str(row.profile_id or "").strip()
-            if not pid or pid.startswith("_"):
-                continue
-            if is_profile_forgotten(pid):
-                continue
-            session = self._sessions.get(pid)
-            label = str(row.profile_label or row.email or pid[:8])
-            if not session:
-                session = ExtensionSession(pid, label)
-                self._sessions[pid] = session
-            elif label and session.profile_label in ("", pid[:8]):
-                session.profile_label = label
-            if row.email:
-                session.user_info = session.user_info or {}
-                if isinstance(session.user_info, dict):
-                    session.user_info.setdefault("email", row.email)
-            if row.paygate_tier:
-                session.paygate_tier = row.paygate_tier
+        rows = list_all_profile_rows()
+        with self._sessions_lock:
+            for row in rows:
+                pid = str(row.profile_id or "").strip()
+                if not pid or pid.startswith("_"):
+                    continue
+                if is_profile_forgotten(pid):
+                    continue
+                session = self._sessions.get(pid)
+                label = str(row.profile_label or row.email or pid[:8])
+                if not session:
+                    session = ExtensionSession(pid, label)
+                    self._sessions[pid] = session
+                elif label and session.profile_label in ("", pid[:8]):
+                    session.profile_label = label
+                if row.email:
+                    session.user_info = session.user_info or {}
+                    if isinstance(session.user_info, dict):
+                        session.user_info.setdefault("email", row.email)
+                if row.paygate_tier:
+                    session.paygate_tier = row.paygate_tier
 
     def bind_profile(self, profile_id: str) -> None:
         _bound_profile_id.set(profile_id)
@@ -1019,7 +1029,7 @@ class ExtensionPool:
         from flow2api.services.worker_settings import is_profile_forgotten
 
         return [
-            s for s in self._sessions.values()
+            s for s in self._sessions_snapshot()
             if s.is_ready() and not is_profile_forgotten(s.profile_id)
         ]
 
@@ -1027,7 +1037,7 @@ class ExtensionPool:
         from flow2api.services.worker_settings import is_profile_forgotten
 
         return [
-            s for s in self._sessions.values()
+            s for s in self._sessions_snapshot()
             if not s.profile_id.startswith("_") and not is_profile_forgotten(s.profile_id)
         ]
 
@@ -1036,14 +1046,14 @@ class ExtensionPool:
 
         return any(
             s.connected and not is_profile_forgotten(s.profile_id)
-            for s in self._sessions.values()
+            for s in self._sessions_snapshot()
         )
 
     def online_count(self) -> int:
         from flow2api.services.worker_settings import is_profile_forgotten
 
         return sum(
-            1 for s in self._sessions.values()
+            1 for s in self._sessions_snapshot()
             if s.connected and not is_profile_forgotten(s.profile_id)
         )
 
@@ -1054,7 +1064,7 @@ class ExtensionPool:
         from flow2api.services.worker_settings import is_profile_forgotten
 
         return sum(
-            1 for s in self._sessions.values()
+            1 for s in self._sessions_snapshot()
             if s.has_direct_lane() and not is_profile_forgotten(s.profile_id)
         )
 
@@ -1063,7 +1073,7 @@ class ExtensionPool:
 
         return sum(
             1
-            for s in self._sessions.values()
+            for s in self._sessions_snapshot()
             if s.has_direct_lane()
             and not s.connected
             and not s.profile_id.startswith("_")
@@ -1075,20 +1085,20 @@ class ExtensionPool:
 
         items = [
             s.to_public_dict()
-            for s in self._sessions.values()
+            for s in self._sessions_snapshot()
             if not s.profile_id.startswith("_") and not is_profile_forgotten(s.profile_id)
         ]
         items.sort(key=lambda x: (not x.get("ready"), x.get("display_name") or ""))
         return items
 
     async def remove_profile(self, profile_id: str) -> dict[str, Any]:
-        """Xóa profile generate khỏi dashboard: forget + wipe DB + đóng WS."""
+        """Xóa thật profile: đóng WS + wipe DB token/cookies + purge worker settings."""
         pid = str(profile_id or "").strip()
         if not pid or pid.startswith("_"):
             raise ValueError("invalid_profile_id")
 
         from flow2api.services.flow_profile_service import delete_profile_row
-        from flow2api.services.worker_settings import forget_profile
+        from flow2api.services.worker_settings import purge_profile
 
         session = self._sessions.get(pid)
         was_online = bool(session and session.connected)
@@ -1104,9 +1114,10 @@ class ExtensionPool:
         for wid, mapped in list(self._ws_to_profile.items()):
             if mapped == pid:
                 self._ws_to_profile.pop(wid, None)
-        self._sessions.pop(pid, None)
+        with self._sessions_lock:
+            self._sessions.pop(pid, None)
 
-        forget_profile(pid)
+        purge_profile(pid)
         deleted = delete_profile_row(pid)
 
         try:
@@ -1120,7 +1131,7 @@ class ExtensionPool:
         append_request_log(
             None,
             "profile",
-            f"Chrome profile removed: {pid[:12]}",
+            f"Chrome profile deleted: {pid[:12]}",
             level="warn",
             data={"profile_id": pid, "db_deleted": deleted, "was_online": was_online},
         )
@@ -1141,7 +1152,7 @@ class ExtensionPool:
 
         restored: list[str] = []
         online: list[str] = []
-        for session in list(self._sessions.values()):
+        for session in self._sessions_snapshot():
             pid = session.profile_id
             if not pid or pid.startswith("_"):
                 continue
@@ -1176,24 +1187,25 @@ class ExtensionPool:
 
         forgotten = is_profile_forgotten(pid)
         async with self._lock:
-            session = self._sessions.get(pid)
-            if not session:
-                session = ExtensionSession(pid, profile_label)
-                self._sessions[pid] = session
-            elif profile_label:
-                session.profile_label = profile_label
-            if not forgotten:
-                from flow2api.services.flow_profile_service import ensure_profile_row
+            with self._sessions_lock:
+                session = self._sessions.get(pid)
+                if not session:
+                    session = ExtensionSession(pid, profile_label)
+                    self._sessions[pid] = session
+                elif profile_label:
+                    session.profile_label = profile_label
+                if not forgotten:
+                    from flow2api.services.flow_profile_service import ensure_profile_row
 
-                ensure_profile_row(pid, profile_label=session.profile_label)
-            stale_ws_ids = [
-                wid for wid, mapped_pid in self._ws_to_profile.items()
-                if mapped_pid == pid and wid != id(ws)
-            ]
-            for wid in stale_ws_ids:
-                self._ws_to_profile.pop(wid, None)
-            session.attach_ws(ws)
-            self._ws_to_profile[id(ws)] = pid
+                    ensure_profile_row(pid, profile_label=session.profile_label)
+                stale_ws_ids = [
+                    wid for wid, mapped_pid in self._ws_to_profile.items()
+                    if mapped_pid == pid and wid != id(ws)
+                ]
+                for wid in stale_ws_ids:
+                    self._ws_to_profile.pop(wid, None)
+                session.attach_ws(ws)
+                self._ws_to_profile[id(ws)] = pid
         await session.send_json({"type": "callback_secret", "secret": self.callback_secret})
         if forgotten:
             # Giữ WS sống để nút "Quét profile online" lấy lại được — không hiện dashboard.
@@ -1268,7 +1280,7 @@ class ExtensionPool:
         return session
 
     def resolve_callback(self, payload: dict) -> bool:
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             if session.resolve_callback(payload):
                 return True
         return False
@@ -1444,7 +1456,7 @@ class ExtensionPool:
     def reconcile_active_jobs(self, actual_by_profile: dict[str, int]) -> dict[str, dict[str, int]]:
         """Reset profile slot counters to match worker tasks actually running."""
         drift: dict[str, dict[str, int]] = {}
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             if session.profile_id.startswith("_"):
                 continue
             actual = max(0, int(actual_by_profile.get(session.profile_id, 0)))
@@ -1465,7 +1477,7 @@ class ExtensionPool:
         if not rid:
             return []
         pairs: list[tuple[ExtensionSession, str]] = []
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             for req_id in session.snapshot_trace_pending(rid):
                 pairs.append((session, req_id))
         return pairs
@@ -1493,7 +1505,7 @@ class ExtensionPool:
         return sent
 
     async def broadcast(self, payload: dict) -> None:
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             if session.profile_id.startswith("_"):
                 continue
             if session.connected:
@@ -1506,7 +1518,7 @@ class ExtensionPool:
         from flow2api.services.flow_profile_service import clear_all_access_tokens
 
         clear_all_access_tokens()
-        for session in self._sessions.values():
+        for session in self._sessions_snapshot():
             if session.profile_id.startswith("_"):
                 continue
             session.user_info = None

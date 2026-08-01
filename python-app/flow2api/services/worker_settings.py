@@ -226,6 +226,24 @@ def forget_profile(profile_id: str) -> WorkerSettings:
     )
 
 
+def purge_profile(profile_id: str) -> WorkerSettings:
+    """Xóa hẳn profile khỏi mọi danh sách worker (không soft-forget)."""
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        raise ValueError("invalid_profile_id")
+    current = get_worker_settings()
+    limits = dict(current.profile_limits)
+    limits.pop(pid, None)
+    return save_worker_settings(
+        profile_forgotten=[x for x in current.profile_forgotten if x != pid],
+        profile_limits=limits,
+        profile_dispatch_disabled=[x for x in current.profile_dispatch_disabled if x != pid],
+        profile_credit_allowed=[x for x in current.profile_credit_allowed if x != pid],
+        profile_image_allowed=[x for x in current.profile_image_allowed if x != pid],
+        profile_video_allowed=[x for x in current.profile_video_allowed if x != pid],
+    )
+
+
 def unforget_profile(profile_id: str) -> WorkerSettings:
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):

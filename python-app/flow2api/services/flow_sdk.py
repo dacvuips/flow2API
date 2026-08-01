@@ -1487,6 +1487,27 @@ def is_http_403_failure(
     return False
 
 
+def is_http_429_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """HTTP 429 / RESOURCE_EXHAUSTED / rate limit."""
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and int(raw.get("status") or 0) == 429:
+            return True
+    text = str(msg or "").strip().upper()
+    if "HTTP_429" in text or "STATUS: 429" in text:
+        return True
+    if "RESOURCE_EXHAUSTED" in text or "RATE LIMIT" in text or "TOO MANY REQUESTS" in text:
+        return True
+    for entry in api_trace or []:
+        if int(entry.get("http_status") or 0) == 429:
+            return True
+    return False
+
+
 def is_policy_rejection_failure(
     exc: Exception | None = None,
     msg: str = "",

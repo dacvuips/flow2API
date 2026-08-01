@@ -36,6 +36,7 @@ from flow2api.routes.captcha_broker import router as captcha_broker_router
 from flow2api.routes.chatgpt import router as chatgpt_router
 from flow2api.routes.chatgpt import v1_router as chatgpt_v1_router
 from flow2api.routes.chatgpt_broker import router as chatgpt_broker_router
+from flow2api.routes.flow_cdp import router as flow_cdp_router
 from flow2api.routes.requests import router as requests_router
 from flow2api.routes.settings import router as settings_router
 from flow2api.routes.system import router as system_router
@@ -241,6 +242,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(settings_router)
     app.include_router(worker_router)
+    app.include_router(flow_cdp_router)
     app.include_router(captcha_broker_router)
     app.include_router(chatgpt_broker_router)
     app.include_router(chatgpt_router)

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -603,6 +604,455 @@ def launch_all_playwright_slots(*, start_url: str = "https://chatgpt.com/") -> d
         "total": len(results),
         "results": results,
         "message": f"Đã mở {ok_n}/{len(results)} Chrome CDP slot.",
+    }
+
+
+def _flow_extension_dir() -> Path | None:
+    """Resolve unpacked Flow2API extension folder for --load-extension."""
+    env = str(os.environ.get("FLOW2API_EXTENSION") or "").strip()
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    candidates.extend(
+        [
+            _REPO_ROOT / "extension",
+            APP_ROOT / "extension",
+            APP_ROOT.parent / "extension",
+        ]
+    )
+    seen: set[str] = set()
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+        except Exception:
+            resolved = p
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if (resolved / "manifest.json").is_file():
+            return resolved
+    return None
+
+
+def _staged_flow_extension_dir() -> Path | None:
+    """
+    Copy extension into a short path without spaces when possible.
+    Repo path like '.../Flow 2/...' and user folders with spaces break Chrome CLI flags;
+    CDP Extensions.loadUnpacked tolerates spaces better but clean path is still safer.
+    """
+    src = _flow_extension_dir()
+    if not src:
+        return None
+    candidates = [
+        Path("C:/Flow2API/flow_cdp_extension"),
+        Path(os.environ.get("LOCALAPPDATA") or ".") / "Flow2API" / "flow_cdp_extension",
+        STORAGE_DIR / "flow_cdp_extension",
+    ]
+    last_err: Exception | None = None
+    for dest in candidates:
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src_manifest = src / "manifest.json"
+            dest_manifest = dest / "manifest.json"
+            need_copy = True
+            if dest_manifest.is_file() and src_manifest.is_file():
+                try:
+                    need_copy = src_manifest.stat().st_mtime > dest_manifest.stat().st_mtime
+                except Exception:
+                    need_copy = True
+            if need_copy:
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                shutil.copytree(src, dest)
+            if (dest / "manifest.json").is_file():
+                return dest.resolve()
+        except Exception as exc:
+            last_err = exc
+            continue
+    logger.warning("stage flow extension failed: %s — fallback source path", last_err)
+    try:
+        return src.resolve()
+    except Exception:
+        return src
+
+
+def _cdp_browser_ws_url(cdp_url: str) -> str | None:
+    url = (cdp_url or "").strip().rstrip("/")
+    if not url:
+        return None
+    try:
+        req = Request(url + "/json/version", method="GET")
+        with urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        ws = str((data or {}).get("webSocketDebuggerUrl") or "").strip()
+        return ws or None
+    except Exception:
+        return None
+
+
+def _cdp_load_unpacked_extension(cdp_url: str, ext_path: str | Path) -> dict[str, Any]:
+    """
+    Chrome 137+ blocks --load-extension on branded Chrome.
+    Load via CDP Extensions.loadUnpacked (needs --enable-unsafe-extension-debugging).
+    """
+    abs_path = str(Path(ext_path).resolve())
+    ws_url = _cdp_browser_ws_url(cdp_url)
+    if not ws_url:
+        return {"ok": False, "error": "cdp_ws_missing", "path": abs_path}
+
+    async def _run() -> dict[str, Any]:
+        import websockets
+
+        async with websockets.connect(ws_url, max_size=8 * 1024 * 1024) as ws:
+            msg_id = 0
+
+            async def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+                nonlocal msg_id
+                msg_id += 1
+                payload = {"id": msg_id, "method": method}
+                if params:
+                    payload["params"] = params
+                await ws.send(json.dumps(payload))
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                    data = json.loads(raw)
+                    if data.get("id") == msg_id:
+                        return data
+
+            # Skip if already loaded from this path
+            listed = await call("Extensions.getExtensions")
+            if "error" not in listed:
+                for item in (listed.get("result") or {}).get("extensions") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    existing = str(item.get("path") or "").replace("/", "\\").lower().rstrip("\\")
+                    want = abs_path.replace("/", "\\").lower().rstrip("\\")
+                    if existing == want or existing.endswith("flow_cdp_extension"):
+                        if item.get("enabled", True):
+                            return {
+                                "ok": True,
+                                "already": True,
+                                "id": item.get("id"),
+                                "path": abs_path,
+                            }
+
+            loaded = await call("Extensions.loadUnpacked", {"path": abs_path})
+            if loaded.get("error"):
+                err = loaded["error"]
+                return {
+                    "ok": False,
+                    "error": err.get("message") or err.get("code") or str(err),
+                    "path": abs_path,
+                }
+            ext_id = str((loaded.get("result") or {}).get("id") or "").strip()
+            return {"ok": True, "id": ext_id, "path": abs_path}
+
+    def _runner() -> dict[str, Any]:
+        return asyncio.run(_run())
+
+    try:
+        try:
+            asyncio.get_running_loop()
+            running = True
+        except RuntimeError:
+            running = False
+        if running:
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(_runner).result(timeout=45)
+        return _runner()
+    except Exception as exc:
+        logger.warning("CDP loadUnpacked failed: %s", exc)
+        return {"ok": False, "error": str(exc), "path": abs_path}
+
+
+def launch_flow_cdp_slot(slot_id: str, *, start_url: str | None = None) -> dict[str, Any]:
+    """Open Chrome CDP for one Flow pool slot (dedicated user-data under flow_cdp_slots/).
+
+    Extension chỉ gắn cho CDP Captcha Center. CDP Gen (bridge) chỉ cần cookie/token
+    qua Sync — không load extension.
+    """
+    from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
+
+    slot = get_flow_cdp_slot(slot_id)
+    if not slot:
+        return {"ok": False, "error": "slot_not_found", "message": f"Không tìm thấy Flow CDP {slot_id}"}
+
+    paths = _chrome_paths()
+    if not paths:
+        return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
+
+    user_data = Path(slot.user_data_dir())
+    user_data.mkdir(parents=True, exist_ok=True)
+    cdp_url = slot.cdp_url()
+    port = int(slot.port)
+    # Chỉ Captcha Center cần extension; Gen CDP sync cookie rồi gen Direct HTTP.
+    need_extension = (slot.role or "bridge") == "center"
+    ext_dir = _staged_flow_extension_dir() if need_extension else None
+
+    if cdp_endpoint_alive(cdp_url):
+        ext_load = None
+        if need_extension and ext_dir:
+            ext_load = _cdp_load_unpacked_extension(cdp_url, ext_dir)
+        already_msg = f"Flow CDP {slot.id} đã chạy tại {cdp_url}."
+        if need_extension:
+            if ext_load and ext_load.get("ok"):
+                already_msg += " Extension OK."
+            elif ext_load:
+                already_msg += f" Extension lỗi: {ext_load.get('error')}"
+        else:
+            already_msg += " (Gen — không gắn extension)."
+        return {
+            "ok": True,
+            "already_running": True,
+            "slot_id": slot.id,
+            "label": slot.label,
+            "role": slot.role,
+            "cdp_url": cdp_url,
+            "port": port,
+            "user_data_dir": str(user_data),
+            "extension_dir": str(ext_dir) if ext_dir else None,
+            "extension_loaded": bool(ext_load and ext_load.get("ok")),
+            "extension_skipped": not need_extension,
+            "extension_load": ext_load,
+            "message": already_msg,
+        }
+
+    flow_url = (start_url or "").strip()
+    if not flow_url:
+        flow_url = str(load_config().get("flow_url") or _FLOW_URL_DEFAULT).strip() or _FLOW_URL_DEFAULT
+
+    chrome = str(paths[0])
+    args = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data}",
+        "--profile-directory=Default",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--hide-crash-restore-bubble",
+        "--disable-session-crashed-bubble",
+    ]
+    if need_extension:
+        # Required for CDP Extensions.loadUnpacked (Chrome 137+)
+        args.append("--enable-unsafe-extension-debugging")
+        # Best-effort restore of --load-extension on Chrome 137–141
+        args.append("--disable-features=DisableLoadExtensionCommandLineSwitch")
+        if ext_dir:
+            # Fallback for older Chrome; primary path is CDP loadUnpacked after start.
+            args.append(f"--load-extension={ext_dir}")
+    args.append(flow_url)
+
+    try:
+        subprocess.Popen(
+            args,
+            cwd=str(user_data),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "chrome_launch_failed",
+            "slot_id": slot.id,
+            "message": str(exc),
+        }
+
+    for _ in range(24):
+        time.sleep(0.25)
+        if cdp_endpoint_alive(cdp_url):
+            break
+
+    alive = cdp_endpoint_alive(cdp_url)
+    ext_load = None
+    if alive and need_extension and ext_dir:
+        # Give Chrome a moment to finish boot before Extensions domain is ready
+        time.sleep(0.6)
+        ext_load = _cdp_load_unpacked_extension(cdp_url, ext_dir)
+        if not ext_load.get("ok"):
+            # One retry — domain sometimes not ready yet
+            time.sleep(1.0)
+            ext_load = _cdp_load_unpacked_extension(cdp_url, ext_dir)
+
+    role_hint = "Captcha Center" if need_extension else "Gen"
+    if need_extension:
+        if alive and ext_load and ext_load.get("ok"):
+            ext_msg = " Extension đã cài (CDP). Mở popup chọn mode Captcha Center."
+        elif alive and ext_dir and ext_load and not ext_load.get("ok"):
+            ext_msg = (
+                f" Extension chưa load được: {ext_load.get('error')}. "
+                "Thử đóng CDP rồi Mở lại, hoặc Load unpacked thủ công từ storage/flow_cdp_extension."
+            )
+        elif alive and not ext_dir:
+            ext_msg = " (Không tìm thấy thư mục extension — set FLOW2API_EXTENSION)."
+        else:
+            ext_msg = ""
+    else:
+        ext_msg = " Sync cookie/token để gen Direct HTTP (không cần extension)." if alive else ""
+    return {
+        "ok": alive,
+        "slot_id": slot.id,
+        "label": slot.label,
+        "role": slot.role,
+        "cdp_url": cdp_url,
+        "port": port,
+        "user_data_dir": str(user_data),
+        "extension_dir": str(ext_dir) if ext_dir else None,
+        "extension_loaded": bool(alive and ext_load and ext_load.get("ok")),
+        "extension_skipped": not need_extension,
+        "extension_load": ext_load,
+        "message": (
+            f"Đã mở {role_hint} CDP {slot.id} · {cdp_url}. Đăng nhập Google trong cửa sổ này (một lần).{ext_msg}"
+            if alive
+            else f"Đã gọi mở {slot.id} nhưng CDP {cdp_url} chưa sẵn sàng."
+        ),
+        "error": None if alive else "cdp_not_ready",
+    }
+
+
+def launch_all_flow_cdp_slots(*, start_url: str | None = None) -> dict[str, Any]:
+    from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
+
+    results = []
+    for slot in list_flow_cdp_slots():
+        results.append(launch_flow_cdp_slot(slot.id, start_url=start_url))
+    ok_n = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": ok_n > 0 or not results,
+        "launched": ok_n,
+        "total": len(results),
+        "results": results,
+        "message": f"Đã mở {ok_n}/{len(results)} Flow CDP slot.",
+    }
+
+
+def _pids_listening_on_port(port: int) -> list[int]:
+    """Best-effort Windows: PIDs with TCP listen on port."""
+    port = int(port)
+    pids: set[int] = set()
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        for line in (proc.stdout or "").splitlines():
+            if f":{port}" not in line:
+                continue
+            low = line.lower()
+            if "listening" not in low and "listenting" not in low:
+                # also match ESTABLISHED for chrome child sometimes; prefer LISTENING
+                if "listen" not in low:
+                    continue
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                pid = int(parts[-1])
+            except ValueError:
+                continue
+            if pid > 0:
+                pids.add(pid)
+    except Exception as exc:
+        logger.debug("netstat port lookup failed: %s", exc)
+    return sorted(pids)
+
+
+def close_flow_cdp_slot(slot_id: str) -> dict[str, Any]:
+    """Close Chrome for one Flow CDP slot (by debugging port), not all Chrome."""
+    from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
+
+    slot = get_flow_cdp_slot(slot_id)
+    if not slot:
+        return {"ok": False, "error": "slot_not_found", "message": f"Không tìm thấy slot {slot_id}"}
+
+    cdp_url = slot.cdp_url()
+    port = int(slot.port)
+    if not cdp_endpoint_alive(cdp_url):
+        return {
+            "ok": True,
+            "already_closed": True,
+            "slot_id": slot.id,
+            "port": port,
+            "message": f"CDP {slot.id} đã tắt.",
+        }
+
+    # Prefer graceful Browser.close via CDP websocket
+    closed_via_cdp = False
+    try:
+        ws_url = _cdp_browser_ws_url(cdp_url)
+        if ws_url:
+
+            async def _browser_close() -> None:
+                import websockets
+
+                async with websockets.connect(ws_url, max_size=1024 * 1024) as ws:
+                    await ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=3.0)
+                    except Exception:
+                        pass
+
+            def _runner() -> None:
+                asyncio.run(_browser_close())
+
+            try:
+                asyncio.get_running_loop()
+                running = True
+            except RuntimeError:
+                running = False
+            if running:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(_runner).result(timeout=10)
+            else:
+                _runner()
+            closed_via_cdp = True
+    except Exception as exc:
+        logger.debug("Browser.close via CDP failed slot=%s: %s", slot.id, exc)
+
+    for _ in range(12):
+        time.sleep(0.25)
+        if not cdp_endpoint_alive(cdp_url):
+            return {
+                "ok": True,
+                "slot_id": slot.id,
+                "port": port,
+                "via": "cdp" if closed_via_cdp else "gone",
+                "message": f"Đã đóng CDP {slot.id}.",
+            }
+
+    # Fallback: kill listener PID on port
+    killed: list[int] = []
+    for pid in _pids_listening_on_port(port):
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid), "/T"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            killed.append(pid)
+        except Exception:
+            pass
+
+    time.sleep(0.5)
+    alive = cdp_endpoint_alive(cdp_url)
+    return {
+        "ok": not alive,
+        "slot_id": slot.id,
+        "port": port,
+        "killed_pids": killed,
+        "via": "taskkill" if killed else ("cdp" if closed_via_cdp else "unknown"),
+        "message": (
+            f"Đã đóng CDP {slot.id}."
+            if not alive
+            else f"Không đóng được CDP {slot.id} (port {port} vẫn sống)."
+        ),
+        "error": None if not alive else "close_failed",
     }
 
 

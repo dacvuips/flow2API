@@ -70,6 +70,11 @@ async def refresh_access_token_from_cookies(
     token = str(session_data.get("access_token") or "").strip()
     if not token:
         return {"ok": False, "error": "AUTH_SESSION_EMPTY", "keys": list(session_data.keys())}
+    logger.info(
+        "auth/session response keys=%s expires=%r",
+        list(session_data.keys()),
+        session_data.get("expires"),
+    )
 
     row = get_profile_row(pid)
     save_access_token(

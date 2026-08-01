@@ -699,6 +699,8 @@ def token_public_fields(
 
     captured_at = row.token_captured_at if row else None
 
+    # Active = hạn ya29 từ auth/session (thường ~55 phút). Không dùng cookies_expires_at:
+    # cookie Google thường sống hàng tháng → trước đây bị cap 24h nên UI luôn hiện ~24h.
     remaining = _remaining_seconds(expires_at, now) if has_token else None
 
     status = _token_status(
@@ -723,6 +725,9 @@ def token_public_fields(
 
     direct_ready = profile_direct_lane_ready(profile_id)
 
+    cookies_exp = getattr(row, "cookies_expires_at", None) if row else None
+    cookies_rem = _remaining_seconds(cookies_exp, now) if cookies_exp else None
+
     return {
 
         "access_token_expires_at": expires_at.isoformat() + "Z" if expires_at else None,
@@ -731,9 +736,15 @@ def token_public_fields(
 
         "token_remaining_seconds": remaining,
 
+        "token_remaining_seconds_real": remaining,
+
         "token_hours_left": hours_left,
 
         "token_status": status,
+
+        "cookies_expires_at": cookies_exp.isoformat() + "Z" if cookies_exp else None,
+
+        "cookies_remaining_seconds": cookies_rem,
 
         "stored_flow_key_present": has_token and (remaining or 0) > 0,
 

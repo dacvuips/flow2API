@@ -110,6 +110,8 @@ async def update_profile_limits(body: ProfileLimitsBulkBody, _=Depends(_auth_key
 
 @router.post("/nudge")
 async def nudge_worker(_=Depends(_auth_key_id)):
+    # Hydrate DB profiles trước nudge để đảm bảo offline gen profile có trong pool
+    get_extension_pool().hydrate_db_profiles()
     worker = get_worker()
     return await worker.nudge()
 
@@ -168,16 +170,44 @@ async def rediscover_captcha_centers(_=Depends(_auth_key_id)):
 
 @router.delete("/profiles/{profile_id}")
 async def delete_flow_profile(profile_id: str, _=Depends(_auth_key_id)):
-    """Xóa profile generate khỏi dashboard (ẩn đến khi Quét profile online)."""
+    """Xóa hẳn profile (DB + settings). Nếu là CDP slot → xóa luôn slot + retire port."""
+    from flow2api.services.flow_cdp_control import delete_slot_fully
+    from flow2api.services.flow_cdp_settings import get_flow_cdp_slot, is_flow_cdp_slot_id
     from flow2api.services.health_cache import invalidate_health_cache
 
+    pid = str(profile_id or "").strip()
     pool = get_extension_pool()
+
+    # Profile gắn CDP → xóa đúng nghĩa cả slot (port retire, wipe disk)
+    cdp_slot = get_flow_cdp_slot(pid)
+    if not cdp_slot and is_flow_cdp_slot_id(pid):
+        from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
+
+        for s in list_flow_cdp_slots():
+            if s.profile_id() == pid:
+                cdp_slot = s
+                break
+    if cdp_slot:
+        result = await delete_slot_fully(cdp_slot.id)
+        if not result.get("ok"):
+            raise HTTPException(400, str(result.get("error") or "cdp_delete_failed"))
+        invalidate_health_cache()
+        return {
+            **result,
+            "profiles": pool.list_public(),
+            "message": result.get("message") or f"Đã xóa CDP {cdp_slot.id}",
+        }
+
     try:
-        result = await pool.remove_profile(profile_id)
+        result = await pool.remove_profile(pid)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     invalidate_health_cache()
-    return {**result, "profiles": pool.list_public()}
+    return {
+        **result,
+        "profiles": pool.list_public(),
+        "message": f"Đã xóa profile {pid[:12]}",
+    }
 
 
 @router.post("/profiles/rediscover")

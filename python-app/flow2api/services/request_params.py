@@ -28,7 +28,11 @@ def get_video_quality(params: dict[str, Any], default: str = "") -> str:
 
 
 def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
-    out = dict(params or {})
+    from flow2api.services.activity import sanitize_utf8
+
+    out = sanitize_utf8(dict(params or {}))
+    if not isinstance(out, dict):
+        out = {}
 
     has_video_quality = any(
         out.get(k) is not None and str(out.get(k) or "").strip()

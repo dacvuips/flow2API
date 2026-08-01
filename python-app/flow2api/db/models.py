@@ -75,6 +75,7 @@ class FlowProfile(Base):
     access_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     cookies_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     cookies_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cookies_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     paygate_tier: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -105,3 +106,5 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_enc TEXT"))
         if fp_cols and "cookies_captured_at" not in fp_cols:
             conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_captured_at DATETIME"))
+        if fp_cols and "cookies_expires_at" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_expires_at DATETIME"))
