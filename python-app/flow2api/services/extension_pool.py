@@ -1332,6 +1332,24 @@ class ExtensionPool:
             )
         )
 
+    def available_job_slots(
+        self,
+        *,
+        credit_required: bool = False,
+        request_type: str | None = None,
+    ) -> int:
+        """Tổng slot trống trên các profile đang nhận job (ready + dispatch)."""
+        from flow2api.services.worker_settings import get_profile_max_concurrent
+
+        total = 0
+        for session in self._sessions_with_capacity(
+            credit_required=credit_required,
+            request_type=request_type,
+        ):
+            limit = get_profile_max_concurrent(session.profile_id)
+            total += max(0, limit - session.active_jobs)
+        return total
+
     def pick_round_robin(
         self,
         *,
@@ -1358,7 +1376,6 @@ class ExtensionPool:
         )
         pick = ready[self._rr_index % len(ready)]
         self._rr_index = (self._rr_index + 1) % len(ready)
-        pick.assigned_total += 1
         return pick.profile_id
 
     def pick_profile_for_retry(
@@ -1415,10 +1432,30 @@ class ExtensionPool:
                 return pid
         return ids[(start + 1) % len(ids)]
 
-    def job_started(self, profile_id: str) -> None:
-        session = self._sessions.get(profile_id)
-        if session:
+    def try_reserve_job(self, profile_id: str) -> bool:
+        """Atomic slot reserve theo giới hạn từng profile. False nếu đã đầy."""
+        from flow2api.services.worker_settings import (
+            get_profile_max_concurrent,
+            is_profile_dispatch_enabled,
+        )
+
+        pid = str(profile_id or "").strip()
+        if not pid or not is_profile_dispatch_enabled(pid):
+            return False
+        with self._sessions_lock:
+            session = self._sessions.get(pid)
+            if not session or not session.is_ready():
+                return False
+            limit = get_profile_max_concurrent(pid)
+            if session.active_jobs >= limit:
+                return False
             session.active_jobs += 1
+            session.assigned_total += 1
+            return True
+
+    def job_started(self, profile_id: str) -> None:
+        """Giữ API cũ — ủy quyền sang try_reserve_job."""
+        self.try_reserve_job(profile_id)
 
     def job_finished(self, profile_id: str) -> None:
         session = self._sessions.get(profile_id)

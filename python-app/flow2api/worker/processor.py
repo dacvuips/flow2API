@@ -554,6 +554,9 @@ class WorkerController:
             else:
                 params.pop("profile_email", None)
         self._persist_params(rid, params)
+        # Reserve slot sau persist — tránh leak nếu ghi params lỗi; chặn race vượt limit
+        if not get_extension_pool().try_reserve_job(profile_id):
+            raise RuntimeError("no_extension_profile_online")
         return profile_id
 
     def _requeue_for_retry(
@@ -635,44 +638,44 @@ class WorkerController:
         self._prune_running()
         self._expire_stale_running()
         settings = get_worker_settings()
-        slots = settings.max_concurrent - len(self._running)
         started = 0
         pool = get_extension_pool()
-        if slots > 0 and pool.ready_count() == 0:
+        if pool.ready_count() == 0:
             # Hydrate DB profiles mỗi tick khi pool rỗng (bắt direct-lane offline gen)
             pool.hydrate_db_profiles()
             if pool.ready_count() == 0:
                 return 0
-        if slots > 0 and not pool.has_available_profile():
+        # Không dùng giới hạn Tổng global — capacity = tổng slot các profile đang nhận job
+        slots = pool.available_job_slots()
+        if slots <= 0 or not pool.has_available_profile():
             return 0
-        if slots > 0:
-            rows = activity.next_queued_batch(max(slots * 2, slots))
-            started_this_round = 0
-            for row in rows:
-                if started_this_round >= slots:
-                    break
-                if row.id in self._running:
-                    continue
-                row_params = normalize_request_params(json.loads(row.params_json or "{}"))
-                retry_not_before = float(row_params.get("retry_not_before") or 0)
-                if retry_not_before > time.time():
-                    continue
-                if not profile_available_for_queue(row_params, row.type):
-                    continue
-                stagger = settings.task_stagger_s
-                if stagger > 0 and self._last_start_monotonic > 0:
-                    wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
-                    if wait_s > 0:
-                        await asyncio.sleep(wait_s)
-                row_params.pop("retry_not_before", None)
-                row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
-                activity.update_request(row.id, status="running", params=row_params)
-                events.publish("request_started", {"id": row.id})
-                self._running_since[row.id] = time.monotonic()
-                self._running[row.id] = asyncio.create_task(self._run_job(row.id))
-                self._last_start_monotonic = time.monotonic()
-                started += 1
-                started_this_round += 1
+        rows = activity.next_queued_batch(max(slots * 2, slots))
+        started_this_round = 0
+        for row in rows:
+            if started_this_round >= slots:
+                break
+            if row.id in self._running:
+                continue
+            row_params = normalize_request_params(json.loads(row.params_json or "{}"))
+            retry_not_before = float(row_params.get("retry_not_before") or 0)
+            if retry_not_before > time.time():
+                continue
+            if not profile_available_for_queue(row_params, row.type):
+                continue
+            stagger = settings.task_stagger_s
+            if stagger > 0 and self._last_start_monotonic > 0:
+                wait_s = stagger - (time.monotonic() - self._last_start_monotonic)
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+            row_params.pop("retry_not_before", None)
+            row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
+            activity.update_request(row.id, status="running", params=row_params)
+            events.publish("request_started", {"id": row.id})
+            self._running_since[row.id] = time.monotonic()
+            self._running[row.id] = asyncio.create_task(self._run_job(row.id))
+            self._last_start_monotonic = time.monotonic()
+            started += 1
+            started_this_round += 1
         return started
 
     async def _run_job(self, rid: str) -> None:
@@ -694,7 +697,6 @@ class WorkerController:
                 self._requeue_no_profile(rid, params, reason=reason)
                 return
 
-            pool.job_started(profile_id)
             bind_task_profile(profile_id)
             client = get_flow_client()
             client.trace_request_id = rid
