@@ -1,12 +1,14 @@
 """Flow CDP slots API — parallel to extension Bridge / Captcha Center."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from flow2api.config import HTTP_HANDLER_TIMEOUT_S
 from flow2api.services import system_ops
 from flow2api.services.api_auth import auth_key_id
 from flow2api.services.flow_cdp_control import (
@@ -63,12 +65,15 @@ async def flow_cdp_slots_list(
     auto_attach: bool = True,
     _: int = Depends(auth_key_id),
 ):
-    # auto_attach = chỉ gắn email/profile, KHÔNG lấy cookies/token
+    # auto_attach chạy nền — tránh block list → Cloudflare 524
     if auto_attach:
-        try:
-            await auto_attach_emails(only_missing=True)
-        except Exception as exc:
-            logger.debug("auto_attach on list failed: %s", exc)
+        async def _bg_attach() -> None:
+            try:
+                await auto_attach_emails(only_missing=True)
+            except Exception as exc:
+                logger.debug("auto_attach on list failed: %s", exc)
+
+        asyncio.create_task(_bg_attach())
     return {
         "ok": True,
         "slots": _profiles_payload(),
@@ -201,8 +206,16 @@ async def flow_cdp_open_flow(slot_id: str, _: int = Depends(auth_key_id)):
 
 @router.post("/slots/{slot_id}/sync")
 async def flow_cdp_sync(slot_id: str, _: int = Depends(auth_key_id)):
+    # Cap dưới Cloudflare ~100s để trả JSON 503 thay vì CF 524 HTML
+    timeout = max(20.0, min(80.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 3))
     try:
-        result = await sync_session(slot_id)
+        result = await asyncio.wait_for(sync_session(slot_id), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            503,
+            "sync_timeout — CDP/Flow phản hồi chậm. Thử Sync qua http://127.0.0.1 "
+            "hoặc đợi Flow load xong rồi Sync lại.",
+        ) from None
     except RuntimeError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
