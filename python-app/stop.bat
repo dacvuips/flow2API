@@ -20,29 +20,42 @@ if not "%HTTP_PORT%"=="1993" call :kill_port 1993
 if not "%HTTP_PORT%"=="1994" call :kill_port 1994
 call :kill_port %WS_PORT%
 
-rem Dung python run.py cua thu muc nay
+rem Dung python run.py cua thu muc nay (timeout tranh treo WMI)
 powershell -NoProfile -Command ^
+  "$ErrorActionPreference='SilentlyContinue'; " ^
   "$root = (Resolve-Path '%CD%').Path; " ^
-  "$exclude = 0; [void][int]::TryParse($env:FLOW2API_STOP_EXCLUDE_PID, [ref]$exclude); " ^
-  "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" -ErrorAction SilentlyContinue | " ^
-  "Where-Object { $_.CommandLine -and $_.CommandLine -like '*run.py*' -and $_.CommandLine -like \"*$root*\" } | " ^
-  "ForEach-Object { Write-Host ('Dung python PID ' + $_.ProcessId + ' (run.py)'); " ^
-  "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+  "$job = Start-Job { param($r) " ^
+  "  Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | " ^
+  "  Where-Object { $_.CommandLine -and $_.CommandLine -like '*run.py*' -and $_.CommandLine -like \"*$r*\" } | " ^
+  "  ForEach-Object { $_.ProcessId } " ^
+  "} -ArgumentList $root; " ^
+  "if (Wait-Job $job -Timeout 8) { " ^
+  "  foreach ($procId in @(Receive-Job $job)) { " ^
+  "    if (-not $procId) { continue } " ^
+  "    Write-Host ('Dung python PID ' + $procId + ' (run.py)'); " ^
+  "    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue " ^
+  "  } " ^
+  "} else { Write-Host 'Bo qua quet python (timeout)'; Stop-Job $job } " ^
+  "Remove-Job $job -Force -ErrorAction SilentlyContinue"
 
-rem Dong cua so CMD agent cu: title Flow2API-Agent, hoac CommandLine run.bat (tru CMD hien tai)
+rem Chi dong CMD agent cu theo title Flow2API-Agent (KHONG match run.bat — tranh tu kill cua so dang mo)
+rem Bo qua title *STARTING* = cua so run.bat hien tai
 powershell -NoProfile -Command ^
-  "$root = (Resolve-Path '%CD%').Path; " ^
+  "$ErrorActionPreference='SilentlyContinue'; " ^
   "$exclude = 0; [void][int]::TryParse($env:FLOW2API_STOP_EXCLUDE_PID, [ref]$exclude); " ^
-  "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" -ErrorAction SilentlyContinue | " ^
-  "ForEach-Object { " ^
-  "  if ($exclude -gt 0 -and $_.ProcessId -eq $exclude) { return } " ^
-  "  $cmd = [string]$_.CommandLine; " ^
-  "  $title = ''; try { $title = [string](Get-Process -Id $_.ProcessId -ErrorAction Stop).MainWindowTitle } catch {} " ^
-  "  $byTitle = $title -like 'Flow2API-Agent*'; " ^
-  "  $byCmd = $cmd -and ($cmd -like '*run.bat*' -or $cmd -like '*run-prod.bat*') -and $cmd -notlike '*stop.bat*' -and ($cmd -like ('*{0}*' -f $root) -or $cmd -like '*\\python-app\\*' -or $cmd -like '*/python-app/*'); " ^
-  "  if (-not ($byTitle -or $byCmd)) { return } " ^
-  "  Write-Host ('Dong CMD PID ' + $_.ProcessId + ' (run)'); " ^
-  "  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue " ^
+  "$job = Start-Job { " ^
+  "  Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | ForEach-Object { $_.ProcessId } " ^
+  "}; " ^
+  "if (-not (Wait-Job $job -Timeout 8)) { Write-Host 'Bo qua quet CMD (timeout)'; Stop-Job $job; Remove-Job $job -Force; exit 0 }; " ^
+  "$ids = @(Receive-Job $job); Remove-Job $job -Force; " ^
+  "foreach ($procId in $ids) { " ^
+  "  if ($exclude -gt 0 -and $procId -eq $exclude) { continue } " ^
+  "  $title = ''; try { $title = [string](Get-Process -Id $procId -ErrorAction Stop).MainWindowTitle } catch { continue } " ^
+  "  if (-not $title) { continue } " ^
+  "  if ($title -notlike 'Flow2API-Agent*') { continue } " ^
+  "  if ($title -like '*STARTING*') { continue } " ^
+  "  Write-Host ('Dong CMD PID ' + $procId + ' (' + $title + ')'); " ^
+  "  Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue " ^
   "}"
 
 if "%KILLED%"=="0" (
