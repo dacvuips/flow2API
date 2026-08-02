@@ -23,6 +23,7 @@ from flow2api.services.flow_cdp_control import (
 from flow2api.services.flow_cdp_settings import (
     add_flow_cdp_slot,
     get_flow_cdp_settings,
+    get_flow_cdp_slot,
     update_flow_cdp_slot,
 )
 
@@ -62,6 +63,7 @@ async def flow_cdp_slots_list(
     auto_attach: bool = True,
     _: int = Depends(auth_key_id),
 ):
+    # auto_attach = chỉ gắn email/profile, KHÔNG lấy cookies/token
     if auto_attach:
         try:
             await auto_attach_emails(only_missing=True)
@@ -73,9 +75,9 @@ async def flow_cdp_slots_list(
         "settings": get_flow_cdp_settings().to_dict(),
         "profiles": _profiles_payload(),
         "hint": (
-            "Luồng CDP song song với Extension: Thêm CDP → Mở CDP → Login Flow. "
-            "Email tự gắn sau khi login (hoặc Sync session). "
-            "Sau sync, profile dùng Direct HTTP như Offline gen."
+            "Thêm CDP → Mở CDP → Login Google → tắt CDP. "
+            "Chỉ lưu email + profile (Chrome user-data). "
+            "Cookies/token lấy khi Sync session hoặc Auto generate."
         ),
     }
 
@@ -99,11 +101,21 @@ async def flow_cdp_slots_create(
         slot = add_flow_cdp_slot(label=body.label, port=body.port, role=body.role)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Tạo FlowProfile ngay — chưa lấy cookies; dùng sau khi login + automation
+    try:
+        from flow2api.services.flow_profile_service import ensure_profile_row
+
+        ensure_profile_row(slot.profile_id(), profile_label=slot.label or slot.id)
+    except Exception as exc:
+        logger.warning("ensure profile on add CDP failed slot=%s: %s", slot.id, exc)
     return {
         "ok": True,
         "slot": slot.to_dict(),
         "profiles": _profiles_payload(),
-        "message": f"Đã thêm Flow CDP {slot.id} (:{slot.port})",
+        "message": (
+            f"Đã thêm Flow CDP {slot.id} (:{slot.port}) · "
+            "Mở CDP → login → tắt CDP (không auto cookies)"
+        ),
     }
 
 
@@ -125,6 +137,18 @@ async def flow_cdp_slots_update(
         raise HTTPException(404, "slot_not_found") from None
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # Lưu tay email/@ vào FlowProfile (không sync cookies)
+    email = str(body.email or "").strip()
+    if not email and body.label and "@" in str(body.label):
+        email = str(body.label).strip()
+    if email and "@" in email:
+        try:
+            from flow2api.services.flow_cdp_control import _attach_email_to_slot
+
+            _attach_email_to_slot(slot.id, email, profile_id=slot.profile_id())
+            slot = get_flow_cdp_slot(slot_id) or slot
+        except Exception as exc:
+            logger.warning("attach email on slot update failed: %s", exc)
     return {"ok": True, "slot": slot.to_dict(), "profiles": _profiles_payload()}
 
 
@@ -281,6 +305,17 @@ async def flow_cdp_auto_run_one(slot_id: str, _: int = Depends(auth_key_id)):
     from flow2api.services.flow_cdp_auto import run_one_now
 
     result = await run_one_now(slot_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message") or result.get("error") or "run_failed")
+    return result
+
+
+@router.post("/auto/run-next")
+async def flow_cdp_auto_run_next(_: int = Depends(auth_key_id)):
+    """Chạy CDP Gen tiếp theo trên danh sách: mở CDP → Sync cookies → Nhận job."""
+    from flow2api.services.flow_cdp_auto import run_next_now
+
+    result = await run_next_now()
     if not result.get("ok"):
         raise HTTPException(400, result.get("message") or result.get("error") or "run_failed")
     return result

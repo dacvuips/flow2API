@@ -156,8 +156,9 @@ def auto_status() -> dict[str, Any]:
         "logs": list(_logs[-40:]),
         "scheduler_alive": bool(_scheduler_task and not _scheduler_task.done()),
         "hint": (
-            "Khi gen gặp HTTP 403/429 trên profile CDP → ngừng nhận job profile đó, "
-            "mở CDP kế tiếp (đang ngưng nhận job, phía dưới trong danh sách) để Sync + bật Nhận job."
+            "Nút «Chạy CDP tiếp theo»: lấy CDP Gen đầu tiên chưa nhận job trên danh sách "
+            "→ Sync cookies → bật Nhận job. "
+            "Khi lịch bật và gen gặp 403/429 → ngừng job profile lỗi → mở CDP Gen kế tiếp tương tự."
         ),
     }
 
@@ -187,6 +188,24 @@ def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
         # Đang ngưng nhận job (= standby) → đây là ứng viên mở Sync
         if s.get("standby") or not s.get("dispatch_enabled"):
             return s
+    return None
+
+
+def find_next_cdp_to_run() -> dict[str, Any] | None:
+    """CDP Gen tiếp theo trên danh sách cần chạy full cycle (chưa nhận job / chưa ready)."""
+    slots = ordered_auto_slots()
+    for s in slots:
+        if not s.get("enabled"):
+            continue
+        if (s.get("role") or "bridge") == "center":
+            continue
+        sid = str(s.get("id") or "").strip()
+        if not sid or sid in _running:
+            continue
+        # Đã nhận job rồi → bỏ qua, lấy cái kế tiếp
+        if s.get("accepting_jobs"):
+            continue
+        return s
     return None
 
 
@@ -697,3 +716,46 @@ async def run_one_now(slot_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "already_running", "message": f"{sid} đang chạy"}
     result = await run_auto_cycle_for_slot(sid)
     return {**result, "status": auto_status()}
+
+
+async def run_next_now() -> dict[str, Any]:
+    """Chạy full cycle cho CDP Gen tiếp theo trên danh sách (cookies → nhận job)."""
+    nxt = find_next_cdp_to_run()
+    if not nxt:
+        return {
+            "ok": False,
+            "error": "no_next_cdp",
+            "message": (
+                "Không còn CDP Gen chưa nhận job trong danh sách "
+                "(hoặc tất cả đang chạy / đã tắt)"
+            ),
+            "status": auto_status(),
+        }
+    sid = str(nxt.get("id") or "").strip()
+    email = str(nxt.get("email") or "").strip()
+    if sid in _running:
+        return {
+            "ok": False,
+            "error": "already_running",
+            "slot_id": sid,
+            "message": f"{sid} đang chạy",
+            "status": auto_status(),
+        }
+    _log(
+        "info",
+        f"Chạy CDP tiếp theo: {sid}" + (f" ({email})" if email else ""),
+        slot_id=sid,
+    )
+    result = await run_auto_cycle_for_slot(sid)
+    msg = result.get("message") or (
+        f"Đã chạy {sid}" + (f" · {email}" if email else "")
+        if result.get("ok")
+        else (result.get("error") or "run_failed")
+    )
+    return {
+        **result,
+        "slot_id": sid,
+        "email": email or result.get("email"),
+        "message": msg,
+        "status": auto_status(),
+    }

@@ -439,6 +439,56 @@ async def _fetch_email_from_token(token: str) -> str:
     return ""
 
 
+async def attach_email_only(slot_id: str) -> dict[str, Any]:
+    """Detect logged-in email and persist slot + FlowProfile metadata.
+
+    Does NOT save cookies/token to DB — that is only for Sync session / auto cycle.
+    Chrome user-data already keeps the Google login for later automation.
+    """
+    from flow2api.services.flow_profile_service import ensure_profile_row
+
+    async with _slot_lock(slot_id):
+        async for slot, _browser, context, page in _agen_page(slot_id):
+            try:
+                await page.goto(_FLOW_START, wait_until="domcontentloaded", timeout=60_000)
+            except Exception as exc:
+                logger.warning("goto flow failed slot=%s: %s", slot.id, exc)
+
+            cookies = await context.cookies()
+            useful = [
+                c
+                for c in cookies
+                if isinstance(c, dict)
+                and (
+                    "google" in str(c.get("domain") or "").lower()
+                    or "labs" in str(c.get("domain") or "").lower()
+                )
+            ]
+            if not useful:
+                useful = [c for c in cookies if isinstance(c, dict)]
+
+            email = await _detect_email(page) or _guess_email_from_cookies(useful)
+            pid = slot.profile_id()
+            ensure_profile_row(pid, profile_label=slot.label or slot.id, email=email or "")
+            if email:
+                _attach_email_to_slot(slot.id, email, profile_id=pid)
+
+            return {
+                "ok": True,
+                "slot_id": slot.id,
+                "profile_id": pid,
+                "email": email,
+                "cookies_saved": False,
+                "token_refreshed": False,
+                "message": (
+                    f"Đã lưu profile {slot.id}"
+                    + (f" · {email}" if email else " · chưa thấy email (login xong chờ rồi Refresh)")
+                    + " · chưa lấy cookies (dùng Sync / Auto khi generate)"
+                ),
+            }
+        return {"ok": False, "error": "attach_failed"}
+
+
 async def sync_session(slot_id: str) -> dict[str, Any]:
     """Export cookies from CDP → FlowProfile DB so Direct HTTP / offline gen can use them."""
     from flow2api.services.cookie_service import save_profile_cookies
@@ -528,7 +578,7 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
 
 
 async def auto_attach_emails(*, only_missing: bool = True, force: bool = False) -> dict[str, Any]:
-    """For live CDP slots, sync + attach logged-in email automatically."""
+    """For live CDP slots, attach logged-in email + profile only (no cookie/token sync)."""
     attached: list[dict[str, Any]] = []
     skipped: list[str] = []
     errors: list[dict[str, Any]] = []
@@ -546,7 +596,7 @@ async def auto_attach_emails(*, only_missing: bool = True, force: bool = False) 
             continue
         _AUTO_ATTACH_TS[slot.id] = now
         try:
-            result = await sync_session(slot.id)
+            result = await attach_email_only(slot.id)
             attached.append(
                 {
                     "slot_id": slot.id,
@@ -568,7 +618,7 @@ async def auto_attach_emails(*, only_missing: bool = True, force: bool = False) 
 
 
 async def schedule_auto_attach(slot_id: str, *, attempts: int = 4, delay_s: float = 8.0) -> None:
-    """Background: retry sync/email attach after user finishes Google login."""
+    """Background: retry email/profile attach after login — never auto-sync cookies."""
     sid = str(slot_id or "").strip()
     if not sid:
         return
@@ -584,7 +634,7 @@ async def schedule_auto_attach(slot_id: str, *, attempts: int = 4, delay_s: floa
             if not system_ops.cdp_endpoint_alive(slot.cdp_url()):
                 continue
             try:
-                result = await sync_session(sid)
+                result = await attach_email_only(sid)
                 if str(result.get("email") or "").strip():
                     logger.info(
                         "auto-attached email for CDP %s: %s", sid, result.get("email")
