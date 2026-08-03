@@ -17,6 +17,8 @@ AUTH_SESSION_URL = "https://labs.google/fx/api/auth/session"
 # Coalesce concurrent refreshes per profile (tránh spam auth/session khi nhiều job cùng lúc)
 _inflight: dict[str, asyncio.Task] = {}
 _claim_locks: dict[str, asyncio.Lock] = {}
+_last_ok_log_at: dict[str, float] = {}
+_OK_LOG_INTERVAL_S = 120.0
 
 
 def _claim_lock(pid: str) -> asyncio.Lock:
@@ -25,6 +27,27 @@ def _claim_lock(pid: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _claim_locks[pid] = lock
     return lock
+
+
+def _log_refresh_ok(pid: str, expires: Any) -> None:
+    import time
+
+    now = time.time()
+    last = _last_ok_log_at.get(pid, 0.0)
+    if now - last >= _OK_LOG_INTERVAL_S:
+        _last_ok_log_at[pid] = now
+        logger.info("cookie token refresh ok profile=%s", pid[:12])
+        logger.info(
+            "auth/session response keys refreshed profile=%s expires=%r",
+            pid[:12],
+            expires,
+        )
+    else:
+        logger.debug(
+            "cookie token refresh ok profile=%s expires=%r (quiet)",
+            pid[:12],
+            expires,
+        )
 
 
 async def refresh_access_token_from_cookies(
@@ -109,11 +132,6 @@ async def _refresh_access_token_from_cookies_impl(
     token = str(session_data.get("access_token") or "").strip()
     if not token:
         return {"ok": False, "error": "AUTH_SESSION_EMPTY", "keys": list(session_data.keys())}
-    logger.info(
-        "auth/session response keys=%s expires=%r",
-        list(session_data.keys()),
-        session_data.get("expires"),
-    )
 
     row = get_profile_row(pid)
     save_access_token(
@@ -124,7 +142,7 @@ async def _refresh_access_token_from_cookies_impl(
         paygate_tier=str(row.paygate_tier) if row and row.paygate_tier else None,
         expires_at=session_data.get("expires"),
     )
-    logger.info("cookie token refresh ok profile=%s", pid[:12])
+    _log_refresh_ok(pid, session_data.get("expires"))
     return {
         "ok": True,
         "method": "cookie_auth_session",

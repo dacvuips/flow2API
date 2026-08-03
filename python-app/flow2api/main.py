@@ -195,6 +195,20 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:
         logger.warning("captcha-center broker init failed: %s", exc)
+
+    # CDP Chrome (Gen/Captcha/ChatGPT) đã detach khỏi process tree —
+    # nếu vẫn mở sau stop/run thì gắn lại (không mở Chrome mới).
+    async def _reconnect_cdps_later() -> None:
+        await asyncio.sleep(1.5)  # chờ WS 1609 sẵn sàng → extension reconnect
+        try:
+            from flow2api.services.cdp_startup import reconnect_open_cdps
+
+            await reconnect_open_cdps()
+        except Exception as exc:
+            logger.warning("startup CDP reconnect failed: %s", exc)
+
+    asyncio.create_task(_reconnect_cdps_later())
+
     logger.info(
         "flow2api agent started (http:%s + ws:1609 + worker + nudge %ss)",
         HTTP_PORT,

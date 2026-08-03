@@ -47,6 +47,7 @@ class ChatgptSettingsBody(BaseModel):
     chrome_user_data_dir: str | None = None
     use_system_chrome_profile: bool | None = None
     headless: bool | None = None
+    small_window: bool | None = None
 
 
 @router.get("/config")
@@ -98,6 +99,8 @@ async def save_chatgpt_settings(body: ChatgptSettingsBody, _: int = Depends(auth
         patch["use_system_chrome_profile"] = bool(body.use_system_chrome_profile)
     if body.headless is not None:
         patch["headless"] = bool(body.headless)
+    if body.small_window is not None:
+        patch["small_window"] = bool(body.small_window)
     if not patch:
         return {"ok": True, "chatgpt": current}
     # drop runtime-only list before save

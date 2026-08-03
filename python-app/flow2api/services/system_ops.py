@@ -19,6 +19,31 @@ from flow2api.config import APP_ROOT, STORAGE_DIR
 
 logger = logging.getLogger(__name__)
 
+
+def _popen_detached(args: list[str], *, cwd: str | Path | None = None) -> subprocess.Popen:
+    """
+    Launch outside Python process tree / job object.
+
+    stop.bat + run.bat dùng ``taskkill /T`` — nếu Chrome CDP là con của python.exe
+    thì bị tắt theo khi stop/run. Detach để CDP ChatGPT / Flow sống sót.
+    """
+    flags = 0
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    if os.name == "nt":
+        # DETACHED | NEW_PROCESS_GROUP | BREAKAWAY_FROM_JOB
+        flags = 0x00000008 | 0x00000200 | 0x01000000
+        kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(args, **kwargs)
+
 _CONFIG_PATH = STORAGE_DIR / "system_config.json"
 _SCRIPTS_DIR = APP_ROOT / "scripts"
 _REPO_ROOT = APP_ROOT.parent
@@ -51,6 +76,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chrome_user_data_dir": "",
         "use_system_chrome_profile": False,
         "headless": False,
+        # CDP ChatGPT: mở cửa sổ nhỏ (420x720) thay vì full màn hình
+        "small_window": True,
     },
     "proxy_pool": [],
     "proxy_pool_enabled": False,
@@ -171,8 +198,25 @@ def chatgpt_config() -> dict[str, Any]:
         "chrome_user_data_dir": str(cgpt.get("chrome_user_data_dir") or "").strip(),
         "use_system_chrome_profile": bool(cgpt.get("use_system_chrome_profile")),
         "headless": bool(cgpt.get("headless")),
+        "small_window": bool(cgpt.get("small_window", True)),
         "chrome_profiles": list_chrome_profiles(),
     }
+
+
+def _chatgpt_chrome_window_args(*, slot_index: int = 0) -> list[str]:
+    """Chrome flags for ChatGPT CDP window size / headless."""
+    cgpt = chatgpt_config()
+    if bool(cgpt.get("headless")):
+        return ["--headless=new", "--window-size=1280,720", "--disable-gpu"]
+    if bool(cgpt.get("small_window", True)):
+        idx = max(0, int(slot_index or 0))
+        x = 40 + (idx % 6) * 36
+        y = 40 + (idx % 6) * 36
+        return [
+            "--window-size=420,720",
+            f"--window-position={x},{y}",
+        ]
+    return []
 
 
 def public_chatgpt_config() -> dict[str, Any]:
@@ -369,11 +413,7 @@ def launch_all_profiles() -> dict[str, Any]:
     if not _chrome_paths():
         return {"ok": False, "error": "chrome_not_found", "message": "Không tìm thấy chrome.exe"}
     bat = ensure_launch_script(profiles)
-    subprocess.Popen(
-        ["cmd", "/c", str(bat)],
-        cwd=str(_SCRIPTS_DIR),
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    _popen_detached(["cmd", "/c", str(bat)], cwd=_SCRIPTS_DIR)
     msg = f"Đã kích hoạt {len(profiles)} Chrome profile → Flow"
     if skipped:
         msg += f" (bỏ qua {len(skipped)} profile đã tắt nhận job)"
@@ -453,14 +493,11 @@ def launch_chrome_for_playwright(
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--disable-session-crashed-bubble",
+        *_chatgpt_chrome_window_args(slot_index=0),
         start_url or "https://chatgpt.com/",
     ]
     try:
-        subprocess.Popen(
-            args,
-            cwd=str(user_data),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        _popen_detached(args, cwd=user_data)
     except Exception as exc:
         return {
             "ok": False,
@@ -543,6 +580,14 @@ def launch_playwright_slot(
             "message": f"Slot {slot.id} CDP đã chạy tại {cdp_url}.",
         }
 
+    from flow2api.services.chatgpt_pool_settings import list_playwright_slots
+
+    slot_index = 0
+    for i, s in enumerate(list_playwright_slots()):
+        if s.id == slot.id:
+            slot_index = i
+            break
+
     chrome = str(paths[0])
     args = [
         chrome,
@@ -553,14 +598,11 @@ def launch_playwright_slot(
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--disable-session-crashed-bubble",
+        *_chatgpt_chrome_window_args(slot_index=slot_index),
         start_url or "https://chatgpt.com/",
     ]
     try:
-        subprocess.Popen(
-            args,
-            cwd=str(user_data),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        _popen_detached(args, cwd=user_data)
     except Exception as exc:
         return {
             "ok": False,
@@ -846,11 +888,7 @@ def launch_flow_cdp_slot(slot_id: str, *, start_url: str | None = None) -> dict[
     args.append(flow_url)
 
     try:
-        subprocess.Popen(
-            args,
-            cwd=str(user_data),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        _popen_detached(args, cwd=user_data)
     except Exception as exc:
         return {
             "ok": False,

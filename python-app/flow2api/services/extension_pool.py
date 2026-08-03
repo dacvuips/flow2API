@@ -237,22 +237,30 @@ class ExtensionSession:
                 extension_online=self.connected,
             )
             rem = meta.get("token_remaining_seconds")
-            needs_refresh = (
-                not token
-                or offline
-                or (rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S)
+            # Cookies/token đã trong DB → dùng luôn nếu còn hạn.
+            # Chỉ gọi auth/session khi thiếu token hoặc sắp hết (kể cả offline).
+            needs_refresh = not token or (
+                rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
             )
             if needs_refresh:
                 result = await self.refresh_flow_token(force=True)
-                if not result.get("ok") and offline:
+                if result.get("ok"):
+                    token = get_stored_access_token(self.profile_id)
+                elif not token:
+                    token = get_stored_access_token(self.profile_id)
+                if not result.get("ok") and offline and not token:
                     err = str(result.get("error") or "TOKEN_REFRESH_FAILED")
                     raise RuntimeError(
                         "offline_auth_expired: Cookies/token trong DB không còn hợp lệ — "
                         "mở Chrome profile, bấm Get Connection Status để sync lại, rồi thử gen."
                         f" ({err})"
                     )
-                if result.get("ok"):
-                    token = get_stored_access_token(self.profile_id)
+                # Refresh fail nhưng còn token → tiếp tục gen với token cũ
+                if not result.get("ok") and token:
+                    logger.warning(
+                        "auth header refresh failed profile=%s — dùng token DB cũ",
+                        self.profile_id[:12],
+                    )
         if not token:
             if offline:
                 raise RuntimeError(
@@ -866,7 +874,10 @@ class ExtensionSession:
 
     async def ensure_token_fresh(self) -> bool:
         from flow2api.config import FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
-        from flow2api.services.flow_profile_service import token_public_fields
+        from flow2api.services.flow_profile_service import (
+            get_stored_access_token,
+            token_public_fields,
+        )
 
         meta = token_public_fields(
             self.profile_id,
@@ -874,15 +885,27 @@ class ExtensionSession:
             extension_online=self.connected,
         )
         rem = meta.get("token_remaining_seconds")
-        if (
-            self.flow_key
-            and self.connected
-            and rem is not None
-            and rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
-        ):
+        token = self.flow_key or get_stored_access_token(self.profile_id)
+        # Offline sau Sync: token DB còn hạn → dùng luôn, không refresh liên tục
+        if token and (rem is None or rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S):
+            if not self.flow_key:
+                self._browser_flow_key = token
             return True
         result = await self.refresh_flow_token(force=True)
-        return bool(result.get("ok") and self.flow_key)
+        if result.get("ok") and self.flow_key:
+            return True
+        # Refresh fail (cookies chết) nhưng còn token DB → vẫn thử gen (tránh fail hàng loạt)
+        token = token or get_stored_access_token(self.profile_id)
+        if token:
+            if not self.flow_key:
+                self._browser_flow_key = token
+            logger.warning(
+                "token refresh failed profile=%s — dùng token DB cũ (rem=%s)",
+                self.profile_id[:12],
+                rem,
+            )
+            return True
+        return False
 
     def to_public_dict(self) -> dict[str, Any]:
         from flow2api.services.worker_settings import (

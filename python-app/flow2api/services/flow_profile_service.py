@@ -308,7 +308,7 @@ def save_access_token(
 
         db.commit()
 
-    logger.info(
+    logger.debug(
 
         "flow token saved profile=%s expires=%s",
 

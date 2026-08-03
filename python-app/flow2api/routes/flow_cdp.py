@@ -65,7 +65,7 @@ async def flow_cdp_slots_list(
     auto_attach: bool = True,
     _: int = Depends(auth_key_id),
 ):
-    # auto_attach chạy nền — tránh block list → Cloudflare 524
+    # auto_attach chạy nền — tránh block list → Cloudflare 502/524
     if auto_attach:
         async def _bg_attach() -> None:
             try:
@@ -74,11 +74,42 @@ async def flow_cdp_slots_list(
                 logger.debug("auto_attach on list failed: %s", exc)
 
         asyncio.create_task(_bg_attach())
+
+    # Probe CDP song song trên thread — cap thời gian để không bị gateway 502
+    probe_timeout = max(4.0, min(18.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 0.7))
+    try:
+        profiles = await asyncio.wait_for(
+            asyncio.to_thread(flow_cdp_public_status),
+            timeout=probe_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("flow-cdp slots list probe timeout (%.0fs) — trả danh sách không probe", probe_timeout)
+        from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
+
+        profiles = []
+        for s in list_flow_cdp_slots():
+            d = s.to_dict()
+            d.update(
+                {
+                    "profile_id": s.id,
+                    "display_name": s.email or s.label or s.id,
+                    "email": s.email or "",
+                    "online": False,
+                    "cdp_alive": False,
+                    "ready": bool(s.email),
+                    "probe_skipped": True,
+                }
+            )
+            profiles.append(d)
+    except Exception as exc:
+        logger.warning("flow-cdp slots list failed: %s", exc)
+        raise HTTPException(503, f"flow_cdp_list_failed: {exc}") from exc
+
     return {
         "ok": True,
-        "slots": _profiles_payload(),
+        "slots": profiles,
         "settings": get_flow_cdp_settings().to_dict(),
-        "profiles": _profiles_payload(),
+        "profiles": profiles,
         "hint": (
             "Thêm CDP → Mở CDP → Login Google → tắt CDP. "
             "Chỉ lưu email + profile (Chrome user-data). "
@@ -201,8 +232,18 @@ async def flow_cdp_slots_launch_all(_: int = Depends(auth_key_id)):
 
 @router.post("/slots/{slot_id}/open-flow")
 async def flow_cdp_open_flow(slot_id: str, _: int = Depends(auth_key_id)):
+    # Cap dưới Cloudflare ~100s — trả JSON 503 thay vì CF 524 HTML
+    timeout = max(15.0, min(70.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 2.5))
     try:
-        result = await open_flow_login(slot_id)
+        result = await asyncio.wait_for(open_flow_login(slot_id), timeout=timeout)
+    except asyncio.TimeoutError:
+        # Navigation có thể đã chạy trên Chrome — hướng dẫn user kiểm tra cửa sổ CDP
+        raise HTTPException(
+            503,
+            "open_flow_timeout — server chậm / Cloudflare. Kiểm tra cửa sổ CDP: "
+            "nếu đã vào Flow thì bỏ qua; không thì bấm Login Flow lại "
+            "(hoặc dùng http://127.0.0.1 trực tiếp).",
+        ) from None
     except RuntimeError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:

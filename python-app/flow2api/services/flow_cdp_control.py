@@ -23,7 +23,15 @@ _FLOW_START = "https://labs.google/fx/tools/flow"
 _LOCKS: dict[str, asyncio.Lock] = {}
 _AUTO_ATTACH_TS: dict[str, float] = {}
 _AUTO_ATTACH_COOLDOWN_S = 40.0
+_AUTO_ATTACH_LOCK = asyncio.Lock()
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+
+def _is_cdp_unreachable_error(exc: BaseException | str) -> bool:
+    text = str(exc or "").lower()
+    return "cdp_unreachable" in text or (
+        "cdp" in text and ("chưa chạy" in text or "chua chay" in text)
+    )
 
 
 def _slot_lock(slot_id: str) -> asyncio.Lock:
@@ -152,7 +160,7 @@ async def _agen_page(slot_id: str):
 
 
 async def open_flow_login(slot_id: str) -> dict[str, Any]:
-    """Navigate slot Chrome to Flow login page."""
+    """Navigate slot Chrome to Flow login page (nhanh — tránh Cloudflare 524)."""
     async with _slot_lock(slot_id):
         async for slot, _browser, _context, page in _agen_page(slot_id):
             url = _FLOW_START
@@ -161,12 +169,38 @@ async def open_flow_login(slot_id: str) -> dict[str, Any]:
                 url = str(cfg.get("flow_url") or _FLOW_START).strip() or _FLOW_START
             except Exception:
                 pass
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            nav_err = ""
+            try:
+                # commit: navigation đã bắt đầu — không chờ DOM đầy đủ (SSO/Flow hay chậm)
+                await page.goto(url, wait_until="commit", timeout=25_000)
+            except Exception as exc:
+                nav_err = str(exc or "")[:160]
+                # Trang có thể đã về Flow / đang load — vẫn coi là OK nếu URL hợp lý
+                try:
+                    cur = str(page.url or "")
+                except Exception:
+                    cur = ""
+                if not (
+                    "labs.google" in cur
+                    or "flow" in cur.lower()
+                    or "accounts.google" in cur
+                ):
+                    raise RuntimeError(
+                        f"open_flow_nav_failed — không mở được Flow trên CDP {slot.id}. "
+                        f"Thử lại khi cửa sổ Chrome sẵn sàng. ({nav_err})"
+                    ) from exc
+            try:
+                final_url = str(page.url or url)
+            except Exception:
+                final_url = url
+            msg = f"Đã mở Flow trên CDP {slot.id}. Đăng nhập Google trong cửa sổ này."
+            if nav_err:
+                msg += " (trang đang load — kiểm tra cửa sổ CDP)"
             return {
                 "ok": True,
                 "slot_id": slot.id,
-                "url": page.url,
-                "message": f"Đã mở Flow trên CDP {slot.id}. Đăng nhập Google trong cửa sổ này.",
+                "url": final_url,
+                "message": msg,
             }
         return {"ok": False, "error": "attach_failed"}
 
@@ -722,32 +756,40 @@ async def auto_attach_emails(*, only_missing: bool = True, force: bool = False) 
     attached: list[dict[str, Any]] = []
     skipped: list[str] = []
     errors: list[dict[str, Any]] = []
-    now = time.time()
-    for slot in list_flow_cdp_slots():
-        if not system_ops.cdp_endpoint_alive(slot.cdp_url()):
-            skipped.append(slot.id)
-            continue
-        if only_missing and str(slot.email or "").strip() and not force:
-            skipped.append(slot.id)
-            continue
-        last = _AUTO_ATTACH_TS.get(slot.id, 0.0)
-        if not force and (now - last) < _AUTO_ATTACH_COOLDOWN_S:
-            skipped.append(slot.id)
-            continue
-        _AUTO_ATTACH_TS[slot.id] = now
-        try:
-            result = await attach_email_only(slot.id)
-            attached.append(
-                {
-                    "slot_id": slot.id,
-                    "email": result.get("email") or "",
-                    "ok": bool(result.get("ok")),
-                    "message": result.get("message"),
-                }
-            )
-        except Exception as exc:
-            logger.warning("auto_attach email failed slot=%s: %s", slot.id, exc)
-            errors.append({"slot_id": slot.id, "error": str(exc)})
+    async with _AUTO_ATTACH_LOCK:
+        now = time.time()
+        for slot in list_flow_cdp_slots():
+            if not system_ops.cdp_endpoint_alive(slot.cdp_url()):
+                skipped.append(slot.id)
+                continue
+            if only_missing and str(slot.email or "").strip() and not force:
+                skipped.append(slot.id)
+                continue
+            last = _AUTO_ATTACH_TS.get(slot.id, 0.0)
+            if not force and (now - last) < _AUTO_ATTACH_COOLDOWN_S:
+                skipped.append(slot.id)
+                continue
+            _AUTO_ATTACH_TS[slot.id] = now
+            try:
+                result = await attach_email_only(slot.id)
+                attached.append(
+                    {
+                        "slot_id": slot.id,
+                        "email": result.get("email") or "",
+                        "ok": bool(result.get("ok")),
+                        "message": result.get("message"),
+                    }
+                )
+            except Exception as exc:
+                if _is_cdp_unreachable_error(exc):
+                    # CDP tắt giữa lúc probe/attach — bình thường, không spam WARNING
+                    logger.debug(
+                        "auto_attach skip slot=%s (CDP tắt): %s", slot.id, exc
+                    )
+                    skipped.append(slot.id)
+                else:
+                    logger.warning("auto_attach email failed slot=%s: %s", slot.id, exc)
+                    errors.append({"slot_id": slot.id, "error": str(exc)})
     return {
         "ok": True,
         "attached": attached,
@@ -772,7 +814,9 @@ async def schedule_auto_attach(slot_id: str, *, attempts: int = 4, delay_s: floa
             if str(slot.email or "").strip():
                 return
             if not system_ops.cdp_endpoint_alive(slot.cdp_url()):
-                continue
+                # CDP đã tắt (user đóng cửa sổ) — dừng hẳn, không retry spam
+                logger.debug("schedule_auto_attach stop slot=%s — CDP tắt", sid)
+                return
             try:
                 result = await attach_email_only(sid)
                 if str(result.get("email") or "").strip():
@@ -781,6 +825,11 @@ async def schedule_auto_attach(slot_id: str, *, attempts: int = 4, delay_s: floa
                     )
                     return
             except Exception as exc:
+                if _is_cdp_unreachable_error(exc):
+                    logger.debug(
+                        "schedule_auto_attach stop slot=%s — CDP tắt: %s", sid, exc
+                    )
+                    return
                 logger.debug(
                     "schedule_auto_attach attempt %s slot=%s: %s", i + 1, sid, exc
                 )
