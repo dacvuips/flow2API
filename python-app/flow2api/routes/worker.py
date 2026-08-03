@@ -252,6 +252,14 @@ async def update_profile_dispatch(
         saved = set_profile_dispatch_enabled(profile_id, body.enabled)
     except ValueError as exc:
         raise HTTPException(400, "invalid_profile_id") from exc
+    requeued = 0
+    if not body.enabled:
+        try:
+            requeued = get_worker().requeue_running_on_profile(
+                profile_id, reason="manual_dispatch_off"
+            )
+        except Exception:
+            requeued = 0
     from flow2api.services import system_ops
 
     await system_ops.push_dispatch_to_profile(profile_id, body.enabled)
@@ -271,6 +279,7 @@ async def update_profile_dispatch(
     return {
         **saved.to_dict(),
         "profiles": pool.list_public(),
+        "requeued_running": requeued,
         "ok": True,
     }
 

@@ -97,7 +97,7 @@ def _profile_token_meta(profile_id: str) -> dict[str, Any]:
         "access_token_expires_at": meta.get("access_token_expires_at"),
         "dispatch_enabled": dispatch,
         "accepting_jobs": accepting,
-        # Standby = có trong danh sách auto nhưng đang ngưng nhận job → sẵn sàng được mở khi 403/429
+        # Standby = có trong danh sách auto nhưng đang ngưng nhận job → sẵn sàng được mở khi 403/429/524
         "standby": bool(not dispatch),
     }
 
@@ -158,7 +158,7 @@ def auto_status() -> dict[str, Any]:
         "hint": (
             "Nút «Chạy CDP tiếp theo»: lấy CDP Gen đầu tiên chưa nhận job trên danh sách "
             "→ Sync cookies → bật Nhận job. "
-            "Khi lịch bật và gen gặp 403/429 → Ngừng job profile lỗi → mở CDP Gen "
+            "Khi lịch bật và gen gặp 403/429/524 → Ngừng job profile lỗi → mở CDP Gen "
             "tiếp theo trên danh sách (ngay dưới các profile đang nhận job)."
         ),
     }
@@ -258,7 +258,7 @@ async def on_profile_http_block(
     reason: str = "HTTP_403",
 ) -> dict[str, Any]:
     """
-    Khi gen gặp 403/429:
+    Khi gen gặp 403/429/524:
     - Ngừng nhận job profile lỗi
     - Mở CDP Gen tiếp theo trên danh sách (ngay dưới các profile đang nhận job)
       → Sync + bật Nhận job
@@ -279,6 +279,16 @@ async def on_profile_http_block(
         _log("info", f"{reason}: đã Ngừng job profile {pid}")
     except Exception as exc:
         _log("error", f"Ngừng job {pid} thất bại: {exc}")
+
+    # Dừng job đang chạy trên profile lỗi — không tiếp tục refresh/call API
+    try:
+        from flow2api.worker.processor import get_worker
+
+        moved = get_worker().requeue_running_on_profile(pid, reason=reason)
+        if moved:
+            _log("info", f"{reason}: đã chuyển {moved} job đang chạy khỏi {pid}")
+    except Exception as exc:
+        _log("error", f"requeue running off {pid} thất bại: {exc}")
 
     next_slot = find_next_standby_gen_slot(pid)
     if not next_slot:
@@ -652,7 +662,7 @@ def mark_cdp_profile_standby(profile_id: str, *, reason: str = "") -> dict[str, 
 
 
 def apply_job_parallel_to_enabled_slots() -> dict[str, Any]:
-    """Chỉ set Song song cho CDP Gen — không bật Nhận job (giữ standby cho 403/429)."""
+    """Chỉ set Song song cho CDP Gen — không bật Nhận job (giữ standby cho 403/429/524)."""
     cfg = get_flow_cdp_auto_settings()
     results = []
     for slot in ordered_auto_slots():
@@ -673,7 +683,7 @@ def apply_job_parallel_to_enabled_slots() -> dict[str, Any]:
 
 
 async def _scheduler_tick() -> None:
-    """Scheduler giữ alive khi auto bật — refresh CDP do 403/429 trigger, không canh Active."""
+    """Scheduler giữ alive khi auto bật — refresh CDP do 403/429/524 trigger, không canh Active."""
     cfg = get_flow_cdp_auto_settings()
     if not cfg.enabled:
         return
@@ -681,11 +691,11 @@ async def _scheduler_tick() -> None:
     for sid, until in list(_fail_cooldown_until.items()):
         if until <= now:
             _fail_cooldown_until.pop(sid, None)
-    # Không còn auto-open theo Active. Trigger qua on_profile_http_block (403/429).
+    # Không còn auto-open theo Active. Trigger qua on_profile_http_block (403/429/524).
 
 
 async def _scheduler_loop() -> None:
-    _log("info", "Scheduler auto CDP đã chạy (403/429 → mở CDP kế tiếp)")
+    _log("info", "Scheduler auto CDP đã chạy (403/429/524 → mở CDP kế tiếp)")
     while True:
         try:
             cfg = get_flow_cdp_auto_settings()
@@ -735,7 +745,7 @@ async def set_enabled(enabled: bool) -> dict[str, Any]:
             _log("error", f"apply job_parallel on enable: {exc}")
         _log(
             "info",
-            "Đã BẬT lịch auto CDP (403/429 → mở CDP Gen kế tiếp đang standby)",
+            "Đã BẬT lịch auto CDP (403/429/524 → mở CDP Gen kế tiếp đang standby)",
         )
     else:
         _log("info", "Đã TẮT lịch auto CDP")

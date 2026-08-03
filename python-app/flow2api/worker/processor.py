@@ -34,6 +34,7 @@ from flow2api.services.flow_sdk import (
     is_extension_timeout_error,
     is_http_403_failure,
     is_http_429_failure,
+    is_http_524_failure,
     is_policy_rejection_failure,
     is_prominent_people_filter_failure,
     is_trpc_401_failure,
@@ -371,9 +372,106 @@ class WorkerController:
         row = activity.get_request(rid)
         if row and row.status.startswith("failed:") and "cancel" in row.status.lower():
             raise RequestCancelled("canceled")
+        if row and row.status == "queued":
+            raise RequestCancelled("canceled")
+        if row:
+            try:
+                params = json.loads(row.params_json or "{}")
+            except Exception:
+                params = {}
+            pid = str(params.get("profile_id") or "").strip()
+            if pid:
+                from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+                if not is_profile_dispatch_enabled(pid):
+                    raise RuntimeError("PROFILE_DISPATCH_DISABLED")
 
     def _abort_hook(self, rid: str):
         return lambda: self._raise_if_cancelled(rid)
+
+    def requeue_running_on_profile(
+        self,
+        profile_id: str,
+        *,
+        reason: str = "dispatch_disabled",
+    ) -> int:
+        """Ngưng nhận job → dừng job đang chạy trên profile đó và đưa về queue profile khác."""
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return 0
+        self._prune_running()
+        targets: list[str] = []
+        for rid in list(self._running.keys()):
+            row = activity.get_request(rid)
+            if not row or row.status != "running":
+                continue
+            try:
+                params = normalize_request_params(json.loads(row.params_json or "{}"))
+            except Exception:
+                continue
+            if str(params.get("profile_id") or "").strip() != pid:
+                continue
+            targets.append(rid)
+
+        if not targets:
+            return 0
+
+        pool = get_extension_pool()
+        abort_snapshot: list = []
+        for rid in targets:
+            abort_snapshot.extend(pool.snapshot_trace_pending(rid))
+        if abort_snapshot:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(pool.abort_snapshot(abort_snapshot))
+            except RuntimeError:
+                pass
+
+        moved = 0
+        for rid in targets:
+            row = activity.get_request(rid)
+            if not row or row.status != "running":
+                continue
+            try:
+                params = normalize_request_params(json.loads(row.params_json or "{}"))
+            except Exception:
+                params = {"profile_id": pid}
+            params["retry_exclude_profile_id"] = pid
+            rotated = apply_retry_profile_rotation(params, row.type)
+            if str(rotated.get("profile_id") or "").strip() == pid:
+                rotated.pop("profile_id", None)
+                rotated.pop("profile_label", None)
+                rotated.pop("profile_email", None)
+                rotated["retry_exclude_profile_id"] = pid
+            rotated.pop("running_started_at", None)
+            activity.update_request(rid, status="queued", params=rotated, error=None)
+            append_request_log(
+                rid,
+                "worker",
+                (
+                    f"Profile {pid[:12]} ngưng nhận job ({reason}) "
+                    "— dừng gọi API, chuyển profile khác"
+                ),
+                level="warn",
+                profile_id=str(
+                    rotated.get("profile_id") or rotated.get("retry_exclude_profile_id") or ""
+                )
+                or None,
+            )
+            events.publish("request_finished", {"id": rid, "status": "queued"})
+            logger.warning(
+                "requeue running rid=%s off profile=%s reason=%s → %s",
+                rid[:8],
+                pid[:12],
+                reason,
+                str(rotated.get("profile_id") or "-")[:12],
+            )
+            task = self._running.get(rid)
+            self.request_cancel(rid)
+            if task and not task.done():
+                task.cancel()
+            moved += 1
+        return moved
 
     def _persist_params(self, rid: str, params: dict[str, Any]) -> None:
         activity.update_request(rid, params=params)
@@ -658,9 +756,9 @@ class WorkerController:
             rid[:8],
             failed_profile[:12] or "-",
         )
-        # Auto CDP: 403/429 → ngừng job profile lỗi + mở CDP Gen kế tiếp (standby)
+        # Auto CDP: 403/429/524 → ngừng job profile lỗi + mở CDP Gen kế tiếp (standby)
         if failed_profile and (
-            "403" in label or "429" in label or "reCAPTCHA" in label
+            "403" in label or "429" in label or "524" in label or "reCAPTCHA" in label
         ):
             self._trigger_next_cdp_on_block(failed_profile, label)
 
@@ -956,6 +1054,25 @@ class WorkerController:
                         str(retry_params.get("profile_id") or retry_params.get("retry_exclude_profile_id") or "-")[:12],
                     )
                     return
+                if "PROFILE_DISPATCH_DISABLED" in msg.upper():
+                    failed_profile = str(retry_params.get("profile_id") or "").strip()
+                    retry_params = self._requeue_for_retry(rid, retry_params, error=msg)
+                    append_request_log(
+                        rid,
+                        "worker",
+                        (
+                            "Profile đã ngưng nhận job — chuyển profile khác"
+                            + (f" (từ {failed_profile[:12]})" if failed_profile else "")
+                        ),
+                        level="warn",
+                        profile_id=failed_profile or None,
+                    )
+                    logger.warning(
+                        "dispatch off → requeue rid=%s profile=%s",
+                        rid[:8],
+                        failed_profile[:12] or "-",
+                    )
+                    return
                 if is_http_403_failure(exc, msg, api_trace):
                     self._handle_profile_error_switch(
                         rid,
@@ -970,6 +1087,14 @@ class WorkerController:
                         retry_params,
                         msg,
                         label="HTTP 429",
+                    )
+                    return
+                if is_http_524_failure(exc, msg, api_trace):
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="HTTP 524",
                     )
                     return
                 if isinstance(exc, FlowApiError):
@@ -1053,6 +1178,12 @@ class WorkerController:
         if not row:
             return
         params = json.loads(row.params_json or "{}")
+        profile_id = str(params.get("profile_id") or "")
+        if profile_id:
+            from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+            if not is_profile_dispatch_enabled(profile_id):
+                raise RuntimeError("PROFILE_DISPATCH_DISABLED")
         client = get_flow_client()
         if not client.connected and not client.has_direct_lane():
             raise RuntimeError("extension_not_connected")

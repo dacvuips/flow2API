@@ -1536,6 +1536,27 @@ def is_http_429_failure(
     return False
 
 
+def is_http_524_failure(
+    exc: Exception,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """HTTP 524 Cloudflare timeout — treat like 403/429 (switch profile)."""
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and int(raw.get("status") or 0) == 524:
+            return True
+    text = str(msg or "").strip().upper()
+    if "HTTP_524" in text or "STATUS: 524" in text:
+        return True
+    if "ERROR 524" in text or "A TIMEOUT OCCURRED" in text:
+        return True
+    for entry in api_trace or []:
+        if int(entry.get("http_status") or 0) == 524:
+            return True
+    return False
+
+
 def is_policy_rejection_failure(
     exc: Exception | None = None,
     msg: str = "",
