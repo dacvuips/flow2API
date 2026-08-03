@@ -1541,7 +1541,7 @@ def is_http_524_failure(
     msg: str = "",
     api_trace: list[dict] | None = None,
 ) -> bool:
-    """HTTP 524 Cloudflare timeout — treat like 403/429 (switch profile)."""
+    """HTTP 524 Cloudflare timeout — transient; do not treat as account ban."""
     if isinstance(exc, FlowApiError):
         raw = exc.raw
         if isinstance(raw, dict) and int(raw.get("status") or 0) == 524:

@@ -756,9 +756,10 @@ class WorkerController:
             rid[:8],
             failed_profile[:12] or "-",
         )
-        # Auto CDP: 403/429/524 → ngừng job profile lỗi + mở CDP Gen kế tiếp (standby)
+        # Auto CDP: chỉ 403/429/reCAPTCHA (lỗi tài khoản) → mở Gen kế tiếp.
+        # 524 = Cloudflare timeout — không đổi profile / không mở Gen mới.
         if failed_profile and (
-            "403" in label or "429" in label or "524" in label or "reCAPTCHA" in label
+            "403" in label or "429" in label or "reCAPTCHA" in label
         ):
             self._trigger_next_cdp_on_block(failed_profile, label)
 
@@ -1090,13 +1091,41 @@ class WorkerController:
                     )
                     return
                 if is_http_524_failure(exc, msg, api_trace):
-                    self._handle_profile_error_switch(
-                        rid,
-                        retry_params,
-                        msg,
-                        label="HTTP 524",
-                    )
-                    return
+                    # 524 = Cloudflare/origin timeout — không phải lỗi tài khoản.
+                    # Retry cùng profile, không ngừng job / không mở Gen CDP mới.
+                    http_524_retry = int(retry_params.get("http_524_retry_count") or 0)
+                    if http_524_retry < RECAPTCHA_RETRY_MAX:
+                        delay_s = flow_sdk.recaptcha_retry_delay(http_524_retry)
+                        retry_params["http_524_retry_count"] = http_524_retry + 1
+                        retry_params["retry_not_before"] = time.time() + delay_s
+                        retry_params.pop("running_started_at", None)
+                        activity.update_request(
+                            rid, status="queued", params=retry_params, error=None
+                        )
+                        events.publish(
+                            "request_finished", {"id": rid, "status": "queued"}
+                        )
+                        append_request_log(
+                            rid,
+                            "worker",
+                            (
+                                f"HTTP 524 timeout — giữ profile, retry "
+                                f"{http_524_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                                f"sau {delay_s:.1f}s"
+                            ),
+                            level="warn",
+                            profile_id=str(retry_params.get("profile_id") or "") or None,
+                        )
+                        logger.warning(
+                            "HTTP 524 timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                            http_524_retry + 1,
+                            RECAPTCHA_RETRY_MAX,
+                            rid[:8],
+                            delay_s,
+                            str(retry_params.get("profile_id") or "-")[:12],
+                        )
+                        return
+                    # Hết retry → fail bình thường (không switch Gen)
                 if isinstance(exc, FlowApiError):
                     logger.error(
                         "worker failed rid=%s step=%s err=%s api_trace=%s",
@@ -1301,6 +1330,7 @@ class WorkerController:
                 or params.get("get_media_404_retry_count")
                 or params.get("upload_internal_retry_count")
                 or params.get("extension_timeout_retry_count")
+                or params.get("http_524_retry_count")
                 or params.get("prominent_people_retry_count")
                 or params.get("invalid_argument_retry_count")
                 or params.get("trpc_401_retry_count")
@@ -1310,6 +1340,7 @@ class WorkerController:
                 params.pop("get_media_404_retry_count", None)
                 params.pop("upload_internal_retry_count", None)
                 params.pop("extension_timeout_retry_count", None)
+                params.pop("http_524_retry_count", None)
                 params.pop("prominent_people_retry_count", None)
                 params.pop("invalid_argument_retry_count", None)
                 params.pop("trpc_401_retry_count", None)
@@ -1582,6 +1613,7 @@ class WorkerController:
                     or done_params.pop("get_media_404_retry_count", None) is not None
                     or done_params.pop("upload_internal_retry_count", None) is not None
                     or done_params.pop("extension_timeout_retry_count", None) is not None
+                    or done_params.pop("http_524_retry_count", None) is not None
                     or done_params.pop("prominent_people_retry_count", None) is not None
                     or done_params.pop("invalid_argument_retry_count", None) is not None
                     or done_params.pop("trpc_401_retry_count", None) is not None
