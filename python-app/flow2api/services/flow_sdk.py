@@ -672,7 +672,7 @@ async def gen_image(
         )
         last_resp = resp if isinstance(resp, dict) else {}
         status = int(resp.get("status") or 0)
-        if status < 400:
+        if 200 <= status < 400:
             return resp.get("data") or {}
         last_err = error_from_response(resp)
         if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
@@ -681,6 +681,15 @@ async def gen_image(
                 client,
                 "gen_image",
                 f"reCAPTCHA retry {attempt + 1}/{RECAPTCHA_RETRY_MAX}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        if is_transient_flow_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = min(300, (2**attempt) * 10)
+            log_task_event(
+                client,
+                "gen_image",
+                f"transient retry {attempt + 1}: {last_err} — wait {delay}s",
             )
             await asyncio.sleep(delay)
             continue
@@ -854,7 +863,7 @@ async def upsample_image(
         )
         last_resp = resp if isinstance(resp, dict) else {}
         status = int(resp.get("status") or 0)
-        if status < 400:
+        if 200 <= status < 400:
             data = resp.get("data") or {}
             parsed = parse_upsample_image_response(data)
             if parsed:
@@ -867,6 +876,15 @@ async def upsample_image(
                 client,
                 "upsample_image",
                 f"reCAPTCHA retry {attempt + 1}/{RECAPTCHA_RETRY_MAX}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        if is_transient_flow_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = min(300, (2**attempt) * 10)
+            log_task_event(
+                client,
+                "upsample_image",
+                f"transient retry {attempt + 1}: {last_err} — wait {delay}s",
             )
             await asyncio.sleep(delay)
             continue
@@ -1309,6 +1327,16 @@ _TRANSIENT_MARKERS = (
     "unavailable",
 )
 
+_CURL_TRANSPORT_MARKERS = (
+    "curl: (",
+    "failed to perform",
+    "connection closed abruptly",
+    "connection reset",
+    "recv failure",
+    "ssl_error_syscall",
+    "empty reply from server",
+)
+
 
 class FlowApiError(RuntimeError):
     """Flow API failure — carries raw extension/api responses for dashboard debug."""
@@ -1550,7 +1578,17 @@ def compact_api_response(resp: Any, label: str = "") -> dict:
 
 def is_transient_flow_error(msg: str) -> bool:
     low = str(msg or "").lower()
-    return any(m in low for m in _TRANSIENT_MARKERS)
+    return any(m in low for m in _TRANSIENT_MARKERS) or is_curl_transport_error(msg)
+
+
+def is_curl_transport_error(msg: str = "", exc: Exception | None = None) -> bool:
+    """curl_cffi / TLS drop (e.g. curl 56) — safe to retry; media uploads already done."""
+    text = str(msg or "").strip().lower()
+    if not text and exc is not None:
+        text = str(exc).strip().lower()
+    if not text:
+        return False
+    return any(m in text for m in _CURL_TRANSPORT_MARKERS)
 
 
 def is_upload_image_internal_error(resp: dict) -> bool:
@@ -1767,7 +1805,8 @@ async def _video_submit_request(
             return payload
         last_err = error_from_response(resp)
         status = int(resp.get("status") or 0)
-        if status < 400:
+        # status 0 = transport failure (curl drop) — do not treat as success
+        if 200 <= status < 400:
             break
         if is_recaptcha_error(last_err) and attempt < max_attempts - 1:
             delay = _recaptcha_retry_delay(attempt)

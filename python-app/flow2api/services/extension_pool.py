@@ -491,15 +491,29 @@ class ExtensionSession:
             raise RuntimeError("NO_CAPTCHA_CENTER")
         params["headers"] = await self._with_auth_headers(headers)
         captcha_tok = str(params.get("captchaToken") or "").strip() or None
-        resp = await self._dispatch_api_request(
-            url=url,
-            method=method,
-            headers=params["headers"],
-            body=body,
-            captcha_token=captcha_tok,
-            timeout=timeout,
-        )
-        if "aisandbox-pa.googleapis.com" in url:
+
+        async def _do_request(auth_headers: dict) -> dict:
+            try:
+                return await self._dispatch_api_request(
+                    url=url,
+                    method=method,
+                    headers=auth_headers,
+                    body=body,
+                    captcha_token=captcha_tok,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                # curl_cffi / network drop before HTTP status — still record for debug.
+                err_msg = str(exc).strip() or type(exc).__name__
+                synth = {"status": 0, "error": err_msg, "data": None}
+                if "aisandbox-pa.googleapis.com" in url:
+                    record_api_call(self.trace_request_id, url, method, body, synth)
+                if raise_on_error:
+                    raise RuntimeError(err_msg) from exc
+                return synth
+
+        resp = await _do_request(params["headers"])
+        if "aisandbox-pa.googleapis.com" in url and int(resp.get("status") or 0) > 0:
             record_api_call(self.trace_request_id, url, method, body, resp)
         try:
             status_probe = int(resp.get("status") or 0)
@@ -509,15 +523,8 @@ class ExtensionSession:
             refresh = await self.refresh_flow_token(force=True)
             if refresh.get("ok"):
                 captcha_tok = str(params.get("captchaToken") or "").strip() or None
-                resp = await self._dispatch_api_request(
-                    url=url,
-                    method=method,
-                    headers=await self._with_auth_headers(headers, refresh=False),
-                    body=body,
-                    captcha_token=captcha_tok,
-                    timeout=timeout,
-                )
-                if "aisandbox-pa.googleapis.com" in url:
+                resp = await _do_request(await self._with_auth_headers(headers, refresh=False))
+                if "aisandbox-pa.googleapis.com" in url and int(resp.get("status") or 0) > 0:
                     record_api_call(self.trace_request_id, url, method, body, resp)
                 try:
                     status_probe = int(resp.get("status") or 0)
@@ -536,6 +543,8 @@ class ExtensionSession:
         if not raise_on_error:
             return resp
         status = int(resp.get("status") or 0)
+        if status == 0 and resp.get("error"):
+            raise RuntimeError(str(resp.get("error")))
         if status >= 400:
             data = resp.get("data")
             if isinstance(data, dict) and isinstance(data.get("error"), dict):

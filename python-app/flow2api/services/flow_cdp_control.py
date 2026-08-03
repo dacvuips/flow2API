@@ -59,6 +59,7 @@ def _attach_email_to_slot(slot_id: str, email: str, *, profile_id: str = "") -> 
     if not slot:
         return ""
     pid = str(profile_id or slot.profile_id()).strip() or slot.id
+    first_email = not bool(str(slot.email or "").strip())
     new_label = em if _looks_like_default_label(slot.label, slot.id) else None
     kwargs: dict[str, Any] = {"email": em, "linked_profile_id": pid}
     if new_label:
@@ -66,6 +67,14 @@ def _attach_email_to_slot(slot_id: str, email: str, *, profile_id: str = "") -> 
     update_flow_cdp_slot(slot.id, **kwargs)
     ensure_profile_row(pid, profile_label=new_label or slot.label or em, email=em)
     update_profile_meta(pid, profile_label=new_label or slot.label or em, email=em)
+    # Lần đầu gắn email (login/Sync tay) → standby; auto-run sẽ bật Nhận job sau.
+    if first_email and (slot.role or "bridge") != "center":
+        try:
+            from flow2api.services.flow_cdp_auto import mark_cdp_profile_standby
+
+            mark_cdp_profile_standby(pid, reason=f"first_email:{slot.id}")
+        except Exception as exc:
+            logger.warning("standby on first email failed slot=%s: %s", slot.id, exc)
     return em
 
 

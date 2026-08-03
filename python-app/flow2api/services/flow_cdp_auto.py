@@ -158,7 +158,8 @@ def auto_status() -> dict[str, Any]:
         "hint": (
             "Nút «Chạy CDP tiếp theo»: lấy CDP Gen đầu tiên chưa nhận job trên danh sách "
             "→ Sync cookies → bật Nhận job. "
-            "Khi lịch bật và gen gặp 403/429 → ngừng job profile lỗi → mở CDP Gen kế tiếp tương tự."
+            "Khi lịch bật và gen gặp 403/429 → Ngừng job profile lỗi → mở CDP Gen "
+            "tiếp theo trên danh sách (ngay dưới các profile đang nhận job)."
         ),
     }
 
@@ -176,18 +177,27 @@ def _find_slot_index_for_profile(slots: list[dict[str, Any]], profile_id: str) -
 
 
 def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
-    """CDP Gen kế tiếp (phía dưới) đang ngưng nhận job, trong danh sách auto đã bật."""
+    """CDP Gen tiếp theo trên danh sách auto: ngay dưới các profile đang nhận job.
+
+    Duyệt theo slot_order, bỏ qua profile vừa lỗi, lấy Gen đầu tiên chưa nhận job
+    (standby / ngưng dispatch) — tức phần tử kế tiếp trong danh sách.
+    """
     slots = ordered_auto_slots()
-    idx = _find_slot_index_for_profile(slots, failed_profile_id)
-    start = idx + 1 if idx >= 0 else 0
-    for s in slots[start:]:
+    exclude = str(failed_profile_id or "").strip()
+    for s in slots:
         if not s.get("enabled"):
             continue
         if (s.get("role") or "bridge") == "center":
             continue
-        # Đang ngưng nhận job (= standby) → đây là ứng viên mở Sync
-        if s.get("standby") or not s.get("dispatch_enabled"):
-            return s
+        sid = str(s.get("id") or "").strip()
+        linked = str(s.get("linked_profile_id") or sid).strip()
+        if exclude and (linked == exclude or sid == exclude):
+            continue
+        # Đang nhận job → bỏ qua, lấy cái kế tiếp trên danh sách
+        if s.get("accepting_jobs"):
+            continue
+        # Chưa nhận job → mở Sync + Nhận job (tiếp theo danh sách)
+        return s
     return None
 
 
@@ -250,7 +260,8 @@ async def on_profile_http_block(
     """
     Khi gen gặp 403/429:
     - Ngừng nhận job profile lỗi
-    - Mở CDP Gen kế tiếp (đang ngưng nhận job, phía dưới) → Sync + bật Nhận job
+    - Mở CDP Gen tiếp theo trên danh sách (ngay dưới các profile đang nhận job)
+      → Sync + bật Nhận job
     """
     cfg = get_flow_cdp_auto_settings()
     if not cfg.enabled:
@@ -613,6 +624,30 @@ def apply_job_parallel_for_profile(
         }
     except Exception as exc:
         _log("error", f"Apply job parallel failed {pid}: {exc}")
+        return {"ok": False, "profile_id": pid, "error": str(exc)}
+
+
+def mark_cdp_profile_standby(profile_id: str, *, reason: str = "") -> dict[str, Any]:
+    """CDP mới / lần đầu nhập → tắt Nhận job (standby). Chỉ auto-run mới bật lại."""
+    from flow2api.services.worker_settings import set_profile_dispatch_enabled
+
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return {"ok": False, "error": "missing_profile_id"}
+    try:
+        set_profile_dispatch_enabled(pid, False)
+        note = f" ({reason})" if reason else ""
+        _log("info", f"Profile {pid}: Nhận job OFF · standby{note}")
+        try:
+            get_extension_pool = __import__(
+                "flow2api.services.extension_pool", fromlist=["get_extension_pool"]
+            ).get_extension_pool
+            get_extension_pool().hydrate_db_profiles()
+        except Exception:
+            pass
+        return {"ok": True, "profile_id": pid, "dispatch_enabled": False}
+    except Exception as exc:
+        _log("error", f"mark standby failed {pid}: {exc}")
         return {"ok": False, "profile_id": pid, "error": str(exc)}
 
 

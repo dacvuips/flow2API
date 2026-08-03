@@ -113,13 +113,21 @@ async def flow_cdp_slots_create(
         ensure_profile_row(slot.profile_id(), profile_label=slot.label or slot.id)
     except Exception as exc:
         logger.warning("ensure profile on add CDP failed slot=%s: %s", slot.id, exc)
+    # CDP mới = standby: tắt Nhận job. Chỉ «Chạy CDP / auto» mới bật.
+    if (slot.role or "bridge") != "center":
+        try:
+            from flow2api.services.flow_cdp_auto import mark_cdp_profile_standby
+
+            mark_cdp_profile_standby(slot.profile_id(), reason=f"add_slot:{slot.id}")
+        except Exception as exc:
+            logger.warning("standby on add CDP failed slot=%s: %s", slot.id, exc)
     return {
         "ok": True,
         "slot": slot.to_dict(),
         "profiles": _profiles_payload(),
         "message": (
-            f"Đã thêm Flow CDP {slot.id} (:{slot.port}) · "
-            "Mở CDP → login → tắt CDP (không auto cookies)"
+            f"Đã thêm Flow CDP {slot.id} (:{slot.port}) · standby (chưa nhận job) · "
+            "Mở CDP → login → Sync; bật nhận job qua «Chạy CDP tiếp theo» / Auto"
         ),
     }
 
