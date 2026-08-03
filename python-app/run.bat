@@ -3,8 +3,10 @@ cd /d "%~dp0"
 
 rem Double-click lai: dong CMD agent cu (theo title) + dung server, giu cua so moi
 echo Dang dung instance cu (neu co)...
-taskkill /F /T /FI "WINDOWTITLE eq Flow2API-Agent" >nul 2>&1
-taskkill /F /T /FI "WINDOWTITLE eq Flow2API-Agent*" >nul 2>&1
+rem KHONG dung /T o day — /T se keo theo Chrome CDP ChatGPT/Flow neu van la con cua python.
+rem stop.bat se tat python theo port (khong /T); sau do dong CMD agent cu.
+taskkill /F /FI "WINDOWTITLE eq Flow2API-Agent" >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq Flow2API-Agent*" >nul 2>&1
 
 rem Danh dau cua so nay TRUOC stop — stop.bat se khong kill title *STARTING*
 title Flow2API-Agent-STARTING

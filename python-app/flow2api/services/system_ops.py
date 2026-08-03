@@ -22,12 +22,15 @@ logger = logging.getLogger(__name__)
 
 def _popen_detached(args: list[str], *, cwd: str | Path | None = None) -> subprocess.Popen:
     """
-    Launch outside Python process tree / job object.
+    Launch Chrome CDP outside the Python/CMD process tree.
 
-    stop.bat + run.bat dùng ``taskkill /T`` — nếu Chrome CDP là con của python.exe
-    thì bị tắt theo khi stop/run. Detach để CDP ChatGPT / Flow sống sót.
+    stop.bat + run.bat dùng ``taskkill /T`` (kill cả cây con). Trên Windows,
+    DETACHED_PROCESS / BREAKAWAY_FROM_JOB **không** đổi ParentProcessId — Chrome
+    vẫn là con của python.exe và bị tắt theo khi restart server.
+
+    Cách đúng: ``cmd /c start "" …`` (shell) để Chrome không còn là descendant
+    của agent. Không dùng CREATE_NO_WINDOW — làm ``start`` fail im lặng.
     """
-    flags = 0
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -37,11 +40,18 @@ def _popen_detached(args: list[str], *, cwd: str | Path | None = None) -> subpro
     if cwd is not None:
         kwargs["cwd"] = str(cwd)
     if os.name == "nt":
-        # DETACHED | NEW_PROCESS_GROUP | BREAKAWAY_FROM_JOB
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
         flags = 0x00000008 | 0x00000200 | 0x01000000
-        kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
+        # `start ""` — arg quoted đầu tiên sau start là window title (để trống).
+        cmdline = subprocess.list2cmdline(list(args))
+        full = f'start "" {cmdline}'
+        return subprocess.Popen(
+            full,
+            shell=True,
+            creationflags=flags,
+            **kwargs,
+        )
+    kwargs["start_new_session"] = True
     return subprocess.Popen(args, **kwargs)
 
 _CONFIG_PATH = STORAGE_DIR / "system_config.json"

@@ -73,7 +73,8 @@ for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr /R /C:":%PORT% .*LISTE
   if not "%%P"=="0" (
     if not "%%P"=="%EXCLUDE_PID%" (
       echo Dung PID %%P ^(port %PORT%^)
-      taskkill /PID %%P /T /F >nul 2>&1
+      rem KHONG dung /T — tranh kill Chrome CDP ChatGPT/Flow (con cua python)
+      taskkill /PID %%P /F >nul 2>&1
       set "KILLED=1"
     )
   )
