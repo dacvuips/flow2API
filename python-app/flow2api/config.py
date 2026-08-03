@@ -76,6 +76,10 @@ TASK_TIMEOUT_ERROR = "task_timeout_20m"
 TASK_TIMEOUT_ERROR_MSG = (
     "Timeout: quá 20 phút không hoàn thành, job đã kết thúc."
 )
+# Auto-retry task_timeout_20m once while task age since created_at is within
+# (running timeout + this grace). Default 20m + 10m → first 20m timeout can retry once.
+TASK_TIMEOUT_RETRY_GRACE_S = int(os.environ.get("FLOW2API_TASK_TIMEOUT_RETRY_GRACE_S", "600"))
+TASK_TIMEOUT_RETRY_MAX = int(os.environ.get("FLOW2API_TASK_TIMEOUT_RETRY_MAX", "1"))
 WORKER_NUDGE_INTERVAL_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_INTERVAL_S", "120"))
 WORKER_NUDGE_STUCK_S = int(os.environ.get("FLOW2API_WORKER_NUDGE_STUCK_S", "120"))
 # Fail HTTP handlers before Cloudflare 524 (~100s); return JSON 503 instead.

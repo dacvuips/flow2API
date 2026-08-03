@@ -439,6 +439,94 @@ async def _fetch_email_from_token(token: str) -> str:
     return ""
 
 
+def _has_flow_session_cookie(cookies: list[dict[str, Any]]) -> bool:
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("name") or "") == "__Secure-next-auth.session-token":
+            return bool(str(c.get("value") or "").strip())
+    return False
+
+
+async def _wait_flow_ready(page, *, timeout_ms: int = 12_000) -> None:
+    """Give NextAuth time to set session-token after Google SSO."""
+    try:
+        await page.wait_for_timeout(min(2500, max(500, timeout_ms // 4)))
+    except Exception:
+        pass
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        try:
+            cookies = await page.context.cookies()
+            if _has_flow_session_cookie(cookies):
+                return
+        except Exception:
+            pass
+        try:
+            await page.wait_for_timeout(800)
+        except Exception:
+            break
+
+
+async def _auth_session_from_page(page) -> dict[str, Any]:
+    """Same path as extension: fetch auth/session inside the Flow tab."""
+    try:
+        raw = await page.evaluate(
+            """async () => {
+              const resp = await fetch('https://labs.google/fx/api/auth/session', {
+                credentials: 'include',
+                headers: { accept: 'application/json' },
+              });
+              let body = null;
+              try { body = await resp.json(); } catch { body = null; }
+              return { ok: !!resp.ok, status: resp.status, body };
+            }"""
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"page_auth_session:{exc}"}
+    body = (raw or {}).get("body")
+    if not isinstance(body, dict):
+        return {
+            "ok": False,
+            "error": "AUTH_SESSION_EMPTY",
+            "status": (raw or {}).get("status"),
+        }
+    token = str(body.get("access_token") or "").strip()
+    user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    email = str((user or {}).get("email") or "").strip()
+    if not token:
+        return {
+            "ok": False,
+            "error": "AUTH_SESSION_EMPTY",
+            "status": (raw or {}).get("status"),
+            "keys": list(body.keys()),
+            "email": email,
+        }
+    return {
+        "ok": True,
+        "method": "page_auth_session",
+        "flowKey": token,
+        "email": email,
+        "expiresAt": body.get("expires"),
+    }
+
+
+def _sync_not_logged_in_message(slot_id: str, *, cookies_n: int, has_session: bool) -> str:
+    base = f"Đã sync session slot {slot_id}"
+    if cookies_n:
+        base += f" · {cookies_n} cookies"
+    if has_session:
+        return (
+            f"{base} · chưa lấy được token/email. "
+            "Mở đúng cửa sổ CDP này, đợi Flow load xong rồi Sync lại."
+        )
+    return (
+        f"{base} · cửa sổ CDP này CHƯA đăng nhập Flow "
+        "(thiếu session-token). Email trên extension có thể thuộc CDP/profile khác — "
+        "bấm Sign in Google ngay trong cửa sổ Chrome của slot này, đợi vào Flow rồi Sync lại."
+    )
+
+
 async def attach_email_only(slot_id: str) -> dict[str, Any]:
     """Detect logged-in email and persist slot + FlowProfile metadata.
 
@@ -453,6 +541,7 @@ async def attach_email_only(slot_id: str) -> dict[str, Any]:
                 await page.goto(_FLOW_START, wait_until="domcontentloaded", timeout=60_000)
             except Exception as exc:
                 logger.warning("goto flow failed slot=%s: %s", slot.id, exc)
+            await _wait_flow_ready(page)
 
             cookies = await context.cookies()
             useful = [
@@ -467,7 +556,14 @@ async def attach_email_only(slot_id: str) -> dict[str, Any]:
             if not useful:
                 useful = [c for c in cookies if isinstance(c, dict)]
 
-            email = await _detect_email(page) or _guess_email_from_cookies(useful)
+            page_sess = await _auth_session_from_page(page)
+            email = (
+                str(page_sess.get("email") or "").strip()
+                or await _detect_email(page)
+                or _guess_email_from_cookies(useful)
+            )
+            if not email and page_sess.get("ok"):
+                email = await _fetch_email_from_token(str(page_sess.get("flowKey") or ""))
             pid = slot.profile_id()
             ensure_profile_row(pid, profile_label=slot.label or slot.id, email=email or "")
             if email:
@@ -506,6 +602,7 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
                 await page.goto(_FLOW_START, wait_until="domcontentloaded", timeout=60_000)
             except Exception as exc:
                 logger.warning("goto flow failed slot=%s: %s", slot.id, exc)
+            await _wait_flow_ready(page)
 
             cookies = await context.cookies()
             useful = [
@@ -519,8 +616,14 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
             ]
             if not useful:
                 useful = [c for c in cookies if isinstance(c, dict)]
+            has_session = _has_flow_session_cookie(useful)
 
-            email = await _detect_email(page) or _guess_email_from_cookies(useful)
+            page_sess = await _auth_session_from_page(page)
+            email = (
+                str(page_sess.get("email") or "").strip()
+                or await _detect_email(page)
+                or _guess_email_from_cookies(useful)
+            )
             pid = slot.profile_id()
             ensure_profile_row(pid, profile_label=slot.label or slot.id, email=email or "")
             if useful:
@@ -529,16 +632,29 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
             token_ok = False
             token_err = None
             token = ""
-            try:
-                tok = await refresh_access_token_from_cookies(pid, force=True)
-                token_ok = bool(tok and tok.get("ok"))
-                if token_ok:
-                    token = str(tok.get("flowKey") or get_stored_access_token(pid) or "").strip()
-                else:
-                    token_err = str((tok or {}).get("error") or "token_refresh_failed")
-            except Exception as exc:
-                token_err = str(exc)
-                logger.warning("refresh token from CDP cookies failed slot=%s: %s", slot.id, exc)
+            expires_at = None
+            if page_sess.get("ok"):
+                token_ok = True
+                token = str(page_sess.get("flowKey") or "").strip()
+                expires_at = page_sess.get("expiresAt")
+            else:
+                token_err = str(page_sess.get("error") or "AUTH_SESSION_EMPTY")
+                try:
+                    tok = await refresh_access_token_from_cookies(pid, force=True)
+                    token_ok = bool(tok and tok.get("ok"))
+                    if token_ok:
+                        token = str(
+                            tok.get("flowKey") or get_stored_access_token(pid) or ""
+                        ).strip()
+                        expires_at = tok.get("expiresAt")
+                        token_err = None
+                    else:
+                        token_err = str((tok or {}).get("error") or token_err)
+                except Exception as exc:
+                    token_err = str(exc)
+                    logger.warning(
+                        "refresh token from CDP cookies failed slot=%s: %s", slot.id, exc
+                    )
 
             if not email:
                 token = token or (get_stored_access_token(pid) or "")
@@ -547,13 +663,36 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
 
             if email:
                 _attach_email_to_slot(slot.id, email, profile_id=pid)
-                if token_ok and token:
-                    save_access_token(pid, token, profile_label=email, email=email)
+            if token_ok and token:
+                save_access_token(
+                    pid,
+                    token,
+                    profile_label=email or (slot.label or slot.id),
+                    email=email or "",
+                    expires_at=expires_at,
+                )
 
             try:
                 get_extension_pool().hydrate_db_profiles()
             except Exception:
                 pass
+
+            if token_ok and email:
+                msg = (
+                    f"Đã sync session slot {slot.id} · {email}"
+                    f" · {len(useful)} cookies · token OK"
+                )
+            elif token_ok:
+                msg = (
+                    f"Đã sync session slot {slot.id} · {len(useful)} cookies"
+                    " · token OK · chưa thấy email"
+                )
+            else:
+                msg = _sync_not_logged_in_message(
+                    slot.id, cookies_n=len(useful), has_session=has_session
+                )
+                if token_err:
+                    msg += f" ({token_err})"
 
             return {
                 "ok": True,
@@ -561,18 +700,10 @@ async def sync_session(slot_id: str) -> dict[str, Any]:
                 "profile_id": pid,
                 "email": email,
                 "cookies_count": len(useful),
+                "has_flow_session_cookie": has_session,
                 "token_refreshed": token_ok,
                 "token_error": token_err,
-                "message": (
-                    f"Đã sync session slot {slot.id}"
-                    + (
-                        f" · {email}"
-                        if email
-                        else " · chưa thấy email (đăng nhập xong chờ vài giây rồi Sync lại)"
-                    )
-                    + (f" · {len(useful)} cookies" if useful else "")
-                    + (" · token OK" if token_ok else " · chưa lấy được token")
-                ),
+                "message": msg,
             }
         return {"ok": False, "error": "attach_failed"}
 

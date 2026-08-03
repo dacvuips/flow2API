@@ -15,6 +15,8 @@ from flow2api.config import (
     TASK_RUNNING_TIMEOUT_S,
     TASK_TIMEOUT_ERROR,
     TASK_TIMEOUT_ERROR_MSG,
+    TASK_TIMEOUT_RETRY_GRACE_S,
+    TASK_TIMEOUT_RETRY_MAX,
     VIDEO_POLL_INTERVAL_S,
     VIDEO_POLL_MAX,
     VIDEO_POLL_MEDIA_MAX,
@@ -199,13 +201,64 @@ class WorkerController:
             self._running.pop(rid, None)
 
     def _handle_running_stuck(self, rid: str) -> None:
-        """Fail running task when it exceeds TASK_RUNNING_TIMEOUT_S (default 20m)."""
+        """Fail or auto-retry when running exceeds TASK_RUNNING_TIMEOUT_S (default 20m).
+
+        On task_timeout_20m: retry once if not already retried and age since created_at
+        ≤ running_timeout + grace (default 20m + 10m). Otherwise mark failed.
+        """
         row = activity.get_request(rid)
         if not row or row.status != "running":
             return
 
         task = self._running.get(rid)
         self._running_since.pop(rid, None)
+
+        params: dict[str, Any] = {}
+        try:
+            raw = json.loads(row.params_json or "{}")
+            if isinstance(raw, dict):
+                params = raw
+        except Exception:
+            params = {}
+
+        retry_count = int(params.get("running_timeout_retry_count") or 0)
+        created = row.created_at or datetime.utcnow()
+        try:
+            age_s = max(0.0, (datetime.utcnow() - created).total_seconds())
+        except Exception:
+            age_s = float("inf")
+
+        age_limit_s = max(60, int(TASK_RUNNING_TIMEOUT_S or 1200)) + max(
+            0, int(TASK_TIMEOUT_RETRY_GRACE_S or 600)
+        )
+        can_retry = retry_count < max(1, int(TASK_TIMEOUT_RETRY_MAX or 1)) and age_s <= age_limit_s
+        if can_retry:
+            params["running_timeout_retry_count"] = retry_count + 1
+            params["retry_not_before"] = time.time() + 2.0
+            params.pop("running_started_at", None)
+            activity.update_request(rid, status="queued", params=params, error=None)
+            append_request_log(
+                rid,
+                "worker",
+                (
+                    f"{TASK_TIMEOUT_ERROR} — auto retry {retry_count + 1}/"
+                    f"{max(1, int(TASK_TIMEOUT_RETRY_MAX or 1))} "
+                    f"(age {age_s:.0f}s ≤ {age_limit_s}s, chưa báo lỗi)"
+                ),
+                level="warn",
+            )
+            events.publish("request_finished", {"id": rid, "status": "queued"})
+            logger.warning(
+                "task timeout → retry rid=%s age=%.0fs retry=%s",
+                rid[:8],
+                age_s,
+                retry_count + 1,
+            )
+            self.request_cancel(rid)
+            if task and not task.done():
+                task.cancel()
+            self._running.pop(rid, None)
+            return
 
         activity.update_request(
             rid,
@@ -221,9 +274,11 @@ class WorkerController:
         )
         events.publish("request_finished", {"id": rid, "status": "failed"})
         logger.warning(
-            "task timed out rid=%s after %ss",
+            "task timed out rid=%s after %ss (age=%.0fs retries=%s)",
             rid[:8],
             TASK_RUNNING_TIMEOUT_S,
+            age_s,
+            retry_count,
         )
         self.request_cancel(rid)
         if task and not task.done():
