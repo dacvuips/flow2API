@@ -3,15 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 _runtime_logger = logging.getLogger("flow2api.runtime")
-
-
-def _now_iso() -> str:
-    ts = datetime.now(timezone.utc)
-    return ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
 
 
 def resolve_log_email(
@@ -62,12 +56,13 @@ def append_request_log(
     profile_email: str | None = None,
 ) -> None:
     email = resolve_log_email(request_id, profile_id, profile_email)
-    line = f"[{_now_iso()}]"
+    parts: list[str] = []
     if email:
-        line += f" [{email}]"
+        parts.append(f"[{email}]")
     if request_id:
-        line += f" [{request_id}]"
-    line += f" {step}: {message}"
+        parts.append(f"[{request_id}]")
+    parts.append(f"{step}: {message}")
+    line = " ".join(parts)
     if level == "error":
         _runtime_logger.error(line)
     elif level == "warn":
