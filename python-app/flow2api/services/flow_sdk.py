@@ -1482,12 +1482,67 @@ def is_http_404_failure(
     return False
 
 
+def _text_has_profile_switch_marker(text: str) -> bool:
+    upper = str(text or "").upper()
+    if not upper:
+        return False
+    if "OFFLINE_AUTH_EXPIRED" in upper:
+        return True
+    if "INVALID AUTHENTICATION CREDENTIALS" in upper:
+        return True
+    if "EXPECTED OAUTH 2 ACCESS TOKEN" in upper:
+        return True
+    if "RESOURCE HAS BEEN EXHAUSTED" in upper:
+        return True
+    return False
+
+
+def is_profile_account_switch_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """Lỗi tài khoản thật — cần ngưng job profile và chuyển sang tài khoản khác.
+
+    Khác với HTTP 403/429 thoáng qua (retry cùng profile).
+    """
+    if _text_has_profile_switch_marker(msg):
+        return True
+    if exc is not None:
+        if _text_has_profile_switch_marker(str(exc)):
+            return True
+        if isinstance(exc, FlowApiError):
+            raw = exc.raw
+            if isinstance(raw, dict):
+                if _text_has_profile_switch_marker(error_from_response(raw)):
+                    return True
+                if _text_has_profile_switch_marker(json.dumps(raw, ensure_ascii=False)):
+                    return True
+    for entry in api_trace or []:
+        if _text_has_profile_switch_marker(str(entry.get("error") or "")):
+            return True
+        data = entry.get("data")
+        if isinstance(data, dict):
+            if _text_has_profile_switch_marker(error_from_response(data)):
+                return True
+            err = data.get("error")
+            if isinstance(err, dict) and _text_has_profile_switch_marker(
+                str(err.get("message") or err.get("status") or "")
+            ):
+                return True
+        if _text_has_profile_switch_marker(json.dumps(entry, ensure_ascii=False)):
+            return True
+    return False
+
+
 def is_http_403_failure(
     exc: Exception,
     msg: str = "",
     api_trace: list[dict] | None = None,
 ) -> bool:
-    """HTTP 403 / PERMISSION_DENIED — not reCAPTCHA (handled separately)."""
+    """HTTP 403 / PERMISSION_DENIED thoáng qua — retry cùng profile."""
+    if is_profile_account_switch_failure(exc, msg, api_trace):
+        return False
     if is_recaptcha_error(str(msg or "")):
         return False
     if isinstance(exc, FlowApiError):
@@ -1520,7 +1575,9 @@ def is_http_429_failure(
     msg: str = "",
     api_trace: list[dict] | None = None,
 ) -> bool:
-    """HTTP 429 / RESOURCE_EXHAUSTED / rate limit."""
+    """HTTP 429 / rate limit — không gồm quota exhausted (xử lý riêng)."""
+    if is_profile_account_switch_failure(exc, msg, api_trace):
+        return False
     if isinstance(exc, FlowApiError):
         raw = exc.raw
         if isinstance(raw, dict) and int(raw.get("status") or 0) == 429:
