@@ -249,19 +249,37 @@ def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
 
 
 def find_next_cdp_to_run() -> dict[str, Any] | None:
-    """CDP Gen tiếp theo: ngay dưới Gen đang bật Nhận job; chưa có thì lấy từ đầu."""
+    """CDP Gen standby tiếp theo để bật nhận job.
+
+    1) Ưu tiên ngay dưới Gen đang bật Nhận job cuối cùng
+    2) Không còn phía dưới → quét cả list từ đầu (standby phía trên / giữa)
+    """
     slots = ordered_auto_slots()
     start_idx = _last_activated_gen_index(slots)
-    return _next_gen_standby_after(
+    nxt = _next_gen_standby_after(
         slots,
         after_index=start_idx,
         skip_running=True,
         skip_cooldown=True,
     )
+    if nxt:
+        return nxt
+    # Wrap: 2 Gen đang chạy có thể nằm cuối list → standby chỉ còn phía trên
+    if start_idx >= 0:
+        return _next_gen_standby_after(
+            slots,
+            after_index=-1,
+            skip_running=True,
+            skip_cooldown=True,
+        )
+    return None
 
 
 def _count_active_or_starting_gens() -> int:
-    """Số Gen đang nhận job / đã bật dispatch / đang chạy (hoặc sắp chạy) cycle auto."""
+    """Số Gen đang bật Nhận job (dispatch) hoặc đang/sắp chạy cycle auto.
+
+    Khớp pill «nhận job»: ưu tiên dispatch_enabled (đã bật nhận job, kể cả chưa ready).
+    """
     n = 0
     for s in ordered_auto_slots():
         if not s.get("enabled"):
@@ -271,15 +289,15 @@ def _count_active_or_starting_gens() -> int:
         sid = str(s.get("id") or "").strip()
         if not sid:
             continue
-        if _is_cycle_busy(sid) or s.get("dispatch_enabled") or s.get("accepting_jobs"):
+        if _is_cycle_busy(sid) or s.get("dispatch_enabled"):
             n += 1
     return n
 
 
 def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[str, Any]:
     """
-    Bù CDP Gen standby đến khi số Gen đang hoạt động / đang mở >= Song song Gen CDP.
-    Gọi sau Lưu cấu hình (và chain sau mỗi cycle thành công nếu còn thiếu).
+    Bù CDP Gen standby đến khi số Gen đang bật nhận job >= Song song Gen CDP.
+    Gọi sau Lưu cấu hình (và chain sau mỗi cycle nếu còn thiếu).
     """
     cfg = get_flow_cdp_auto_settings()
     target = int(cfg.parallel_gen or 0)
@@ -294,6 +312,7 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
         }
 
     started: list[str] = []
+    blocked_reason = ""
     have_before = _count_active_or_starting_gens()
     for _ in range(max(1, target) + 2):
         have = _count_active_or_starting_gens()
@@ -301,16 +320,20 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
             break
         nxt = find_next_cdp_to_run()
         if not nxt:
+            blocked_reason = "no_standby_available"
             break
         sid = str(nxt.get("id") or "").strip()
         if not sid:
+            blocked_reason = "empty_slot_id"
             break
         if not _schedule_cycle(sid, reason=reason):
-            # Đạt giới hạn song song Sync, hoặc slot đã chạy — phần còn lại chain sau khi cycle xong
+            # Đạt giới hạn Sync song song / slot busy — chain sẽ bù tiếp sau cycle
+            blocked_reason = "schedule_blocked_busy_or_parallel_cap"
             break
         started.append(sid)
 
     have_after = _count_active_or_starting_gens()
+    need = max(0, target - have_before)
     if started:
         _log(
             "info",
@@ -319,14 +342,23 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
                 f"đang mở/nhận {have_after} · start {', '.join(started)} ({reason})"
             ),
         )
+    elif need > 0:
+        _log(
+            "info",
+            (
+                f"Bù Gen CDP: cần +{need} (have={have_before} → target={target}) "
+                f"nhưng chưa start — {blocked_reason or 'unknown'} ({reason})"
+            ),
+        )
     return {
         "ok": True,
         "target": target,
         "have_before": have_before,
         "have": have_after,
-        "need": max(0, target - have_before),
+        "need": need,
         "started": started,
         "started_count": len(started),
+        "blocked_reason": blocked_reason or None,
     }
 
 
@@ -350,7 +382,11 @@ def _schedule_cycle(slot_id: str, *, reason: str = "") -> bool:
             prole = ps.role if ps and ps.role in ("bridge", "center") else "bridge"
             if prole != "center":
                 pending_bridge += 1
-        if (_count_running_by_role("bridge") + pending_bridge) >= int(cfg.parallel_gen):
+        busy = _count_running_by_role("bridge") + pending_bridge
+        # Cap Sync song song: tối thiểu 1 để vẫn bù được khi Song song Gen = 0 edge;
+        # bình thường = parallel_gen (cùng ô cấu hình mục tiêu số Gen).
+        cap = max(1, int(cfg.parallel_gen or 0))
+        if busy >= cap:
             return False
 
     _pending_start.add(sid)
