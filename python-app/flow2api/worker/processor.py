@@ -1077,6 +1077,8 @@ class WorkerController:
                     low = str(msg or "").lower()
                     if "offline_auth_expired" in low:
                         switch_label = "offline_auth_expired"
+                    elif "token hết hạn" in low or "token het han" in low or "token expired" in low or "token_expired" in low:
+                        switch_label = "token_expired"
                     elif "invalid authentication credentials" in low:
                         switch_label = "invalid_auth"
                     elif "resource has been exhausted" in low:

@@ -570,7 +570,7 @@ class ExtensionSession:
         broker = get_captcha_broker()
         try:
             token = await broker.request_captcha(
-                action=action, bridge_profile_id=self.profile_id, timeout=30.0
+                action=action, bridge_profile_id=self.profile_id, timeout=60.0
             )
         except RuntimeError as exc:
             err = str(exc or "")

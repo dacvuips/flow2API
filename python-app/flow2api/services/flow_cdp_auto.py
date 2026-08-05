@@ -21,6 +21,7 @@ _DEFAULT_FLOW_URL = "https://labs.google/fx/vi/tools/flow"
 _lock = asyncio.Lock()
 _scheduler_task: asyncio.Task | None = None
 _running: dict[str, dict[str, Any]] = {}  # slot_id -> meta
+_pending_start: set[str] = set()  # đã schedule, chưa vào cycle
 _logs: list[dict[str, Any]] = []
 _MAX_LOGS = 80
 _fail_cooldown_until: dict[str, float] = {}  # slot_id -> unix ts
@@ -158,7 +159,8 @@ def auto_status() -> dict[str, Any]:
         "hint": (
             "Nút «Chạy CDP tiếp theo»: lấy CDP Gen ngay dưới các profile đang bật Nhận job "
             "→ Sync cookies → bật Nhận job. "
-            "Khi lịch bật và gen gặp lỗi tài khoản (auth hết hạn / quota) → Ngừng job profile lỗi → mở CDP Gen "
+            "Sau «Lưu cấu hình»: nếu số Gen đang nhận job < Song song Gen CDP → tự mở CDP standby cho đủ. "
+            "Khi lịch bật và gen gặp lỗi tài khoản (auth hết hạn / Token hết hạn / quota) → Ngừng job profile lỗi → mở CDP Gen "
             "tiếp theo trên danh sách (ngay dưới profile vừa lỗi). "
             "HTTP 403/429 thoáng qua không đổi Gen."
         ),
@@ -191,16 +193,23 @@ def _last_activated_gen_index(slots: list[dict[str, Any]]) -> int:
     return last
 
 
+def _is_cycle_busy(slot_id: str) -> bool:
+    sid = str(slot_id or "").strip()
+    return bool(sid and (sid in _running or sid in _pending_start))
+
+
 def _next_gen_standby_after(
     slots: list[dict[str, Any]],
     *,
     after_index: int,
     exclude_profile_id: str = "",
     skip_running: bool = False,
+    skip_cooldown: bool = False,
 ) -> dict[str, Any] | None:
     """CDP Gen standby đầu tiên nằm dưới after_index (không lấy profile phía trên)."""
     exclude = str(exclude_profile_id or "").strip()
     start = max(-1, int(after_index))
+    now = time.time()
     for s in slots[start + 1 :]:
         if not s.get("enabled"):
             continue
@@ -212,7 +221,9 @@ def _next_gen_standby_after(
             continue
         if exclude and (linked == exclude or sid == exclude):
             continue
-        if skip_running and sid in _running:
+        if skip_running and _is_cycle_busy(sid):
+            continue
+        if skip_cooldown and _fail_cooldown_until.get(sid, 0) > now:
             continue
         # Đã bật nhận job → bỏ qua, tìm standby phía dưới
         if s.get("dispatch_enabled"):
@@ -233,6 +244,7 @@ def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
         slots,
         after_index=start_idx,
         exclude_profile_id=exclude,
+        skip_cooldown=True,
     )
 
 
@@ -244,13 +256,84 @@ def find_next_cdp_to_run() -> dict[str, Any] | None:
         slots,
         after_index=start_idx,
         skip_running=True,
+        skip_cooldown=True,
     )
+
+
+def _count_active_or_starting_gens() -> int:
+    """Số Gen đang nhận job / đã bật dispatch / đang chạy (hoặc sắp chạy) cycle auto."""
+    n = 0
+    for s in ordered_auto_slots():
+        if not s.get("enabled"):
+            continue
+        if (s.get("role") or "bridge") == "center":
+            continue
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        if _is_cycle_busy(sid) or s.get("dispatch_enabled") or s.get("accepting_jobs"):
+            n += 1
+    return n
+
+
+def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[str, Any]:
+    """
+    Bù CDP Gen standby đến khi số Gen đang hoạt động / đang mở >= Song song Gen CDP.
+    Gọi sau Lưu cấu hình (và chain sau mỗi cycle thành công nếu còn thiếu).
+    """
+    cfg = get_flow_cdp_auto_settings()
+    target = int(cfg.parallel_gen or 0)
+    if target <= 0:
+        return {
+            "ok": True,
+            "target": 0,
+            "have": 0,
+            "need": 0,
+            "started": [],
+            "skipped": "target_zero",
+        }
+
+    started: list[str] = []
+    have_before = _count_active_or_starting_gens()
+    for _ in range(max(1, target) + 2):
+        have = _count_active_or_starting_gens()
+        if have >= target:
+            break
+        nxt = find_next_cdp_to_run()
+        if not nxt:
+            break
+        sid = str(nxt.get("id") or "").strip()
+        if not sid:
+            break
+        if not _schedule_cycle(sid, reason=reason):
+            # Đạt giới hạn song song Sync, hoặc slot đã chạy — phần còn lại chain sau khi cycle xong
+            break
+        started.append(sid)
+
+    have_after = _count_active_or_starting_gens()
+    if started:
+        _log(
+            "info",
+            (
+                f"Bù Gen CDP: mục tiêu {target} · trước {have_before} · "
+                f"đang mở/nhận {have_after} · start {', '.join(started)} ({reason})"
+            ),
+        )
+    return {
+        "ok": True,
+        "target": target,
+        "have_before": have_before,
+        "have": have_after,
+        "need": max(0, target - have_before),
+        "started": started,
+        "started_count": len(started),
+    }
 
 
 def _schedule_cycle(slot_id: str, *, reason: str = "") -> bool:
     """Start run_auto_cycle_for_slot in background if not already running."""
     sid = str(slot_id or "").strip()
-    if not sid or sid in _running:
+    if not sid or _is_cycle_busy(sid):
         return False
     cfg = get_flow_cdp_auto_settings()
     role = "bridge"
@@ -261,20 +344,41 @@ def _schedule_cycle(slot_id: str, *, reason: str = "") -> bool:
         if _count_running_by_role("center") >= int(cfg.parallel_center):
             return False
     else:
-        if _count_running_by_role("bridge") >= int(cfg.parallel_gen):
+        pending_bridge = 0
+        for psid in _pending_start:
+            ps = get_flow_cdp_slot(psid)
+            prole = ps.role if ps and ps.role in ("bridge", "center") else "bridge"
+            if prole != "center":
+                pending_bridge += 1
+        if (_count_running_by_role("bridge") + pending_bridge) >= int(cfg.parallel_gen):
             return False
 
-    async def _job(slot_id: str = sid) -> None:
-        result = await run_auto_cycle_for_slot(slot_id)
-        if result.get("ok"):
-            _fail_cooldown_until.pop(slot_id, None)
-            _log("info", f"Sync xong {slot_id} (trigger: {reason or 'manual'})", slot_id=slot_id)
-        else:
-            _fail_cooldown_until[slot_id] = time.time() + _FAIL_COOLDOWN_S
+    _pending_start.add(sid)
+
+    async def _job(slot_id: str = sid, job_reason: str = reason) -> None:
+        try:
+            result = await run_auto_cycle_for_slot(slot_id)
+            if result.get("ok"):
+                _fail_cooldown_until.pop(slot_id, None)
+                _log(
+                    "info",
+                    f"Sync xong {slot_id} (trigger: {job_reason or 'manual'})",
+                    slot_id=slot_id,
+                )
+            else:
+                _fail_cooldown_until[slot_id] = time.time() + _FAIL_COOLDOWN_S
+        finally:
+            _pending_start.discard(slot_id)
+            # Tiếp tục bù Gen nếu Song song Gen CDP > số profile đang hoạt động
+            try:
+                ensure_gen_slots_for_parallel(reason=f"chain:{job_reason or 'cycle'}")
+            except Exception as exc:
+                logger.debug("chain ensure_gen_slots_for_parallel: %s", exc)
 
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        _pending_start.discard(sid)
         return False
     loop.create_task(_job())
     return True
@@ -287,7 +391,7 @@ async def on_profile_http_block(
 ) -> dict[str, Any]:
     """
     Khi gen gặp lỗi tài khoản thật (không phải 403/429 thoáng qua):
-    - invalid authentication credentials / offline_auth_expired / quota exhausted
+    - invalid authentication credentials / offline_auth_expired / Token hết hạn / quota exhausted
     - Ngừng nhận job profile lỗi
     - Mở CDP Gen tiếp theo trên danh sách (ngay dưới profile vừa lỗi)
       → Sync + bật Nhận job
@@ -341,7 +445,7 @@ async def on_profile_http_block(
             "next_slot_id": next_id,
             "error": "next_slot_cooldown",
         }
-    if next_id in _running:
+    if _is_cycle_busy(next_id):
         return {
             "ok": True,
             "failed_profile_id": pid,
@@ -760,18 +864,34 @@ async def save_settings_and_nudge(**fields: Any) -> dict[str, Any]:
         apply_job_parallel_to_enabled_slots()
     except Exception as exc:
         _log("error", f"apply job_parallel on save: {exc}")
+    fill: dict[str, Any] = {}
+    try:
+        # Số Gen đang hoạt động < Song song Gen CDP → mở CDP tiếp theo cho đủ
+        fill = ensure_gen_slots_for_parallel(reason="save_settings")
+    except Exception as exc:
+        _log("error", f"ensure gen slots on save: {exc}")
+        fill = {"ok": False, "error": str(exc)}
     ensure_scheduler()
-    return auto_status()
+    status = auto_status()
+    if fill:
+        status["fill_parallel"] = fill
+    return status
 
 
 async def set_enabled(enabled: bool) -> dict[str, Any]:
     save_flow_cdp_auto_settings(enabled=bool(enabled))
+    fill: dict[str, Any] = {}
     if enabled:
         _fail_cooldown_until.clear()
         try:
             apply_job_parallel_to_enabled_slots()
         except Exception as exc:
             _log("error", f"apply job_parallel on enable: {exc}")
+        try:
+            fill = ensure_gen_slots_for_parallel(reason="enable_auto")
+        except Exception as exc:
+            _log("error", f"ensure gen slots on enable: {exc}")
+            fill = {"ok": False, "error": str(exc)}
         _log(
             "info",
             "Đã BẬT lịch auto CDP (lỗi tài khoản → mở CDP Gen kế tiếp; 403/429 tạm không đổi Gen)",
@@ -779,14 +899,17 @@ async def set_enabled(enabled: bool) -> dict[str, Any]:
     else:
         _log("info", "Đã TẮT lịch auto CDP")
     ensure_scheduler()
-    return auto_status()
+    status = auto_status()
+    if fill:
+        status["fill_parallel"] = fill
+    return status
 
 
 async def run_one_now(slot_id: str) -> dict[str, Any]:
     sid = str(slot_id or "").strip()
     if not sid:
         return {"ok": False, "error": "missing_slot_id"}
-    if sid in _running:
+    if _is_cycle_busy(sid):
         return {"ok": False, "error": "already_running", "message": f"{sid} đang chạy"}
     result = await run_auto_cycle_for_slot(sid)
     return {**result, "status": auto_status()}
@@ -807,7 +930,7 @@ async def run_next_now() -> dict[str, Any]:
         }
     sid = str(nxt.get("id") or "").strip()
     email = str(nxt.get("email") or "").strip()
-    if sid in _running:
+    if _is_cycle_busy(sid):
         return {
             "ok": False,
             "error": "already_running",

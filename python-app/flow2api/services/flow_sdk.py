@@ -1494,6 +1494,11 @@ def _text_has_profile_switch_marker(text: str) -> bool:
         return True
     if "RESOURCE HAS BEEN EXHAUSTED" in upper:
         return True
+    # UI / log: "Token hết hạn" (có/không dấu) + English variants
+    if "TOKEN HẾT HẠN" in upper or "TOKEN HET HAN" in upper:
+        return True
+    if "TOKEN EXPIRED" in upper or "TOKEN_EXPIRED" in upper:
+        return True
     return False
 
 

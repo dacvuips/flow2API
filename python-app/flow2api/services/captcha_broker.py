@@ -74,7 +74,7 @@ def compute_fixed_pairs(
 # ── Timing constants (parity với veo3-captcha-extension) ────────────────
 POLL_TIMEOUT_S = 25.0            # long-poll: server giữ tối đa 25s nếu không có command
 CENTER_STALE_S = 45.0            # center không heartbeat quá 45s → offline
-DEFAULT_REQUEST_TIMEOUT_S = 30.0 # broker.request_captcha total timeout
+DEFAULT_REQUEST_TIMEOUT_S = 60.0 # broker.request_captcha total timeout
 PICK_CENTER_MAX_WAIT_S = 12.0    # chờ center sẵn sàng khi cooldown / chưa poll lại
 HARD_RESET_EVERY_N_SOLVES = 20   # combined trigger: N solves
 HARD_RESET_EVERY_S = 600.0       # combined trigger: mỗi 10 phút
