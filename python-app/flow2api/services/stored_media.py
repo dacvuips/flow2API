@@ -598,6 +598,8 @@ async def materialize_request_video(
     request_id: str,
     index: int = 0,
     result: dict[str, Any] | None = None,
+    *,
+    clean_watermarks: bool = True,
 ) -> Optional[Path]:
     """Ensure OUTPUTS/{request_id}/*.mp4 exists — fetch via media_id if needed."""
     existing = resolve_stored_video_path(request_id, index)
@@ -608,46 +610,80 @@ async def materialize_request_video(
     if not payload:
         return None
 
+    needs_clean = False
+
     apply_video_public_urls(request_id, payload)
     existing = resolve_stored_video_path(request_id, index)
     if existing:
-        return existing
-
-    if await _persist_videos(request_id, payload):
+        needs_clean = True
+    elif await _persist_videos(request_id, payload):
         existing = resolve_stored_video_path(request_id, index)
-        if existing:
-            return existing
+        needs_clean = existing is not None
 
-    media_ids = [str(m) for m in (payload.get("media_ids") or []) if str(m).strip()]
-    if not media_ids:
-        return None
+    if not existing:
+        media_ids = [str(m) for m in (payload.get("media_ids") or []) if str(m).strip()]
+        if not media_ids:
+            return None
 
-    targets: list[tuple[int, str]] = []
-    if index < len(media_ids):
-        targets = [(index, media_ids[index])]
-    elif index == 0:
-        targets = [(i, mid) for i, mid in enumerate(media_ids)]
+        targets: list[tuple[int, str]] = []
+        if index < len(media_ids):
+            targets = [(index, media_ids[index])]
+        elif index == 0:
+            targets = [(i, mid) for i, mid in enumerate(media_ids)]
 
-    out_dir = output_dir(request_id)
-    for idx, mid in targets:
-        data = await _video_bytes_from_source(f"/media/{mid}", mid)
-        if not data:
-            for url in payload.get("video_urls") or []:
-                u = str(url or "").strip()
-                if u.startswith(("http://", "https://")):
-                    data = await _video_bytes_from_source(u, mid)
-                    if data:
-                        break
-        if not data:
-            continue
-        out_dir.mkdir(parents=True, exist_ok=True)
-        filename = "video.mp4" if len(media_ids) <= 1 else f"{idx}.mp4"
-        dest = out_dir / filename
-        dest.write_bytes(data)
-        if idx == index:
-            return dest
+        out_dir = output_dir(request_id)
+        for idx, mid in targets:
+            data = await _video_bytes_from_source(f"/media/{mid}", mid)
+            if not data:
+                for url in payload.get("video_urls") or []:
+                    u = str(url or "").strip()
+                    if u.startswith(("http://", "https://")):
+                        data = await _video_bytes_from_source(u, mid)
+                        if data:
+                            break
+            if not data:
+                continue
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filename = "video.mp4" if len(media_ids) <= 1 else f"{idx}.mp4"
+            dest = out_dir / filename
+            dest.write_bytes(data)
+            needs_clean = True
+            if idx == index:
+                existing = dest
 
-    return resolve_stored_video_path(request_id, index)
+        if not existing:
+            existing = resolve_stored_video_path(request_id, index)
+
+    if existing and needs_clean and clean_watermarks:
+        await _run_watermark_gateway(request_id, payload, is_video=True)
+        existing = resolve_stored_video_path(request_id, index) or existing
+
+    return existing
+
+
+async def _run_watermark_gateway(
+    request_id: str,
+    out: dict[str, Any],
+    *,
+    is_video: bool,
+) -> dict[str, Any]:
+    """Strip visible Gemini/Flow marks from cached outputs; keep public URL shape."""
+    from flow2api.services.watermark_gateway import clean_request_outputs
+
+    try:
+        stats = await clean_request_outputs(
+            request_id, output_dir(request_id), is_video=is_video
+        )
+        if stats.get("enabled") and (stats.get("cleaned") or stats.get("failed")):
+            out["watermark_cleaned"] = bool(stats.get("cleaned"))
+            out["watermark_stats"] = {
+                "cleaned": stats.get("cleaned", 0),
+                "failed": stats.get("failed", 0),
+                "elapsed_seconds": stats.get("elapsed_seconds", 0),
+            }
+    except Exception as exc:
+        logger.warning("watermark gateway failed %s: %s", request_id[:12], exc)
+    return out
 
 
 async def persist_task_result(
@@ -655,7 +691,7 @@ async def persist_task_result(
     result: dict[str, Any],
     task_type: str,
 ) -> dict[str, Any]:
-    """Cache media on disk and expose stable public /image or /video URLs."""
+    """Cache media on disk, clean watermarks, expose stable public /image|/video URLs."""
     if not isinstance(result, dict) or not _safe_request_id(request_id):
         return result
 
@@ -674,15 +710,20 @@ async def persist_task_result(
 
     if is_video:
         if not resolve_stored_video_path(request_id, 0):
-            materialized = await materialize_request_video(request_id, 0, out)
+            materialized = await materialize_request_video(
+                request_id, 0, out, clean_watermarks=False
+            )
             if not materialized:
                 logger.warning(
                     "video not materialized for %s (media_ids=%s)",
                     request_id[:12],
                     [str(m)[:8] for m in (out.get("media_ids") or [])[:3]],
                 )
+        if resolve_stored_video_path(request_id, 0):
+            out = await _run_watermark_gateway(request_id, out, is_video=True)
         out = finalize_video_result_urls(request_id, out)
     else:
+        out = await _run_watermark_gateway(request_id, out, is_video=False)
         out = finalize_image_result_urls(request_id, out)
 
     return normalize_publisher_urls(out)

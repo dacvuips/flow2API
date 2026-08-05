@@ -183,6 +183,32 @@ PUBLIC_BASE_URL = get_public_base_url()
 # How long generated outputs stay on disk (default 6 hours).
 MEDIA_STORE_TTL_S = int(os.environ.get("FLOW2API_MEDIA_STORE_TTL_S", str(6 * 3600)))
 
+# Post-generation watermark gateway.
+# Images: Erasio reverse-blend (all-tool remove-flow-watermark).
+# Videos: OpenMark fixed-region inpaint/crop (unchanged).
+# After media is cached, files are cleaned in-place before status=done.
+# Client URLs (/image/{id}, /video/{id}) and result shape stay the same.
+WATERMARK_CLEAN_ENABLED = os.environ.get("FLOW2API_WATERMARK_CLEAN", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Video: "inpaint" (Telea on logo rectangle) or "crop" (trim right/bottom + scale).
+WATERMARK_VIDEO_MODE = os.environ.get("FLOW2API_WATERMARK_VIDEO_MODE", "crop").strip().lower()
+# Normalized right,bottom crop when mode=crop (Flow/Veo edge logo default).
+WATERMARK_VIDEO_CROP = os.environ.get("FLOW2API_WATERMARK_VIDEO_CROP", "0.035,0.034").strip()
+# Keep original file if cleaner fails (recommended for production).
+WATERMARK_FAIL_SOFT = os.environ.get("FLOW2API_WATERMARK_FAIL_SOFT", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+WATERMARK_STRIP_IMAGE_METADATA = os.environ.get(
+    "FLOW2API_WATERMARK_STRIP_METADATA", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 VIDEOS_DIR = STORAGE_DIR / "videos"
 INPUTS_DIR = STORAGE_DIR / "inputs"
 OUTPUTS_DIR = STORAGE_DIR / "outputs"

@@ -107,6 +107,104 @@ curl -H "Authorization: Bearer f2api_YOUR_KEY" ^
   -o output.jpg
 ```
 
+### Clear watermark (upload base64 → nhận media đã sạch)
+
+Dùng khi frontend **đã có ảnh/video** (file user chọn, hoặc media tải về) và chỉ cần gỡ watermark Gemini/Flow — **không** cần queue generate.
+
+| Endpoint | Mô tả |
+|----------|--------|
+| `POST /api/watermark/clean` | 1 ảnh **hoặc** 1 video (base64) → JSON đồng bộ |
+| `POST /api/watermark/clean-batch` | Nhiều ảnh (`image_base64s`, tối đa 8) |
+
+**Request (ảnh)** — field giống gen (`image_base64`):
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/watermark/clean" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"image_base64\":\"data:image/jpeg;base64,/9j/4AAQ...\",\"return_mode\":\"both\"}"
+```
+
+**Request (video)**:
+
+```bash
+curl -X POST "http://127.0.0.1:1994/api/watermark/clean" ^
+  -H "Authorization: Bearer f2api_YOUR_KEY" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"video_base64\":\"data:video/mp4;base64,AAAA...\",\"return_mode\":\"url\"}"
+```
+
+| Body field | Bắt buộc | Mô tả |
+|------------|----------|--------|
+| `image_base64` | 1 trong 3 | pure base64 **hoặc** `data:image/...;base64,...` |
+| `video_base64` | 1 trong 3 | pure base64 **hoặc** `data:video/mp4;base64,...` |
+| `media_base64` | 1 trong 3 | generic (+ `kind`) |
+| `kind` | không | `image` \| `video` \| `auto` (mặc định auto) |
+| `return_mode` | không | `base64` \| `url` \| `both` (mặc định `both`) |
+
+**Response**:
+
+```json
+{
+  "success": true,
+  "cleaned": true,
+  "kind": "image",
+  "mime_type": "image/jpeg",
+  "media_base64": "<pure base64, không prefix data:>",
+  "image_base64": "<alias của media_base64 khi kind=image>",
+  "url": "https://host/image/REQUEST_ID",
+  "Link": "https://host/image/REQUEST_ID",
+  "image_urls": ["https://host/image/REQUEST_ID"],
+  "request_id": "1785...",
+  "ncc": 0.45,
+  "elapsed_seconds": 0.32,
+  "message": "Watermark removed."
+}
+```
+
+- `cleaned=false` → không detect mark; media trả về vẫn dùng được (gốc).
+- `return_mode=url` gợi ý cho video dài (tránh JSON base64 quá lớn).
+- Ảnh: Erasio (all-tool). Video: mode `FLOW2API_WATERMARK_VIDEO_MODE` (`crop` / `inpaint`).
+- Giới hạn: ảnh ≤ 30MB, video ≤ 120MB.
+
+**Python (frontend / script)**:
+
+```python
+import base64, mimetypes, requests
+
+API = "http://127.0.0.1:1994"
+TOKEN = "f2api_..."
+
+def file_to_data_url(path: str) -> str:
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+# Ảnh
+r = requests.post(
+    f"{API}/api/watermark/clean",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"image_base64": file_to_data_url("input.jpg"), "return_mode": "both"},
+    timeout=120,
+)
+r.raise_for_status()
+data = r.json()
+print(data["cleaned"], data.get("url"), data.get("ncc"))
+if data.get("media_base64"):
+    with open("clean.jpg", "wb") as f:
+        f.write(base64.b64decode(data["media_base64"]))
+
+# Video (nên return_mode=url)
+r = requests.post(
+    f"{API}/api/watermark/clean",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"video_base64": file_to_data_url("input.mp4"), "return_mode": "url"},
+    timeout=600,
+)
+print(r.json().get("url"))
+```
+
 ### Tải ảnh 2K / 4K (upscale)
 
 Sau khi tạo ảnh xong, gọi upscale với `target_resolution`:
@@ -240,6 +338,21 @@ Tunnel trỏ domain (ví dụ `flow2.aitipmart.site`) → `http://127.0.0.1:1994
 | `FLOW2API_ADMIN_USER` | `admin` |
 | `FLOW2API_ADMIN_PASSWORD` | `admin` |
 | `FLOW2API_DB` | `python-app/storage/flow2api.db` |
+| `FLOW2API_WATERMARK_CLEAN` | `1` (bật gateway xóa watermark Gemini/Veo sau generate) |
+| `FLOW2API_WATERMARK_VIDEO_MODE` | `inpaint` (`crop` = cắt mép phải/dưới) |
+| `FLOW2API_WATERMARK_VIDEO_CROP` | `0.035,0.034` (khi mode=crop) |
+| `FLOW2API_WATERMARK_FAIL_SOFT` | `1` (giữ file gốc nếu clean lỗi) |
+| `FLOW2API_FFMPEG` / `OPENMARK_FFMPEG` | tùy chọn — mặc định dùng `imageio-ffmpeg` (cài cùng `install.bat`) |
+
+## Watermark gateway
+
+Sau khi generate/upscale **thành công**, media được tải về `storage/outputs/{request_id}/` rồi chạy engine OpenMark-compatible (OpenCV Telea / crop) **trước** khi `status=done`.
+
+- Client API **không đổi**: `image_urls` / `video_urls` / `Link` / `/image/{id}` / `/video/{id}` vẫn như cũ, nhưng bytes đã sạch mark.
+- Ảnh: **Erasio reverse-blend** (port từ all-tool) — detect sparkle Gemini/Flow 48/96 + reverse alpha.
+- Video: preset Flow/Veo góc dưới-phải. FFmpeg được cài cùng `install.bat` qua package `imageio-ffmpeg` (không cần cài FFmpeg hệ thống).
+- Tắt: `set FLOW2API_WATERMARK_CLEAN=0`
+- Video sạch mép hơn (zoom nhẹ): `set FLOW2API_WATERMARK_VIDEO_MODE=crop`
 
 ## So với bản `.exe`
 

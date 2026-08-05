@@ -41,6 +41,7 @@ from flow2api.routes.requests import router as requests_router
 from flow2api.routes.settings import router as settings_router
 from flow2api.routes.system import router as system_router
 from flow2api.routes.worker import router as worker_router
+from flow2api.routes.watermark import router as watermark_router
 from flow2api.services.ws_server import run_ws_server
 from flow2api.services.task_counters import bootstrap_from_requests_if_empty
 from flow2api.services.task_retention import purge_storage
@@ -250,6 +251,7 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     app.include_router(requests_router)
+    app.include_router(watermark_router)
     app.include_router(auth_router)
     app.include_router(activity_router)
     app.include_router(admin_router)
