@@ -63,6 +63,7 @@ def _profiles_payload() -> list[dict[str, Any]]:
 @router.get("/slots")
 async def flow_cdp_slots_list(
     auto_attach: bool = True,
+    probe: bool = True,
     _: int = Depends(auth_key_id),
 ):
     # auto_attach chạy nền — tránh block list → Cloudflare 502/524
@@ -75,32 +76,55 @@ async def flow_cdp_slots_list(
 
         asyncio.create_task(_bg_attach())
 
-    # Probe CDP song song trên thread — cap thời gian để không bị gateway 502
+    # probe=false: chỉ DB/settings (ms) — dashboard tasks không phụ thuộc check CDP
+    if not probe:
+        try:
+            profiles = await asyncio.to_thread(lambda: flow_cdp_public_status(probe=False))
+        except Exception as exc:
+            logger.warning("flow-cdp slots list (no probe) failed: %s", exc)
+            raise HTTPException(503, f"flow_cdp_list_failed: {exc}") from exc
+        return {
+            "ok": True,
+            "slots": profiles,
+            "settings": get_flow_cdp_settings().to_dict(),
+            "profiles": profiles,
+            "probed": False,
+            "hint": (
+                "Thêm CDP → Mở CDP → Login Google → tắt CDP. "
+                "Chỉ lưu email + profile (Chrome user-data). "
+                "Cookies/token lấy khi Sync session hoặc Auto generate."
+            ),
+        }
+
+    # Probe CDP trên thread — cap thời gian để không bị gateway 502
     probe_timeout = max(4.0, min(18.0, float(HTTP_HANDLER_TIMEOUT_S or 25) * 0.7))
     try:
         profiles = await asyncio.wait_for(
-            asyncio.to_thread(flow_cdp_public_status),
+            asyncio.to_thread(lambda: flow_cdp_public_status(probe=True)),
             timeout=probe_timeout,
         )
     except asyncio.TimeoutError:
         logger.warning("flow-cdp slots list probe timeout (%.0fs) — trả danh sách không probe", probe_timeout)
-        from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
+        try:
+            profiles = await asyncio.to_thread(lambda: flow_cdp_public_status(probe=False))
+        except Exception:
+            from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
 
-        profiles = []
-        for s in list_flow_cdp_slots():
-            d = s.to_dict()
-            d.update(
-                {
-                    "profile_id": s.id,
-                    "display_name": s.email or s.label or s.id,
-                    "email": s.email or "",
-                    "online": False,
-                    "cdp_alive": False,
-                    "ready": bool(s.email),
-                    "probe_skipped": True,
-                }
-            )
-            profiles.append(d)
+            profiles = []
+            for s in list_flow_cdp_slots():
+                d = s.to_dict()
+                d.update(
+                    {
+                        "profile_id": s.id,
+                        "display_name": s.email or s.label or s.id,
+                        "email": s.email or "",
+                        "online": False,
+                        "cdp_alive": False,
+                        "ready": bool(s.email),
+                        "probe_skipped": True,
+                    }
+                )
+                profiles.append(d)
     except Exception as exc:
         logger.warning("flow-cdp slots list failed: %s", exc)
         raise HTTPException(503, f"flow_cdp_list_failed: {exc}") from exc
@@ -110,6 +134,7 @@ async def flow_cdp_slots_list(
         "slots": profiles,
         "settings": get_flow_cdp_settings().to_dict(),
         "profiles": profiles,
+        "probed": True,
         "hint": (
             "Thêm CDP → Mở CDP → Login Google → tắt CDP. "
             "Chỉ lưu email + profile (Chrome user-data). "

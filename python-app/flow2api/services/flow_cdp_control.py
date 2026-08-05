@@ -86,8 +86,12 @@ def _attach_email_to_slot(slot_id: str, email: str, *, profile_id: str = "") -> 
     return em
 
 
-def flow_cdp_public_status(slot_id: str | None = None) -> list[dict[str, Any]]:
-    """List slots with live CDP alive flag (sync, cheap)."""
+def flow_cdp_public_status(
+    slot_id: str | None = None,
+    *,
+    probe: bool = True,
+) -> list[dict[str, Any]]:
+    """List slots. probe=True pings each CDP (can be slow); False = DB/settings only."""
     from flow2api.services.cookie_service import has_stored_cookies
     from flow2api.services.flow_profile_service import get_profile_row
 
@@ -98,7 +102,7 @@ def flow_cdp_public_status(slot_id: str | None = None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for s in slots:
         cdp = s.cdp_url()
-        alive = system_ops.cdp_endpoint_alive(cdp)
+        alive = system_ops.cdp_endpoint_alive(cdp) if probe else False
         pid = s.profile_id()
         row = get_profile_row(pid)
         email = (s.email or (row.email if row else "") or "").strip()
@@ -106,23 +110,24 @@ def flow_cdp_public_status(slot_id: str | None = None) -> list[dict[str, Any]]:
         has_token = bool(row and row.access_token_enc)
         role_label = "Gen (Img/Vid)" if s.role == "bridge" else "Captcha Center"
         display = email or s.label or s.id
-        out.append(
-            {
-                **s.to_dict(),
-                "profile_id": s.id,
-                "display_name": display,
-                "email": email,
-                "online": alive,
-                "cdp_alive": alive,
-                "ready": bool(has_cookies or has_token) or (alive and bool(email)),
-                "has_cookies": has_cookies,
-                "has_token": has_token,
-                "offline_gen_ready": has_cookies and has_token,
-                "role_label": role_label,
-                "transport": "cdp",
-                "logged_in": bool(email),
-            }
-        )
+        item = {
+            **s.to_dict(),
+            "profile_id": s.id,
+            "display_name": display,
+            "email": email,
+            "online": alive,
+            "cdp_alive": alive,
+            "ready": bool(has_cookies or has_token) or (alive and bool(email)),
+            "has_cookies": has_cookies,
+            "has_token": has_token,
+            "offline_gen_ready": has_cookies and has_token,
+            "role_label": role_label,
+            "transport": "cdp",
+            "logged_in": bool(email),
+        }
+        if not probe:
+            item["probe_skipped"] = True
+        out.append(item)
     return out
 
 
