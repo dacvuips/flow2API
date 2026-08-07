@@ -8,9 +8,9 @@ Captcha Center chạy ở các Chrome profile riêng (labs.google/fx/tools/flow 
 — mỗi profile là 1 "center" độc lập, mint token qua grecaptcha.enterprise.execute.
 
 Chính sách:
-- Gắn cặp cố định Center ↔ Bridge (không chồng chéo): sort ổn định theo label/id,
-  1:1 khi số lượng bằng nhau; bên thừa gắn hết vào phần tử cuối của bên ít hơn.
-  VD 3 Center + 2 Bridge → C1↔B1, C2↔B2, C3↔B2.
+- Gắn cặp Center ↔ Bridge chia đều (round-robin), không dồn hết vào phần tử cuối.
+  VD 2 Center + 4 Bridge → C1↔B1,B3 · C2↔B2,B4 (mỗi center 2 bridge).
+  VD 3 Center + 2 Bridge → C1,C3↔B1 · C2↔B2.
 - Chỉ gắn cặp Center online với Bridge đang nhận job VÀ sẵn sàng (ready),
   gồm cả offline-gen / Direct HTTP — không bắt buộc extension WS online.
 - Trong nhóm center đã gắn với Bridge: LRU + skip cooldown.
@@ -43,31 +43,26 @@ def compute_fixed_pairs(
     center_ids: list[str],
     bridge_ids: list[str],
 ) -> list[tuple[str, str]]:
-    """Gắn cặp cố định, không chồng chéo (contiguous overflow).
+    """Gắn cặp Center ↔ Bridge chia đều (round-robin).
 
     - n == m → zip 1:1
-    - n > m  → m-1 cặp đầu 1:1, mọi center còn lại gắn bridge cuối
-    - m > n  → n-1 cặp đầu 1:1, mọi bridge còn lại gắn center cuối
+    - m > n (nhiều Bridge hơn Center) → rải Bridge lần lượt lên các Center
+      VD 2C + 4B → C0↔B0,B2 · C1↔B1,B3  (mỗi Center 2 Bridge)
+    - n > m (nhiều Center hơn Bridge) → rải Center lần lượt lên các Bridge
+      VD 3C + 2B → B0↔C0,C2 · B1↔C1
     """
     n, m = len(center_ids), len(bridge_ids)
     if n == 0 or m == 0:
         return []
     pairs: list[tuple[str, str]] = []
-    if n == m:
-        for i in range(n):
-            pairs.append((center_ids[i], bridge_ids[i]))
-    elif n > m:
-        for i in range(m - 1):
-            pairs.append((center_ids[i], bridge_ids[i]))
-        last_b = bridge_ids[m - 1]
-        for i in range(m - 1, n):
-            pairs.append((center_ids[i], last_b))
+    if m >= n:
+        # Nhiều / bằng Bridge: mỗi Bridge gắn 1 Center, chia vòng cho đều load
+        for i, bid in enumerate(bridge_ids):
+            pairs.append((center_ids[i % n], bid))
     else:
-        for i in range(n - 1):
-            pairs.append((center_ids[i], bridge_ids[i]))
-        last_c = center_ids[n - 1]
-        for i in range(n - 1, m):
-            pairs.append((last_c, bridge_ids[i]))
+        # Nhiều Center hơn Bridge: mỗi Center gắn 1 Bridge, chia vòng
+        for i, cid in enumerate(center_ids):
+            pairs.append((cid, bridge_ids[i % m]))
     return pairs
 
 
