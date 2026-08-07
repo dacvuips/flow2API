@@ -249,7 +249,7 @@ async def update_profile_dispatch(
     if not pool.get(profile_id):
         raise HTTPException(404, "profile_not_found")
     try:
-        saved = set_profile_dispatch_enabled(profile_id, body.enabled)
+        saved = set_profile_dispatch_enabled(profile_id, body.enabled, source="manual")
     except ValueError as exc:
         raise HTTPException(400, "invalid_profile_id") from exc
     requeued = 0
@@ -260,6 +260,19 @@ async def update_profile_dispatch(
             )
         except Exception:
             requeued = 0
+        # User tắt tay: KHÔNG gọi on_profile_http_block / không auto mở CDP
+        try:
+            from flow2api.services.flow_cdp_auto import _log as auto_log
+
+            auto_log(
+                "info",
+                (
+                    f"User Ngừng job thủ công {profile_id} — "
+                    "không auto mở CDP thay (chỉ lỗi TK/token mới đổi Gen)"
+                ),
+            )
+        except Exception:
+            pass
     from flow2api.services import system_ops
 
     await system_ops.push_dispatch_to_profile(profile_id, body.enabled)

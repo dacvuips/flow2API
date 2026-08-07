@@ -23,6 +23,8 @@ class WorkerSettings:
     profile_default_max_concurrent: int = 1
     profile_limits: dict[str, int] = field(default_factory=dict)
     profile_dispatch_disabled: list[str] = field(default_factory=list)
+    # User click «Ngừng job» — auto CDP không thay thế / không mở lại
+    profile_manual_dispatch_off: list[str] = field(default_factory=list)
     profile_credit_allowed: list[str] = field(default_factory=list)
     profile_image_allowed: list[str] = field(default_factory=list)
     profile_video_allowed: list[str] = field(default_factory=list)
@@ -44,6 +46,11 @@ class WorkerSettings:
             for pid in self.profile_dispatch_disabled:
                 if pid and not str(pid).startswith("_"):
                     disabled.append(str(pid))
+        manual_off: list[str] = []
+        if isinstance(self.profile_manual_dispatch_off, list):
+            for pid in self.profile_manual_dispatch_off:
+                if pid and not str(pid).startswith("_"):
+                    manual_off.append(str(pid))
         credit_allowed: list[str] = []
         if isinstance(self.profile_credit_allowed, list):
             for pid in self.profile_credit_allowed:
@@ -75,6 +82,7 @@ class WorkerSettings:
             profile_default_max_concurrent=default_p,
             profile_limits=limits,
             profile_dispatch_disabled=sorted(set(disabled)),
+            profile_manual_dispatch_off=sorted(set(manual_off)),
             profile_credit_allowed=sorted(set(credit_allowed)),
             profile_image_allowed=sorted(set(image_allowed)),
             profile_video_allowed=sorted(set(video_allowed)),
@@ -90,6 +98,7 @@ class WorkerSettings:
             "profile_default_max_concurrent": n.profile_default_max_concurrent,
             "profile_limits": dict(n.profile_limits),
             "profile_dispatch_disabled": list(n.profile_dispatch_disabled),
+            "profile_manual_dispatch_off": list(n.profile_manual_dispatch_off),
             "profile_credit_allowed": list(n.profile_credit_allowed),
             "profile_image_allowed": list(n.profile_image_allowed),
             "profile_video_allowed": list(n.profile_video_allowed),
@@ -146,12 +155,16 @@ def _load_file() -> WorkerSettings | None:
     captcha_forgotten = raw.get("captcha_center_forgotten") or []
     if not isinstance(captcha_forgotten, list):
         captcha_forgotten = []
+    manual_off = raw.get("profile_manual_dispatch_off") or []
+    if not isinstance(manual_off, list):
+        manual_off = []
     return WorkerSettings(
         max_concurrent=int(raw.get("max_concurrent", 1)),
         task_stagger_s=float(raw.get("task_stagger_s", 0)),
         profile_default_max_concurrent=int(raw.get("profile_default_max_concurrent", 1)),
         profile_limits={str(k): int(v) for k, v in limits.items()},
         profile_dispatch_disabled=[str(x) for x in disabled],
+        profile_manual_dispatch_off=[str(x) for x in manual_off],
         profile_credit_allowed=[str(x) for x in credit_allowed],
         profile_image_allowed=[str(x) for x in image_allowed],
         profile_video_allowed=[str(x) for x in video_allowed],
@@ -216,10 +229,12 @@ def forget_profile(profile_id: str) -> WorkerSettings:
     credit = [x for x in current.profile_credit_allowed if x != pid]
     image = [x for x in current.profile_image_allowed if x != pid]
     video = [x for x in current.profile_video_allowed if x != pid]
+    manual_off = [x for x in current.profile_manual_dispatch_off if x != pid]
     return save_worker_settings(
         profile_forgotten=forgotten,
         profile_limits=limits,
         profile_dispatch_disabled=disabled,
+        profile_manual_dispatch_off=manual_off,
         profile_credit_allowed=credit,
         profile_image_allowed=image,
         profile_video_allowed=video,
@@ -238,6 +253,7 @@ def purge_profile(profile_id: str) -> WorkerSettings:
         profile_forgotten=[x for x in current.profile_forgotten if x != pid],
         profile_limits=limits,
         profile_dispatch_disabled=[x for x in current.profile_dispatch_disabled if x != pid],
+        profile_manual_dispatch_off=[x for x in current.profile_manual_dispatch_off if x != pid],
         profile_credit_allowed=[x for x in current.profile_credit_allowed if x != pid],
         profile_image_allowed=[x for x in current.profile_image_allowed if x != pid],
         profile_video_allowed=[x for x in current.profile_video_allowed if x != pid],
@@ -279,15 +295,45 @@ def unforget_captcha_center(center_id: str) -> WorkerSettings:
     return save_worker_settings(captcha_center_forgotten=forgotten)
 
 
-def set_profile_dispatch_enabled(profile_id: str, enabled: bool) -> WorkerSettings:
+def set_profile_dispatch_enabled(
+    profile_id: str,
+    enabled: bool,
+    *,
+    source: str = "manual",
+) -> WorkerSettings:
+    """Bật/tắt nhận job.
+
+    source:
+      - ``manual``: user bấm Ngừng/Bật job trên UI — auto CDP không thay thế profile này
+      - ``system``: auto (token/auth/quota/standby) — auto CDP được quyền đổi Gen
+    """
     pid = str(profile_id or "").strip()
     if not pid or pid.startswith("_"):
         raise ValueError("invalid_profile_id")
+    src = str(source or "manual").strip().lower()
+    if src not in ("manual", "system"):
+        src = "manual"
     current = get_worker_settings()
     disabled = [x for x in current.profile_dispatch_disabled if x != pid]
+    manual_off = [x for x in current.profile_manual_dispatch_off if x != pid]
     if not enabled:
         disabled.append(pid)
-    return save_worker_settings(profile_dispatch_disabled=disabled)
+        if src == "manual":
+            manual_off.append(pid)
+        # system off: không đưa vào manual_off (và xóa nếu từng manual)
+    # enabled=True: đã xóa khỏi manual_off + disabled
+    return save_worker_settings(
+        profile_dispatch_disabled=disabled,
+        profile_manual_dispatch_off=manual_off,
+    )
+
+
+def is_profile_manual_dispatch_off(profile_id: str) -> bool:
+    """True nếu user đã bấm Ngừng job thủ công (auto CDP không được mở lại)."""
+    pid = str(profile_id or "").strip()
+    if not pid or pid.startswith("_"):
+        return False
+    return pid in get_worker_settings().profile_manual_dispatch_off
 
 
 def is_profile_credit_allowed(profile_id: str) -> bool:
@@ -335,6 +381,14 @@ def save_worker_settings(**fields: Any) -> WorkerSettings:
                 data["profile_dispatch_disabled"] = [
                     str(x)
                     for x in raw_disabled
+                    if x and not str(x).startswith("_")
+                ]
+        if "profile_manual_dispatch_off" in fields:
+            raw_manual = fields["profile_manual_dispatch_off"]
+            if isinstance(raw_manual, list):
+                data["profile_manual_dispatch_off"] = [
+                    str(x)
+                    for x in raw_manual
                     if x and not str(x).startswith("_")
                 ]
         if "profile_credit_allowed" in fields:

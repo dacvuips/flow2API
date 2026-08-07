@@ -218,9 +218,11 @@ def _gen_slot_eligible(
     """True nếu slot Gen có thể mở CDP/Sync.
 
     Gồm:
-    - Standby (ngưng job / dispatch OFF)
+    - Standby (ngưng job / dispatch OFF) do hệ thống
     - «không nhận job» (dispatch ON nhưng không accepting — token chết, lane hỏng…)
-    Không gồm Gen đang «Nhận job» (accepting).
+    Không gồm:
+    - Gen đang «Nhận job» (accepting)
+    - Profile user bấm Ngừng job thủ công (không auto mở lại)
     """
     if not s.get("enabled"):
         return False
@@ -237,10 +239,52 @@ def _gen_slot_eligible(
     ts = time.time() if now is None else now
     if skip_cooldown and _fail_cooldown_until.get(sid, 0) > ts:
         return False
-    # Đang nhận job thật → bỏ qua; standby và «không nhận job» đều lấy được
+    # User bấm Ngừng job → không auto mở CDP / không bù song song bằng slot này
+    try:
+        from flow2api.services.worker_settings import is_profile_manual_dispatch_off
+
+        if is_profile_manual_dispatch_off(linked) or is_profile_manual_dispatch_off(sid):
+            return False
+    except Exception:
+        pass
+    # Đang nhận job thật → bỏ qua; standby và «không nhận job» (hệ thống) đều lấy được
     if s.get("accepting_jobs"):
         return False
     return True
+
+
+def _count_manual_dispatch_off_gens() -> int:
+    """Số Gen trong lịch auto mà user đã Ngừng job thủ công (giảm mục tiêu song song)."""
+    try:
+        from flow2api.services.worker_settings import is_profile_manual_dispatch_off
+    except Exception:
+        return 0
+    n = 0
+    for s in ordered_auto_slots():
+        if not s.get("enabled"):
+            continue
+        if (s.get("role") or "bridge") == "center":
+            continue
+        sid = str(s.get("id") or "").strip()
+        linked = str(s.get("linked_profile_id") or sid).strip()
+        if not sid:
+            continue
+        try:
+            if is_profile_manual_dispatch_off(linked) or is_profile_manual_dispatch_off(sid):
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _parallel_gen_target() -> int:
+    """Song song Gen CDP trừ số profile user cố ý ngừng (không bù thay)."""
+    cfg = get_flow_cdp_auto_settings()
+    target = int(cfg.parallel_gen or 0)
+    if target <= 0:
+        return 0
+    manual_n = _count_manual_dispatch_off_gens()
+    return max(0, target - manual_n)
 
 
 def _next_gen_standby_after(
@@ -359,9 +403,10 @@ def find_next_cdp_to_run() -> dict[str, Any] | None:
 
 
 def _count_active_or_starting_gens() -> int:
-    """Số Gen đang nhận job thật (accepting) hoặc đang/sắp chạy cycle auto.
+    """Số Gen đang «giữ chỗ» song song — khớp pill «nhận job» + đang Sync.
 
-    «không nhận job» (dispatch ON nhưng không accepting) không tính — để vẫn bù/mở CDP.
+    Tính: accepting (Nhận job) · đang/sắp cycle · dispatch ON + token còn hạn.
+    Không tính: standby / «không nhận job» (token chết / missing).
     """
     n = 0
     for s in ordered_auto_slots():
@@ -372,19 +417,36 @@ def _count_active_or_starting_gens() -> int:
         sid = str(s.get("id") or "").strip()
         if not sid:
             continue
-        if _is_cycle_busy(sid) or s.get("accepting_jobs"):
+        if _is_cycle_busy(sid):
             n += 1
+            continue
+        if s.get("accepting_jobs"):
+            n += 1
+            continue
+        # Dispatch ON nhưng token còn → vẫn tính đang hoạt động (chưa nhường slot)
+        if s.get("dispatch_enabled"):
+            status = str(s.get("token_status") or "").strip().lower()
+            rem = s.get("token_remaining_seconds")
+            try:
+                rem_n = float(rem) if rem is not None else None
+            except (TypeError, ValueError):
+                rem_n = None
+            if status in ("fresh", "stale") or (rem_n is not None and rem_n > 0):
+                n += 1
     return n
 
 
 def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[str, Any]:
     """
-    Bù CDP Gen standby đến khi số Gen đang bật nhận job >= Song song Gen CDP.
-    Gọi sau Lưu cấu hình (và chain sau mỗi cycle nếu còn thiếu).
+    Bù CDP Gen cho ĐỦ mục tiêu Song song Gen CDP — chỉ mở thêm (target − have).
+
+    Ví dụ: target=3, đang nhận job=2 → chỉ start đúng 1 CDP (không mở thêm 3).
+    Profile user bấm Ngừng job thủ công: không bù thay (effective target giảm).
     """
     cfg = get_flow_cdp_auto_settings()
-    target = int(cfg.parallel_gen or 0)
-    if target <= 0:
+    raw_target = int(cfg.parallel_gen or 0)
+    target = _parallel_gen_target()
+    if raw_target <= 0:
         return {
             "ok": True,
             "target": 0,
@@ -397,9 +459,29 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
     started: list[str] = []
     blocked_reason = ""
     have_before = _count_active_or_starting_gens()
-    for _ in range(max(1, target) + 2):
+    need = max(0, target - have_before)
+    if need <= 0:
+        return {
+            "ok": True,
+            "target": target,
+            "raw_target": raw_target,
+            "manual_off": raw_target - target,
+            "have_before": have_before,
+            "have": have_before,
+            "need": 0,
+            "started": [],
+            "started_count": 0,
+            "blocked_reason": None,
+            "skipped": "already_at_target",
+        }
+
+    # Chỉ lặp đúng số còn thiếu (không mở tràn target)
+    for _ in range(need):
         have = _count_active_or_starting_gens()
         if have >= target:
+            break
+        remaining = target - have
+        if remaining <= 0 or len(started) >= need:
             break
         nxt = find_next_cdp_to_run()
         if not nxt:
@@ -409,6 +491,9 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
         if not sid:
             blocked_reason = "empty_slot_id"
             break
+        if sid in started:
+            blocked_reason = "duplicate_next"
+            break
         if not _schedule_cycle(sid, reason=reason):
             # Đạt giới hạn Sync song song / slot busy — chain sẽ bù tiếp sau cycle
             blocked_reason = "schedule_blocked_busy_or_parallel_cap"
@@ -416,13 +501,14 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
         started.append(sid)
 
     have_after = _count_active_or_starting_gens()
-    need = max(0, target - have_before)
     if started:
         _log(
             "info",
             (
-                f"Bù Gen CDP: mục tiêu {target} · trước {have_before} · "
-                f"đang mở/nhận {have_after} · start {', '.join(started)} ({reason})"
+                f"Bù Gen CDP: mục tiêu {target}"
+                + (f" (song song={raw_target}, user ngừng={raw_target - target})" if raw_target != target else "")
+                + f" · đang có {have_before} · cần +{need} · start {len(started)}: {', '.join(started)} "
+                f"· sau schedule={have_after} ({reason})"
             ),
         )
     elif need > 0:
@@ -436,6 +522,8 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
     return {
         "ok": True,
         "target": target,
+        "raw_target": raw_target,
+        "manual_off": max(0, raw_target - target),
         "have_before": have_before,
         "have": have_after,
         "need": need,
@@ -512,7 +600,7 @@ def _schedule_cycle(slot_id: str, *, reason: str = "") -> bool:
             )
         finally:
             _pending_start.discard(slot_id)
-            # Thành công hay fail: luôn bù cho đủ Song song Gen (slot fail bị cooldown → bỏ qua)
+            # Thành công hay fail: chỉ bù đúng phần còn thiếu (target − have)
             try:
                 chain_reason = (
                     f"chain_ok:{job_reason or 'cycle'}"
@@ -520,15 +608,25 @@ def _schedule_cycle(slot_id: str, *, reason: str = "") -> bool:
                     else f"chain_fail:{slot_id}:{job_reason or 'cycle'}"
                 )
                 fill = ensure_gen_slots_for_parallel(reason=chain_reason)
-                # Fail mà chưa start được slot nào → thử ép 1 Gen kế (tuần hoàn)
-                if not ok and not (fill.get("started_count") or 0):
+                # Fail + vẫn thiếu mục tiêu + ensure chưa start → thử 1 Gen kế (không vượt target)
+                tgt = _parallel_gen_target()
+                have_now = _count_active_or_starting_gens()
+                if (
+                    not ok
+                    and tgt > 0
+                    and have_now < tgt
+                    and not (fill.get("started_count") or 0)
+                ):
                     nxt = find_next_cdp_to_run()
                     nxt_id = str((nxt or {}).get("id") or "").strip()
                     if nxt_id and nxt_id != slot_id:
                         if _schedule_cycle(nxt_id, reason=f"after_fail:{slot_id}"):
                             _log(
                                 "info",
-                                f"Sau lỗi {slot_id} → mở CDP kế {nxt_id} (tuần hoàn)",
+                                (
+                                    f"Sau lỗi {slot_id} → mở +1 CDP kế {nxt_id} "
+                                    f"(have {have_now}/{tgt}, tuần hoàn)"
+                                ),
                                 slot_id=nxt_id,
                             )
             except Exception as exc:
@@ -567,7 +665,7 @@ async def on_profile_http_block(
     try:
         from flow2api.services.worker_settings import set_profile_dispatch_enabled
 
-        set_profile_dispatch_enabled(pid, False)
+        set_profile_dispatch_enabled(pid, False, source="system")
         _log("info", f"{reason}: đã Ngừng job profile {pid}")
     except Exception as exc:
         _log("error", f"Ngừng job {pid} thất bại: {exc}")
@@ -969,7 +1067,7 @@ def mark_cdp_profile_standby(profile_id: str, *, reason: str = "") -> dict[str, 
     if not pid or pid.startswith("_"):
         return {"ok": False, "error": "missing_profile_id"}
     try:
-        set_profile_dispatch_enabled(pid, False)
+        set_profile_dispatch_enabled(pid, False, source="system")
         note = f" ({reason})" if reason else ""
         _log("info", f"Profile {pid}: Nhận job OFF · standby{note}")
         try:
