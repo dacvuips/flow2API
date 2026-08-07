@@ -118,10 +118,17 @@ class CenterState:
         now = now if now is not None else time.time()
         if self.solve_since_last_reset >= HARD_RESET_EVERY_N_SOLVES:
             return True
-        # Chỉ tính periodic nếu đã có ít nhất 1 mint (tránh reset ngay khi vừa attach)
-        if self.last_mint_ok_at > 0 and (now - self.last_hard_reset_at) > HARD_RESET_EVERY_S:
-            return True
-        return False
+        # Periodic 10 phút: chỉ sau khi đã mint ≥1 lần.
+        # last_hard_reset_at == 0 nghĩa là CHƯA từng hard_reset (không phải epoch) —
+        # nếu lấy now - 0 thì luôn > 600s → hard_reset ngay sau mint đầu (reload liên tục).
+        if self.last_mint_ok_at <= 0:
+            return False
+        baseline = (
+            self.last_hard_reset_at
+            if self.last_hard_reset_at > 0
+            else self.last_mint_ok_at
+        )
+        return (now - baseline) > HARD_RESET_EVERY_S
 
 
 @dataclass
@@ -297,9 +304,12 @@ class CaptchaBroker:
         st.in_reset = True
         st.last_hard_reset_at = time.time()
         self._wake_center_poll(st.center_id)
+        baseline = st.last_hard_reset_at if st.last_hard_reset_at > 0 else st.last_mint_ok_at
         logger.info(
             "captcha-center %s: enqueue periodic hard_reset (solves=%d, age=%.0fs)",
-            st.center_id[:12], st.solve_since_last_reset, time.time() - st.last_hard_reset_at,
+            st.center_id[:12],
+            st.solve_since_last_reset,
+            (time.time() - baseline) if baseline else 0,
         )
 
     # ── Result submit ───────────────────────────────────────────────────
