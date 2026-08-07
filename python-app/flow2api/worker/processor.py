@@ -758,7 +758,19 @@ class WorkerController:
             failed_profile[:12] or "-",
         )
         # Auto CDP: chỉ lỗi tài khoản thật (auth hết hạn / quota) → mở Gen kế tiếp.
-        if failed_profile and is_profile_account_switch_failure(None, msg):
+        # label đã được class account-switch ở caller → không yêu cầu marker trong msg
+        # (tránh miss khi marker chỉ có trong api_trace/exc).
+        _cdp_switch_labels = {
+            "account_error",
+            "offline_auth_expired",
+            "token_expired",
+            "invalid_auth",
+            "quota_exhausted",
+        }
+        if failed_profile and (
+            label in _cdp_switch_labels
+            or is_profile_account_switch_failure(None, msg)
+        ):
             self._trigger_next_cdp_on_block(failed_profile, label)
 
     def _trigger_next_cdp_on_block(self, failed_profile_id: str, reason: str) -> None:

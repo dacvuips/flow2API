@@ -83,6 +83,7 @@ async def reconnect_open_cdps() -> dict[str, Any]:
     try:
         from flow2api.services.flow_cdp_auto import ensure_scheduler
 
+        # ensure_scheduler: start loop + bù ngay theo Song song Gen CDP
         ensure_scheduler()
     except Exception as exc:
         logger.debug("ensure_scheduler on startup: %s", exc)
