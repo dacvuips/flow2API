@@ -58,6 +58,7 @@ def unbind_task_profile() -> None:
 _OMNI_VIDEO_TYPES = frozenset({"gen_text_video", "gen_image_video"})
 
 _IMAGE_REQUEST_TYPES = frozenset({"gen_image", "upsample_image"})
+_TEXT_REQUEST_TYPES = frozenset({"gen_text"})
 _VIDEO_REQUEST_TYPES = frozenset({
     "gen_text_video",
     "gen_image_video",
@@ -74,6 +75,8 @@ def request_media_kind(request_type: str | None) -> str | None:
         return "image"
     if rtype in _VIDEO_REQUEST_TYPES:
         return "video"
+    if rtype in _TEXT_REQUEST_TYPES:
+        return "text"
     return None
 
 
@@ -88,6 +91,9 @@ def profile_accepts_request_type(profile_id: str, request_type: str | None) -> b
         return is_profile_image_allowed(profile_id)
     if kind == "video":
         return is_profile_video_allowed(profile_id)
+    if kind == "text":
+        # Text generation uses same Flow session as Image/Video profiles.
+        return is_profile_image_allowed(profile_id) or is_profile_video_allowed(profile_id)
     return is_profile_image_allowed(profile_id) or is_profile_video_allowed(profile_id)
 
 

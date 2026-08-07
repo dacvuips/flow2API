@@ -1378,6 +1378,61 @@ class WorkerController:
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
+        if req_type == "gen_text":
+            prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
+            system_instruction = str(
+                params.get("system_instruction")
+                or params.get("systemInstruction")
+                or ""
+            )
+            model_name = str(
+                params.get("model")
+                or params.get("text_model")
+                or flow_sdk.DEFAULT_TEXT_MODEL
+            )
+            raw_level = (
+                params.get("thinking_level")
+                or params.get("thinkingLevel")
+                or "HIGH"
+            )
+            thinking_level = str(raw_level).strip().upper() or "HIGH"
+            if thinking_level not in flow_sdk.TEXT_THINKING_LEVELS:
+                thinking_level = "HIGH"
+            append_request_log(
+                rid,
+                "worker",
+                f"gen_text model={model_name} thinking={thinking_level} prompt={prompt[:80]}…",
+                level="info",
+            )
+            raw = await flow_sdk.gen_text(
+                client,
+                prompt=prompt,
+                system_instruction=system_instruction,
+                model=model_name,
+                thinking_level=thinking_level,
+                contents=params.get("contents") if isinstance(params.get("contents"), list) else None,
+                system_parts=params.get("system_parts") or params.get("systemParts"),
+                applet_id=str(params.get("applet_id") or params.get("appletId") or flow_sdk.DEFAULT_TEXT_APPLET_ID),
+                applet_version_id=str(
+                    params.get("applet_version_id")
+                    or params.get("appletVersionId")
+                    or flow_sdk.DEFAULT_TEXT_APPLET_VERSION_ID
+                ),
+                extra_body=params.get("extra_body") if isinstance(params.get("extra_body"), dict) else None,
+            )
+            result = {
+                "text": raw.get("text") or "",
+                "json": raw.get("json"),
+                "usage": raw.get("usage") or {},
+                "model": raw.get("model") or model_name,
+                "thinking_level": thinking_level,
+                "profile_id": profile_id,
+                "raw": raw.get("raw"),
+            }
+            activity.update_request(rid, status="done", result=result, error=None)
+            events.publish("request_finished", {"id": rid, "status": "done"})
+            return
+
         project_id = await self._ensure_project(profile_id)
         append_request_log(rid, "worker", f"Project ready: {project_id[:12]}…", level="info")
 

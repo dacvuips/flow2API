@@ -19,13 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 def _url_requires_center_captcha(url: str) -> bool:
-    """Gen image/video submit endpoints — bắt buộc token từ Captcha Center."""
+    """Gen image/video/text submit endpoints — bắt buộc token từ Captcha Center."""
     u = str(url or "")
     if "batchCheckAsync" in u:
         return False
     if "batchGenerateImages" in u:
         return True
     if "batchAsyncGenerateVideo" in u:
+        return True
+    if "flow:generateContent" in u or "flow%3AgenerateContent" in u:
         return True
     return False
 
@@ -36,6 +38,15 @@ def _inject_captcha_into_body(body: Any, captcha_token: str) -> Any:
     import copy
 
     final = copy.deepcopy(body)
+    # Top-level recaptcha (flow:generateContent)
+    top_ctx = final.get("recaptchaContext")
+    if isinstance(top_ctx, dict):
+        top_ctx["token"] = captcha_token
+    elif "contents" in final or "systemInstruction" in final:
+        final["recaptchaContext"] = {
+            "token": captcha_token,
+            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+        }
     ctx = final.get("clientContext")
     if isinstance(ctx, dict) and isinstance(ctx.get("recaptchaContext"), dict):
         ctx["recaptchaContext"]["token"] = captcha_token

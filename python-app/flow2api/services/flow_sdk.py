@@ -144,6 +144,17 @@ def _image_batch_url(project_id: str) -> str:
     return _api_url(f"/v1/projects/{project_id}/flowMedia:batchGenerateImages")
 
 
+def _generate_content_url() -> str:
+    return _api_url("/v1/flow:generateContent")
+
+
+# Flow Prop Writer / text gemini defaults (from labs.google traffic).
+DEFAULT_TEXT_MODEL = "gemini-3-flash-preview"
+DEFAULT_TEXT_APPLET_ID = "eb4a10c1-5f61-4c76-9c95-bc6aa5d446f1"
+DEFAULT_TEXT_APPLET_VERSION_ID = "e4b4151a-2716-42f2-ab14-f39ec21b6473"
+TEXT_THINKING_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH", "MINIMAL"})
+
+
 def _require_tier(client: FlowClient) -> str:
     return client.paygate_tier or "PAYGATE_TIER_ONE"
 
@@ -695,6 +706,183 @@ async def gen_image(
             continue
         break
     raise FlowApiError(last_err, step="gen_image", raw=last_resp)
+
+
+def _normalize_text_parts(parts: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if isinstance(parts, str) and parts.strip():
+        return [{"text": parts}]
+    if not isinstance(parts, list):
+        return out
+    for p in parts:
+        if isinstance(p, str) and p.strip():
+            out.append({"text": p})
+        elif isinstance(p, dict) and p.get("text") is not None:
+            out.append({"text": str(p.get("text") or "")})
+    return out
+
+
+def _extract_generate_content_text(data: dict[str, Any]) -> str:
+    """Pull model text parts from flow:generateContent response."""
+    chunks: list[str] = []
+    for cand in data.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        content = cand.get("content") or {}
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            txt = part.get("text")
+            if txt is not None and str(txt).strip():
+                chunks.append(str(txt))
+    if chunks:
+        return "\n".join(chunks).strip()
+    # Fallback shapes
+    if isinstance(data.get("text"), str):
+        return str(data.get("text") or "").strip()
+    return ""
+
+
+def _try_parse_json_object(text: str) -> Any | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    # Strip common markdown fences
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    # Largest {...} span
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except Exception:
+            return None
+    return None
+
+
+async def gen_text(
+    client: FlowClient,
+    *,
+    prompt: str,
+    system_instruction: str = "",
+    model: str = DEFAULT_TEXT_MODEL,
+    thinking_level: str = "HIGH",
+    contents: Optional[list[dict[str, Any]]] = None,
+    system_parts: Optional[list[Any]] = None,
+    applet_id: str = DEFAULT_TEXT_APPLET_ID,
+    applet_version_id: str = DEFAULT_TEXT_APPLET_VERSION_ID,
+    extra_body: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Text generation via aisandbox-pa ``/v1/flow:generateContent``
+    (Gemini text models on Flow — Prop Writer, etc.).
+    """
+    user_text = str(prompt or "").strip()
+    body_contents = contents if isinstance(contents, list) and contents else None
+    if not body_contents:
+        if not user_text:
+            raise FlowApiError("missing_prompt", step="gen_text")
+        body_contents = [{"role": "user", "parts": [{"text": user_text}]}]
+
+    sys_parts = _normalize_text_parts(system_parts)
+    if not sys_parts:
+        sys_text = str(system_instruction or "").strip()
+        if sys_text:
+            sys_parts = [{"text": sys_text}]
+
+    level = str(thinking_level or "HIGH").strip().upper() or "HIGH"
+    if level not in TEXT_THINKING_LEVELS:
+        level = "HIGH"
+    model_name = str(model or DEFAULT_TEXT_MODEL).strip() or DEFAULT_TEXT_MODEL
+
+    body: dict[str, Any] = {
+        "model": model_name,
+        "contents": body_contents,
+        "thinkingConfig": {"thinkingLevel": level},
+        "requestContext": {
+            "flowSdkInfo": {
+                "appletId": str(applet_id or DEFAULT_TEXT_APPLET_ID),
+                "appletVersionId": str(applet_version_id or DEFAULT_TEXT_APPLET_VERSION_ID),
+            }
+        },
+        "recaptchaContext": {
+            "token": "",
+            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+        },
+    }
+    if sys_parts:
+        body["systemInstruction"] = {"parts": sys_parts}
+    if isinstance(extra_body, dict):
+        # Allow client override of advanced Flow fields (without wiping required keys)
+        for k, v in extra_body.items():
+            if k in ("recaptchaContext",):
+                continue
+            body[k] = v
+
+    url = _generate_content_url()
+    last_err = "text_generation_failed"
+    last_resp: dict = {}
+    for attempt in range(RECAPTCHA_RETRY_MAX):
+        resp = await client.api_request(
+            url,
+            body=body,
+            captcha_action="IMAGE_GENERATION",
+            timeout=300,
+            raise_on_error=False,
+        )
+        last_resp = resp if isinstance(resp, dict) else {}
+        status = int(resp.get("status") or 0)
+        if 200 <= status < 400:
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            if not data and isinstance(resp, dict):
+                # Some bridges put body at top-level
+                if resp.get("candidates"):
+                    data = resp
+            text = _extract_generate_content_text(data if isinstance(data, dict) else {})
+            parsed = _try_parse_json_object(text)
+            usage = {}
+            if isinstance(data, dict) and isinstance(data.get("usageMetadata"), dict):
+                usage = data.get("usageMetadata") or {}
+            return {
+                "text": text,
+                "json": parsed,
+                "raw": data,
+                "usage": usage,
+                "model": model_name,
+            }
+        last_err = error_from_response(resp)
+        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = _recaptcha_retry_delay(attempt)
+            log_task_event(
+                client,
+                "gen_text",
+                f"reCAPTCHA retry {attempt + 1}/{RECAPTCHA_RETRY_MAX}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        if is_transient_flow_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = min(300, (2**attempt) * 10)
+            log_task_event(
+                client,
+                "gen_text",
+                f"transient retry {attempt + 1}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        break
+    raise FlowApiError(last_err, step="gen_text", raw=last_resp)
 
 
 def _iter_generated_images(data: dict) -> list[dict]:

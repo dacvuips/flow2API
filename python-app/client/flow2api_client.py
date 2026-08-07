@@ -56,6 +56,41 @@ class Flow2APIClient:
             r.raise_for_status()
             return r.json()
 
+    def create_text(
+        self,
+        *,
+        prompt: str,
+        system_instruction: str = "",
+        model: str = "gemini-3-flash-preview",
+        thinking_level: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        **extra: Any,
+    ) -> dict:
+        """Text via aisandbox flow:generateContent (Gemini).
+
+        thinking_level: optional MINIMAL|LOW|MEDIUM|HIGH.
+        Omit to use server default (HIGH).
+        """
+        params: dict[str, Any] = {
+            "prompt": prompt,
+            "model": model,
+            **extra,
+        }
+        if thinking_level is not None and str(thinking_level).strip():
+            params["thinking_level"] = str(thinking_level).strip().upper()
+        if system_instruction:
+            params["system_instruction"] = system_instruction
+        if profile_id:
+            params["profile_id"] = profile_id
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/requests",
+                headers=self._headers(),
+                json={"type": "gen_text", "params": params},
+            )
+            r.raise_for_status()
+            return r.json()
+
     def create_image(self, **kwargs: Any) -> dict:
         return self.create("gen_image", **kwargs)
 

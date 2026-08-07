@@ -138,7 +138,13 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
         except ValueError as exc:
             raise HTTPException(400, "profile_not_found") from exc
     prompt = str(params.get("prompt") or "")
-    model = params.get("image_model") or get_video_quality(params, "lite_relaxed" if "video" in str(body.type or "").lower() else "") or ""
+    model = (
+        params.get("image_model")
+        or params.get("model")
+        or params.get("text_model")
+        or get_video_quality(params, "lite_relaxed" if "video" in str(body.type or "").lower() else "")
+        or ""
+    )
     rid = new_request_id()
     image_base64s = params.get("image_base64s") or params.get("imageBase64s") or []
     if image_base64s:
