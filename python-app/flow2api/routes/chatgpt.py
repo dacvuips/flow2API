@@ -17,6 +17,7 @@ from flow2api.services import system_ops
 from flow2api.services.api_auth import auth_key_id
 from flow2api.services.chatgpt_broker import get_chatgpt_broker
 from flow2api.services.chatgpt_media import (
+    load_request_images_as_payload,
     persist_chatgpt_request_images,
     persist_chatgpt_result_media,
     resolve_chatgpt_media_path,
@@ -805,6 +806,49 @@ async def chatgpt_cancel_job(job_id: str, _: int = Depends(auth_key_id)):
         raise HTTPException(404, "chatgpt_job_not_found") from None
     nudge_scheduler()
     return {"ok": True, **job.to_dict(include_result=False)}
+
+
+@router.post("/web/chat/{job_id}/retry")
+async def chatgpt_retry_job(job_id: str, _: int = Depends(auth_key_id)):
+    """Tạo job ChatGPT mới với cùng prompt/ảnh/profile (dashboard «Tạo lại»)."""
+    broker = get_chatgpt_broker()
+    src = broker.get_public_job(job_id)
+    if not src:
+        raise HTTPException(404, "chatgpt_job_not_found")
+    params = dict(src.params_summary or {})
+    kwargs = dict(broker.get_public_kwargs(job_id) or {})
+    images = _normalize_images(kwargs.get("images"))
+    if not images:
+        images = load_request_images_as_payload(job_id)
+    prompt = str(kwargs.get("prompt") or params.get("prompt") or params.get("prompt_preview") or "").strip()
+    if not prompt and not images:
+        raise HTTPException(400, "empty_prompt")
+    profile_id = (
+        kwargs.get("profile_id")
+        or params.get("assigned_profile_id")
+        or params.get("profile_id")
+        or None
+    )
+    if isinstance(profile_id, str):
+        profile_id = profile_id.strip() or None
+    else:
+        profile_id = None
+    mode = kwargs.get("mode") or params.get("mode")
+    out = enqueue_web_chat(
+        prompt=prompt,
+        model=kwargs.get("model") or params.get("model"),
+        endpoint=kwargs.get("endpoint") or params.get("endpoint"),
+        profile_id=profile_id,
+        conversation_id=kwargs.get("conversation_id") or params.get("conversation_id"),
+        parent_message_id=kwargs.get("parent_message_id") or params.get("parent_message_id"),
+        images=images or None,
+        mode=mode,
+        system_hints=kwargs.get("system_hints"),
+        picture=kwargs.get("picture"),
+        tab_id=params.get("tab_id"),
+    )
+    out["retried_from"] = job_id
+    return out
 
 
 @router.put("/profiles/{profile_id}/dispatch")

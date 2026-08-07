@@ -184,3 +184,38 @@ def resolve_chatgpt_media_path(job_id: str, kind: str, index: int) -> Path | Non
     if matches:
         return matches[0]
     return None
+
+
+def load_request_images_as_payload(job_id: str) -> list[dict[str, Any]]:
+    """Rebuild upload images from disk as data-URL payloads (for job retry)."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return []
+    mime_map = {
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+    }
+    out: list[dict[str, Any]] = []
+    for i in range(24):
+        path = resolve_chatgpt_media_path(jid, "request", i)
+        if not path or not path.is_file():
+            break
+        try:
+            raw = path.read_bytes()
+        except Exception as exc:
+            logger.warning("read chatgpt request media failed %s: %s", path, exc)
+            continue
+        ext = path.suffix.lstrip(".").lower()
+        mime = mime_map.get(ext, "image/jpeg")
+        b64 = base64.b64encode(raw).decode("ascii")
+        out.append(
+            {
+                "data": f"data:{mime};base64,{b64}",
+                "fileName": path.name or f"upload-{i}.jpg",
+                "mimeType": mime,
+            }
+        )
+    return out
