@@ -191,7 +191,11 @@ async def serve_media(media_id: str):
         if not client.connected and not client.has_direct_lane():
             raise HTTPException(503, "extension_not_connected")
         try:
-            resp = await asyncio.wait_for(client.get_media(media_id), timeout=60)
+            from flow2api.config import GET_MEDIA_TIMEOUT_S
+
+            # Slightly above curl get_media timeout so wait_for is not the first to fire.
+            get_media_cap = max(60.0, float(GET_MEDIA_TIMEOUT_S or 180)) + 15.0
+            resp = await asyncio.wait_for(client.get_media(media_id), timeout=get_media_cap)
         except asyncio.TimeoutError:
             raise HTTPException(504, "get_media_timeout") from None
         except Exception as exc:

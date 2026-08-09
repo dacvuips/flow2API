@@ -91,8 +91,12 @@ def _profile_token_meta(profile_id: str) -> dict[str, Any]:
     except Exception:
         accepting = bool(dispatch)
     rem = meta.get("token_remaining_seconds")
+    rem_real = meta.get("token_remaining_seconds_real")
+    if rem_real is None:
+        rem_real = rem
     return {
         "token_remaining_seconds": rem,
+        "token_remaining_seconds_real": rem_real,
         "token_hours_left": meta.get("token_hours_left"),
         "token_status": meta.get("token_status"),
         "access_token_expires_at": meta.get("access_token_expires_at"),
@@ -426,7 +430,9 @@ def _count_active_or_starting_gens() -> int:
         # Dispatch ON nhưng token còn → vẫn tính đang hoạt động (chưa nhường slot)
         if s.get("dispatch_enabled"):
             status = str(s.get("token_status") or "").strip().lower()
-            rem = s.get("token_remaining_seconds")
+            rem = s.get("token_remaining_seconds_real")
+            if rem is None:
+                rem = s.get("token_remaining_seconds")
             try:
                 rem_n = float(rem) if rem is not None else None
             except (TypeError, ValueError):
@@ -1132,7 +1138,9 @@ async def _check_expired_receiving_gens() -> None:
         if _fail_cooldown_until.get(watch_key, 0) > now:
             continue
         status = str(s.get("token_status") or "").strip().lower()
-        rem = s.get("token_remaining_seconds")
+        rem = s.get("token_remaining_seconds_real")
+        if rem is None:
+            rem = s.get("token_remaining_seconds")
         try:
             rem_n = float(rem) if rem is not None else None
         except (TypeError, ValueError):

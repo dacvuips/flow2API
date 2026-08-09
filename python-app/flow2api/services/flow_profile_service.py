@@ -20,6 +20,8 @@ from flow2api.config import (
 
     FLOW_ACCESS_TOKEN_TTL_S,
 
+    TOKEN_ACTIVE_DISPLAY_OFFSET_S,
+
 )
 
 from flow2api.db.models import FlowProfile, SessionLocal
@@ -699,9 +701,13 @@ def token_public_fields(
 
     captured_at = row.token_captured_at if row else None
 
-    # Active = hạn ya29 từ auth/session (thường ~55 phút). Không dùng cookies_expires_at:
-    # cookie Google thường sống hàng tháng → trước đây bị cap 24h nên UI luôn hiện ~24h.
-    remaining = _remaining_seconds(expires_at, now) if has_token else None
+    # Active = hạn ya29 từ auth/session. UI "Active (~Xh left)" = real − offset (default 2h).
+    remaining_real = _remaining_seconds(expires_at, now) if has_token else None
+    offset = max(0, int(TOKEN_ACTIVE_DISPLAY_OFFSET_S or 0))
+    if remaining_real is None:
+        remaining_display = None
+    else:
+        remaining_display = max(0, int(remaining_real) - offset)
 
     status = _token_status(
 
@@ -717,7 +723,11 @@ def token_public_fields(
 
     )
 
-    hours_left = round(remaining / 3600, 1) if remaining is not None and remaining > 0 else None
+    hours_left = (
+        round(remaining_display / 3600, 1)
+        if remaining_display is not None and remaining_display > 0
+        else None
+    )
 
     from flow2api.services.cookie_service import has_stored_cookies
 
@@ -734,9 +744,10 @@ def token_public_fields(
 
         "token_captured_at": captured_at.isoformat() + "Z" if captured_at else None,
 
-        "token_remaining_seconds": remaining,
+        # Display / Active (~Xh left) — conservative (real − 2h by default).
+        "token_remaining_seconds": remaining_display,
 
-        "token_remaining_seconds_real": remaining,
+        "token_remaining_seconds_real": remaining_real,
 
         "token_hours_left": hours_left,
 
@@ -746,7 +757,7 @@ def token_public_fields(
 
         "cookies_remaining_seconds": cookies_rem,
 
-        "stored_flow_key_present": has_token and (remaining or 0) > 0,
+        "stored_flow_key_present": has_token and (remaining_real or 0) > 0,
 
         "stored_cookies_present": cookies_ok,
 

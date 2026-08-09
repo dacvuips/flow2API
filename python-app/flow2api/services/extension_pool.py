@@ -247,8 +247,10 @@ class ExtensionSession:
                 live_flow_key_present=self.browser_flow_key_present,
                 extension_online=self.connected,
             )
-            rem = meta.get("token_remaining_seconds")
-            # Cookies/token đã trong DB → dùng luôn nếu còn hạn.
+            rem = meta.get("token_remaining_seconds_real")
+            if rem is None:
+                rem = meta.get("token_remaining_seconds")
+            # Cookies/token đã trong DB → dùng luôn nếu còn hạn thực.
             # Chỉ gọi auth/session khi thiếu token hoặc sắp hết (kể cả offline).
             needs_refresh = not token or (
                 rem is not None and rem <= FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
@@ -679,10 +681,13 @@ class ExtensionSession:
         return resp.get("data") or resp
 
     async def get_media(self, media_id: str) -> dict:
-        from flow2api.config import GOOGLE_API_KEY, GOOGLE_FLOW_API
+        from flow2api.config import GET_MEDIA_TIMEOUT_S, GOOGLE_API_KEY, GOOGLE_FLOW_API
 
         url = f"{GOOGLE_FLOW_API}/v1/media/{media_id}?key={GOOGLE_API_KEY}&clientContext.tool=PINHOLE"
-        return await self.api_request(url, method="GET", timeout=60, raise_on_error=False)
+        timeout = max(60.0, float(GET_MEDIA_TIMEOUT_S or 180))
+        return await self.api_request(
+            url, method="GET", timeout=timeout, raise_on_error=False
+        )
 
     async def labs_upload_video_start(
         self,
@@ -895,9 +900,11 @@ class ExtensionSession:
             live_flow_key_present=self.browser_flow_key_present,
             extension_online=self.connected,
         )
-        rem = meta.get("token_remaining_seconds")
+        rem = meta.get("token_remaining_seconds_real")
+        if rem is None:
+            rem = meta.get("token_remaining_seconds")
         token = self.flow_key or get_stored_access_token(self.profile_id)
-        # Offline sau Sync: token DB còn hạn → dùng luôn, không refresh liên tục
+        # Offline sau Sync: token DB còn hạn thực → dùng luôn, không refresh liên tục
         if token and (rem is None or rem > FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S):
             if not self.flow_key:
                 self._browser_flow_key = token
