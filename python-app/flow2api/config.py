@@ -121,7 +121,8 @@ FLOW_ACCESS_TOKEN_MAX_TTL_S = int(
 FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S = int(
     os.environ.get("FLOW2API_FLOW_TOKEN_REFRESH_BEFORE_S", str(5 * 60))
 )
-# UI "Active (~Xh left)" = real remaining − this (default 2h). Operational logic uses real.
+# Khi save token: access_token_expires_at DB = hạn API thật − offset (default 2h).
+# UI / auto-CDP / get_stored_access_token đều dùng đúng hạn DB (không trừ thêm lần nữa).
 TOKEN_ACTIVE_DISPLAY_OFFSET_S = int(
     os.environ.get("FLOW2API_TOKEN_ACTIVE_DISPLAY_OFFSET_S", str(2 * 3600))
 )

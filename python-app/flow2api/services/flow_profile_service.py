@@ -276,6 +276,13 @@ def save_access_token(
 
     expires = _resolve_expires_at(parsed_expires, captured)
 
+    # Hạn vận hành ghi DB = hạn API thật − buffer (default 2h).
+    # Coi mốc này là hết hạn thật → UI, auto-CDP, get_stored_access_token cùng clock.
+    # (có thể < now nếu TTL API ngắn hơn buffer — token coi như hết ngay).
+    offset_s = max(0, int(TOKEN_ACTIVE_DISPLAY_OFFSET_S or 0))
+    if offset_s:
+        expires = expires - timedelta(seconds=offset_s)
+
     enc = encrypt_token(token)
 
     with SessionLocal() as db:
@@ -701,13 +708,10 @@ def token_public_fields(
 
     captured_at = row.token_captured_at if row else None
 
-    # Active = hạn ya29 từ auth/session. UI "Active (~Xh left)" = real − offset (default 2h).
-    remaining_real = _remaining_seconds(expires_at, now) if has_token else None
-    offset = max(0, int(TOKEN_ACTIVE_DISPLAY_OFFSET_S or 0))
-    if remaining_real is None:
-        remaining_display = None
-    else:
-        remaining_display = max(0, int(remaining_real) - offset)
+    # Hạn DB đã là hạn vận hành (API thật − buffer lúc save). UI hiển thị đúng DB.
+    remaining = _remaining_seconds(expires_at, now) if has_token else None
+    remaining_real = remaining
+    remaining_display = remaining
 
     status = _token_status(
 
@@ -744,7 +748,7 @@ def token_public_fields(
 
         "token_captured_at": captured_at.isoformat() + "Z" if captured_at else None,
 
-        # Display / Active (~Xh left) — conservative (real − 2h by default).
+        # Cùng clock với DB (đã trừ buffer lúc save).
         "token_remaining_seconds": remaining_display,
 
         "token_remaining_seconds_real": remaining_real,
