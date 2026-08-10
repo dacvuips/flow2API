@@ -62,3 +62,11 @@ config/**/*.yml
 
 # Local app storage (database, videos, runtime settings)
 python-app/storage/
+
+# Release / packager output
+python-app/dist/
+python-app/build/build/
+python-app/flow2api.srcbak/
+python-app/pyarmor_runtime*/
+storage_path.txt
+**/storage_path.txt

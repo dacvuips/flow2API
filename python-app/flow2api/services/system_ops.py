@@ -1114,6 +1114,8 @@ def close_all_chrome() -> dict[str, Any]:
 
 
 def set_windows_autostart(enabled: bool) -> dict[str, Any]:
+    import sys
+
     cfg = save_config({"windows_autostart": enabled})
     startup = _startup_bat_path()
     if not enabled:
@@ -1121,8 +1123,17 @@ def set_windows_autostart(enabled: bool) -> dict[str, Any]:
             startup.unlink(missing_ok=True)
         return {"ok": True, "enabled": False, "message": "Đã TẮT khởi động cùng Windows"}
     ensure_launch_script()
-    run_bat = APP_ROOT / "run.bat"
-    agent_bat = f'@echo off\r\nstart "" /min cmd /c "cd /d "{APP_ROOT}" && run.bat"\r\nping 127.0.0.1 -n 18 > nul\r\ncall "{_launch_bat_path()}"\r\n'
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        run_cmd = f'start "" /min "{exe}"'
+    else:
+        run_cmd = f'start "" /min cmd /c "cd /d "{APP_ROOT}" && run.bat"'
+    agent_bat = (
+        f'@echo off\r\n'
+        f'{run_cmd}\r\n'
+        f'ping 127.0.0.1 -n 18 > nul\r\n'
+        f'call "{_launch_bat_path()}"\r\n'
+    )
     startup.parent.mkdir(parents=True, exist_ok=True)
     startup.write_text(agent_bat, encoding="utf-8", newline="\r\n")
     save_config({"windows_autostart": True})

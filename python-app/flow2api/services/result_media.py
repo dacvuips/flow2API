@@ -417,7 +417,7 @@ def persist_input_previews(
     request_id: str,
     image_base64s: list[str],
     *,
-    max_items: int = 3,
+    max_items: int = 10,
 ) -> list[str]:
     """Save input images locally for lightweight list previews."""
     from flow2api.config import INPUTS_DIR
@@ -443,7 +443,7 @@ def persist_input_previews(
     return urls
 
 
-def load_input_base64s_from_storage(request_id: str, *, max_items: int = 3) -> list[str]:
+def load_input_base64s_from_storage(request_id: str, *, max_items: int = 10) -> list[str]:
     """Restore input images from local preview files for manual retry."""
     from flow2api.config import INPUTS_DIR
 

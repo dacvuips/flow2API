@@ -3,11 +3,80 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _default_root() -> Path:
+    """Directory that owns the app (python-app/ source, or folder of .exe)."""
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _default_frontend(app_root: Path) -> Path:
+    env = (os.environ.get("FLOW2API_FRONTEND") or "").strip()
+    if env:
+        return Path(env)
+    # Packaged layout: next to .exe
+    packaged = app_root / "frontend"
+    if packaged.is_dir() or _is_frozen():
+        return packaged
+    # Dev layout: repo/frontend next to python-app
+    return app_root.parent / "frontend"
+
+
+def storage_path_config_file(app_root: Path | None = None) -> Path:
+    """File written by installer / launcher: one line, absolute storage folder."""
+    root = app_root if app_root is not None else Path(os.environ.get("FLOW2API_ROOT", _default_root()))
+    return root / "storage_path.txt"
+
+
+def _read_storage_path_file(app_root: Path) -> Path | None:
+    cfg = storage_path_config_file(app_root)
+    if not cfg.is_file():
+        return None
+    try:
+        text = cfg.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip().strip('"').strip("'")
+        if line and not line.startswith("#"):
+            return Path(line)
+    return None
+
+
+def write_storage_path_file(path: Path | str, app_root: Path | None = None) -> Path:
+    """Persist user-chosen storage dir next to the app (installer / reconfigure)."""
+    target = Path(path).expanduser().resolve()
+    cfg = storage_path_config_file(app_root)
+    cfg.write_text(str(target) + "\n", encoding="utf-8")
+    return target
+
+
+def _default_storage(app_root: Path) -> Path:
+    env = (os.environ.get("FLOW2API_STORAGE") or "").strip()
+    if env:
+        return Path(env)
+    from_file = _read_storage_path_file(app_root)
+    if from_file is not None:
+        return from_file
+    localapp = (os.environ.get("LOCALAPPDATA") or "").strip()
+    # No preference yet: frozen builds fall back to LocalAppData; source → app_root/storage
+    if _is_frozen() and localapp:
+        return Path(localapp) / "Flow2API" / "storage"
+    return app_root / "storage"
+
+
+ROOT = _default_root()
 APP_ROOT = Path(os.environ.get("FLOW2API_ROOT", ROOT))
+IS_FROZEN = _is_frozen()
 
 HTTP_HOST = os.environ.get("FLOW2API_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("FLOW2API_HTTP_PORT", "1994"))
@@ -16,9 +85,9 @@ RELOAD = os.environ.get("FLOW2API_RELOAD", "0").strip().lower() in ("1", "true",
 WS_HOST = os.environ.get("FLOW2API_WS_HOST", "127.0.0.1")
 WS_PORT = int(os.environ.get("FLOW2API_EXT_WS_PORT", "1609"))
 
-DB_PATH = Path(os.environ.get("FLOW2API_DB", APP_ROOT / "storage" / "flow2api.db"))
-STORAGE_DIR = Path(os.environ.get("FLOW2API_STORAGE", APP_ROOT / "storage"))
-FRONTEND_DIR = Path(os.environ.get("FLOW2API_FRONTEND", APP_ROOT.parent / "frontend"))
+STORAGE_DIR = _default_storage(APP_ROOT)
+DB_PATH = Path(os.environ.get("FLOW2API_DB", str(STORAGE_DIR / "flow2api.db")))
+FRONTEND_DIR = _default_frontend(APP_ROOT)
 
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
 TRPC_BASE = "https://labs.google/fx/api/trpc"

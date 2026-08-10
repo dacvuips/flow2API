@@ -1,0 +1,29 @@
+Flow2API — sau khi cài đặt
+===========================
+
+1) Chạy agent
+   - Shortcut "Flow2API" trên Desktop / Start Menu
+   - hoặc mở thư mục cài → double-click "Run Flow2API.bat"
+
+2) Mở trình duyệt
+   - Dashboard:  http://127.0.0.1:1994/
+   - Admin:      http://127.0.0.1:1994/admin  (mặc định admin / admin)
+
+3) Bắt buộc: Chrome Extension (một lần)
+   - Mở Chrome → chrome://extensions → bật Developer mode
+   - Load unpacked → chọn thư mục extension trong thư mục cài Flow2API
+   - Đăng nhập Google Flow (labs.google) để extension bắt token
+
+4) Yêu cầu máy
+   - Windows 10/11 64-bit
+   - Google Chrome đã cài
+   - Không cần cài Python (đã đóng gói trong Flow2API-Agent.exe)
+
+5) Dữ liệu (storage)
+   - Khi cài Setup: màn hình riêng hỏi thư mục lưu DB / video / output
+   - Đường dẫn đã chọn được lưu trong:  storage_path.txt  (cạnh file cài)
+   - Đổi lại:  chay "Run Flow2API.bat" --pick-storage
+   - Mặc định gợi ý: %LOCALAPPDATA%\Flow2API\storage
+
+Lưu ý bảo mật code: binary đã đóng gói (bytecode), không ship file .py nguồn.
+Không có dạng mã hóa tuyệt đối — reverse engineer vẫn có thể ở mức nâng cao.

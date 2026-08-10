@@ -281,12 +281,21 @@ app = create_app()
 
 
 def main() -> None:
-    pkg_dir = Path(__file__).resolve().parent
+    import sys
+
     kwargs: dict = {
         "host": HTTP_HOST,
         "port": HTTP_PORT,
         "log_level": "info",
     }
+    # PyInstaller / frozen: must pass app object (string import path breaks in bootloader).
+    if getattr(sys, "frozen", False):
+        kwargs["reload"] = False
+        logger.info("Flow2API packaged agent (http://%s:%s)", HTTP_HOST, HTTP_PORT)
+        uvicorn.run(app, **kwargs)
+        return
+
+    pkg_dir = Path(__file__).resolve().parent
     if RELOAD:
         reload_dirs = [str(pkg_dir)]
         if FRONTEND_DIR.is_dir():

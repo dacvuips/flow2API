@@ -358,6 +358,37 @@ Sau khi generate/upscale **thành công**, media được tải về `storage/ou
 
 Source Python này được **reverse-engineer** từ `Flow2API-Agent.exe` + mở rộng từ [flowkit](https://github.com/crisng95/flowkit). Một số tính năng nâng cao của bản đóng gói (storyboard, vision classify, pipeline đầy đủ) có thể chưa có — lõi **gen_image / gen_text_video** và admin key đã được implement.
 
+## Đóng gói bản cài Windows (Setup.exe)
+
+Trên máy build (có Python + đã `install.bat`):
+
+1. Cài [Inno Setup 6](https://jrsoftware.org/isinfo.php) (để ra wizard Next → Next).
+2. Chạy:
+
+```bat
+cd python-app\build
+build_release.bat
+```
+
+Tùy chọn che code mạnh hơn (PyArmor + freeze):
+
+```bat
+build_release.bat --obfuscate
+```
+
+Kết quả:
+
+| File | Mô tả |
+|------|--------|
+| `python-app\dist\Flow2API-Release\` | Bản portable — double-click `Run Flow2API.bat` |
+| `python-app\dist\Flow2API-Setup-1.0.0.exe` | Installer Next→Next (cần Inno Setup) |
+
+Người dùng cuối **không cần cài Python**. Sau Setup chỉ cần chạy shortcut **Flow2API**; lần đầu load folder `extension` trong Chrome (Chrome phải đã cài sẵn).
+
+**Storage:** Setup hỏi thư mục lưu dữ liệu (DB / video / output) và ghi vào `storage_path.txt`. Đổi sau: `Run Flow2API.bat --pick-storage`.
+
+Lưu ý: đóng gói/obfuscate **khó đọc source**, không phải mã hóa tuyệt đối — reverse engineer vẫn có thể ở mức chuyên sâu.
+
 ## Cấu trúc thư mục
 
 ```
