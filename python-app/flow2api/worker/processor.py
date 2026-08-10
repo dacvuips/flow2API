@@ -1659,6 +1659,10 @@ class WorkerController:
                 video_quality=video_quality,
                 reference_media_ids=ref_ids,
                 variant_count=vc,
+                voice=params.get("voice")
+                or params.get("reference_audio")
+                or params.get("referenceAudio")
+                or params.get("reference_audio_media_id"),
             )
             await self._poll_video(rid, raw, project_id)
             return

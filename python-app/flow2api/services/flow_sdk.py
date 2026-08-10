@@ -132,6 +132,17 @@ OMNI_COMPONENT_MAX_IMAGES_ONLY = 7
 OMNI_COMPONENT_MAX_VIDEOS = 1
 
 
+def normalize_voice_media_id(raw: Any) -> str:
+    """Flow referenceAudio mediaId = voice display name lowercased (Achernar → achernar)."""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    # Accept simple voice tokens only (no UUIDs / random paths).
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", s):
+        return ""
+    return s
+
+
 def _api_url(path: str) -> str:
     url = f"{GOOGLE_FLOW_API}{path}"
     if GOOGLE_API_KEY:
@@ -1487,10 +1498,12 @@ async def gen_multi_image_video(
     video_quality: str,
     reference_media_ids: list[str],
     variant_count: int = 1,
+    voice: str | None = None,
+    reference_audio_media_id: str | None = None,
 ) -> dict:
     tier = _require_tier(client)
     model_key = _video_model_key("r2v", tier, aspect_ratio, video_quality)
-    request_item = {
+    request_item: dict[str, Any] = {
         "aspectRatio": VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"]),
         "seed": int(time.time()) % 10000,
         "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
@@ -1501,6 +1514,10 @@ async def gen_multi_image_video(
         ],
         "metadata": {},
     }
+    audio_id = normalize_voice_media_id(reference_audio_media_id or voice)
+    if audio_id:
+        # Flow voice id is the voice name lowercased (e.g. Achernar → achernar).
+        request_item["referenceAudio"] = [{"mediaId": audio_id}]
     body = _video_request_body(project_id, tier, request_item, variant_count=variant_count)
     return await _video_submit_request(
         client, _api_url(VIDEO_REF_PATH), body, model_key=model_key

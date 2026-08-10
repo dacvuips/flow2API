@@ -70,6 +70,23 @@ def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
     if image_base64s:
         out["image_base64s"] = image_base64s
 
+    # Video component voice → referenceAudio[].mediaId (lowercase voice name)
+    if not out.get("voice"):
+        for key in (
+            "reference_audio",
+            "referenceAudio",
+            "reference_audio_media_id",
+            "referenceAudioMediaId",
+            "voice_id",
+            "voiceId",
+        ):
+            raw = out.get(key)
+            if raw is not None and str(raw).strip():
+                out["voice"] = str(raw).strip().lower()
+                break
+    elif out.get("voice") is not None:
+        out["voice"] = str(out.get("voice")).strip().lower()
+
     video_base64s = out.get("video_base64s") or out.get("videoBase64s")
     if video_base64s:
         out["video_base64s"] = video_base64s
