@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -156,6 +157,15 @@ def auto_status() -> dict[str, Any]:
         and (s.get("role") or "bridge") != "center"
         and not s.get("accepting_jobs")
     ]
+    # Slot auto thực sự có thể mở (bỏ user Ngừng job / cooldown / center)
+    eligible_open = sum(
+        1
+        for s in slots
+        if _gen_slot_eligible(s, skip_running=True, skip_cooldown=True)
+    )
+    target = _parallel_gen_target() if cfg.enabled else 0
+    have = _count_active_or_starting_gens() if cfg.enabled else len(accepting)
+    manual_off_n = _count_manual_dispatch_off_gens()
     return {
         "ok": True,
         "settings": cfg.to_dict(),
@@ -165,15 +175,20 @@ def auto_status() -> dict[str, Any]:
         "need_refresh_count": 0,
         "accepting_count": len(accepting),
         "standby_count": len(openable),
+        "eligible_standby_count": eligible_open,
+        "parallel_target": target,
+        "parallel_have": have,
+        "manual_dispatch_off_count": manual_off_n,
         "logs": list(_logs[-40:]),
         "scheduler_alive": bool(_scheduler_task and not _scheduler_task.done()),
         "hint": (
-            "Nút «Chạy CDP tiếp theo»: lấy CDP Gen standby / «không nhận job» kế tiếp tuần hoàn "
+            "Nút «Chạy CDP tiếp theo»: lấy CDP Gen kế tiếp tuần hoàn "
             "→ Sync cookies → bật Nhận job. "
-            "Sau «Lưu cấu hình»: nếu số Gen đang nhận job < Song song Gen CDP → tự mở CDP cho đủ "
-            "(Standby và «không nhận job» đều mở được). "
-            "Khi lịch bật và gen lỗi TK / token hết hạn → Ngừng job → mở CDP kế tuần hoàn "
-            "(flow12 → flow1 → …). HTTP 403/429 thoáng qua không đổi Gen."
+            "Gen hết token / đang ngưng nhận job **vẫn được mở** khi đến lượt (ưu tiên Sync lại) — "
+            "chỉ skip profile user bấm «Ngừng job» tay. "
+            "Sau «Lưu cấu hình»: nếu số Gen healthy < Song song Gen CDP → tự mở bù. "
+            "Lịch bật + lỗi TK / token hết → Ngừng job slot lỗi → mở CDP kế. "
+            "HTTP 403/429 thoáng qua không đổi Gen."
         ),
     }
 
@@ -211,6 +226,21 @@ def _is_cycle_busy(slot_id: str) -> bool:
     return bool(sid and (sid in _running or sid in _pending_start))
 
 
+def _slot_token_dead(s: dict[str, Any]) -> bool:
+    """True nếu token DB coi như hết / không dùng được cho gen."""
+    status = str(s.get("token_status") or "").strip().lower()
+    if status in ("expired", "missing", "no-session"):
+        return True
+    rem = s.get("token_remaining_seconds_real")
+    if rem is None:
+        rem = s.get("token_remaining_seconds")
+    try:
+        rem_n = float(rem) if rem is not None else None
+    except (TypeError, ValueError):
+        rem_n = None
+    return rem_n is not None and rem_n <= 0
+
+
 def _gen_slot_eligible(
     s: dict[str, Any],
     *,
@@ -219,14 +249,17 @@ def _gen_slot_eligible(
     skip_cooldown: bool = False,
     now: float | None = None,
 ) -> bool:
-    """True nếu slot Gen có thể mở CDP/Sync.
+    """True nếu slot Gen có thể / nên mở CDP + Sync khi đến lượt.
 
-    Gồm:
-    - Standby (ngưng job / dispatch OFF) do hệ thống
-    - «không nhận job» (dispatch ON nhưng không accepting — token chết, lane hỏng…)
-    Không gồm:
-    - Gen đang «Nhận job» (accepting)
-    - Profile user bấm Ngừng job thủ công (không auto mở lại)
+    Được mở (khi đến lượt tuần hoàn / bù Song song):
+    - Standby (ngưng job / dispatch OFF) do hệ thống — gồm token hết → ngừng nhận task
+    - «không nhận job» (dispatch ON nhưng không accepting)
+    - Dispatch ON / accepting «ma» nhưng **token đã hết** (cần Sync lại, không bỏ qua)
+
+    Không mở:
+    - Gen đang nhận job và token còn hạn (khỏe)
+    - Profile user bấm Ngừng job thủ công
+    - Center / slot tắt lịch / đang cycle / cooldown fail (tuỳ cờ)
     """
     if not s.get("enabled"):
         return False
@@ -243,7 +276,7 @@ def _gen_slot_eligible(
     ts = time.time() if now is None else now
     if skip_cooldown and _fail_cooldown_until.get(sid, 0) > ts:
         return False
-    # User bấm Ngừng job → không auto mở CDP / không bù song song bằng slot này
+    # User bấm Ngừng job → không auto mở lại đúng profile đó
     try:
         from flow2api.services.worker_settings import is_profile_manual_dispatch_off
 
@@ -251,10 +284,29 @@ def _gen_slot_eligible(
             return False
     except Exception:
         pass
-    # Đang nhận job thật → bỏ qua; standby và «không nhận job» (hệ thống) đều lấy được
-    if s.get("accepting_jobs"):
+    token_dead = _slot_token_dead(s)
+    accepting = bool(s.get("accepting_jobs"))
+    # Khỏe: đang nhận job + token còn → bỏ qua (không re-open)
+    if accepting and not token_dead:
         return False
+    # Hết token / không nhận job / standby hệ thống → được chọn khi đến lượt (không skip)
     return True
+
+
+def _gen_slot_open_priority(s: dict[str, Any]) -> int:
+    """Ưu tiên thấp hơn = mở trước. Ưu tiên Gen hết token / đã ngưng nhận job."""
+    token_dead = _slot_token_dead(s)
+    accepting = bool(s.get("accepting_jobs"))
+    dispatch = bool(s.get("dispatch_enabled"))
+    if token_dead and not accepting:
+        return 0
+    if token_dead:
+        return 1
+    if not accepting and not dispatch:
+        return 2  # standby hệ thống
+    if not accepting:
+        return 3
+    return 9
 
 
 def _count_manual_dispatch_off_gens() -> int:
@@ -282,13 +334,14 @@ def _count_manual_dispatch_off_gens() -> int:
 
 
 def _parallel_gen_target() -> int:
-    """Song song Gen CDP trừ số profile user cố ý ngừng (không bù thay)."""
+    """Mục tiêu số Gen (Song song Gen CDP).
+
+    Profile user «Ngừng job» không được chọn để mở (`_gen_slot_eligible`), nhưng
+    KHÔNG giảm mục tiêu — vẫn bù bằng standby / hệ thống standby khác cho đủ số.
+    (Trước đây trừ cả list manual-off → target tụt (vd 4−2=2) rồi không mở thêm.)
+    """
     cfg = get_flow_cdp_auto_settings()
-    target = int(cfg.parallel_gen or 0)
-    if target <= 0:
-        return 0
-    manual_n = _count_manual_dispatch_off_gens()
-    return max(0, target - manual_n)
+    return max(0, int(cfg.parallel_gen or 0))
 
 
 def _next_gen_standby_after(
@@ -299,20 +352,30 @@ def _next_gen_standby_after(
     skip_running: bool = False,
     skip_cooldown: bool = False,
 ) -> dict[str, Any] | None:
-    """CDP Gen standby / không nhận job ngay dưới after_index (không wrap)."""
+    """CDP Gen standby / hết token / không nhận job ngay dưới after_index (không wrap)."""
     exclude = str(exclude_profile_id or "").strip()
     start = max(-1, int(after_index))
     now = time.time()
+    best: dict[str, Any] | None = None
+    best_pri = 999
     for s in slots[start + 1 :]:
-        if _gen_slot_eligible(
+        if not _gen_slot_eligible(
             s,
             exclude=exclude,
             skip_running=skip_running,
             skip_cooldown=skip_cooldown,
             now=now,
         ):
-            return s
-    return None
+            continue
+        pri = _gen_slot_open_priority(s)
+        # Thứ tự list: lấy cái đầu tiên; cùng ưu tiên thì giữ cái xuất hiện trước
+        if best is None or pri < best_pri:
+            best = s
+            best_pri = pri
+            # Ưu tiên cao nhất (token chết + không nhận job) → lấy ngay không quét hết
+            if pri == 0:
+                return best
+    return best
 
 
 def _next_gen_standby_circular(
@@ -323,8 +386,10 @@ def _next_gen_standby_circular(
     skip_running: bool = True,
     skip_cooldown: bool = True,
 ) -> dict[str, Any] | None:
-    """Gen standby / không nhận job kế tiếp tuần hoàn: … → flow12 → flow1 → …
+    """Gen kế tiếp tuần hoàn: … → flow12 → flow1 → …
 
+    Ưu tiên profile **hết token + đang không nhận job** (không bỏ qua),
+    rồi standby hệ thống / không nhận job khác.
     after_index < 0 → quét 0..n-1 một lượt.
     after_index = index profile vừa lỗi/đang active → bắt đầu từ slot kế, wrap hết list.
     """
@@ -339,23 +404,35 @@ def _next_gen_standby_circular(
     else:
         # (start+1) … n-1, 0 … start  (có wrap về đầu)
         order = [(start + i) % n for i in range(1, n + 1)]
-    for idx in order:
+
+    # Pass 1: hết token + không nhận job (và các trường hợp ưu tiên cao)
+    best: dict[str, Any] | None = None
+    best_pri = 999
+    best_order_i = 10**9
+    for order_i, idx in enumerate(order):
         s = slots[idx]
-        if _gen_slot_eligible(
+        if not _gen_slot_eligible(
             s,
             exclude=exclude,
             skip_running=skip_running,
             skip_cooldown=skip_cooldown,
             now=now,
         ):
-            return s
-    return None
+            continue
+        pri = _gen_slot_open_priority(s)
+        # Cùng priority: giữ thứ tự tuần hoàn (slot đến lượt trước)
+        if pri < best_pri or (pri == best_pri and order_i < best_order_i):
+            best = s
+            best_pri = pri
+            best_order_i = order_i
+    return best
 
 
 def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
-    """CDP Gen tiếp theo sau profile vừa lỗi — tuần hoàn (standby + không nhận job).
+    """CDP Gen tiếp theo sau profile vừa lỗi — tuần hoàn (gồm Gen hết token / ngưng job).
 
     1) Quét vòng từ ngay dưới profile lỗi (flow12 → flow1 → …)
+       — ưu tiên slot hết token đang không nhận job (không skip)
     2) Nếu tất cả đang cooldown fail 15p → quét lại bỏ cooldown (vẫn tuần hoàn)
     """
     slots = ordered_auto_slots()
@@ -383,10 +460,10 @@ def find_next_standby_gen_slot(failed_profile_id: str) -> dict[str, Any] | None:
 
 
 def find_next_cdp_to_run() -> dict[str, Any] | None:
-    """CDP Gen kế tiếp (standby hoặc «không nhận job») — tuần hoàn flow12 → flow1.
+    """CDP Gen kế tiếp — tuần hoàn flow12 → flow1.
 
-    1) Ngay dưới Gen đang nhận job cuối cùng (wrap hết list)
-    2) Bỏ cooldown fail nếu vòng 1 không còn slot
+    Không bỏ qua Gen **hết token / đang ngưng nhận job** khi đến lượt:
+    ưu tiên mở lại các slot đó (Sync token) trước standby «còn token».
     """
     slots = ordered_auto_slots()
     start_idx = _last_activated_gen_index(slots)
@@ -409,8 +486,11 @@ def find_next_cdp_to_run() -> dict[str, Any] | None:
 def _count_active_or_starting_gens() -> int:
     """Số Gen đang «giữ chỗ» song song — khớp pill «nhận job» + đang Sync.
 
-    Tính: accepting (Nhận job) · đang/sắp cycle · dispatch ON + token còn hạn.
-    Không tính: standby / «không nhận job» (token chết / missing).
+    Chỉ tính:
+    - accepting + token còn hạn (đang nhận job thật)
+    - đang/sắp cycle (mở CDP / Sync)
+
+    Không tính: hết token (dù extension còn «ready»), standby / ngưng nhận job.
     """
     n = 0
     for s in ordered_auto_slots():
@@ -424,21 +504,8 @@ def _count_active_or_starting_gens() -> int:
         if _is_cycle_busy(sid):
             n += 1
             continue
-        if s.get("accepting_jobs"):
+        if s.get("accepting_jobs") and not _slot_token_dead(s):
             n += 1
-            continue
-        # Dispatch ON nhưng token còn → vẫn tính đang hoạt động (chưa nhường slot)
-        if s.get("dispatch_enabled"):
-            status = str(s.get("token_status") or "").strip().lower()
-            rem = s.get("token_remaining_seconds_real")
-            if rem is None:
-                rem = s.get("token_remaining_seconds")
-            try:
-                rem_n = float(rem) if rem is not None else None
-            except (TypeError, ValueError):
-                rem_n = None
-            if status in ("fresh", "stale") or (rem_n is not None and rem_n > 0):
-                n += 1
     return n
 
 
@@ -466,12 +533,13 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
     blocked_reason = ""
     have_before = _count_active_or_starting_gens()
     need = max(0, target - have_before)
+    manual_off_n = _count_manual_dispatch_off_gens()
     if need <= 0:
         return {
             "ok": True,
             "target": target,
             "raw_target": raw_target,
-            "manual_off": raw_target - target,
+            "manual_off": manual_off_n,
             "have_before": have_before,
             "have": have_before,
             "need": 0,
@@ -512,7 +580,7 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
             "info",
             (
                 f"Bù Gen CDP: mục tiêu {target}"
-                + (f" (song song={raw_target}, user ngừng={raw_target - target})" if raw_target != target else "")
+                + (f" · user-Ngừng-job={manual_off_n} (bỏ qua, không giảm target)" if manual_off_n else "")
                 + f" · đang có {have_before} · cần +{need} · start {len(started)}: {', '.join(started)} "
                 f"· sau schedule={have_after} ({reason})"
             ),
@@ -522,14 +590,16 @@ def ensure_gen_slots_for_parallel(*, reason: str = "fill_parallel_gen") -> dict[
             "info",
             (
                 f"Bù Gen CDP: cần +{need} (have={have_before} → target={target}) "
-                f"nhưng chưa start — {blocked_reason or 'unknown'} ({reason})"
+                f"nhưng chưa start — {blocked_reason or 'unknown'}"
+                + (f" · eligible standby=0 / manual-off={manual_off_n}" if blocked_reason == "no_standby_available" else "")
+                + f" ({reason})"
             ),
         )
     return {
         "ok": True,
         "target": target,
         "raw_target": raw_target,
-        "manual_off": max(0, raw_target - target),
+        "manual_off": manual_off_n,
         "have_before": have_before,
         "have": have_after,
         "need": need,
@@ -831,35 +901,366 @@ async def _clear_synced_cookies(context, slot_id: str) -> int:
     return removed
 
 
-async def _click_by_texts(page, texts: list[str], *, timeout_ms: int = 25_000) -> str:
-    """Click first visible element matching any of the texts (button/link/role)."""
+async def _js_find_click_by_texts(page, texts: list[str]) -> str | None:
+    """Click qua DOM JS — CTA landing + «+ Dự án mới» (icon + chữ) mà Playwright hay miss.
+
+    Matching: exact · includes · strip dấu + · regex Create/Flow · regex New project.
+    """
+    try:
+        hit = await page.evaluate(
+            """(texts) => {
+              const norm = (s) => String(s || '')
+                .replace(/[\\u200b\\u00a0]/g, ' ')
+                .replace(/[+＋]/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+              const wanted = (texts || []).map(norm).filter(Boolean);
+              const selectors = [
+                'a', 'button', '[role="button"]',
+                'input[type="button"]', 'input[type="submit"]',
+                '[data-testid]', 'span', 'div'
+              ].join(',');
+              const nodes = Array.from(document.querySelectorAll(selectors));
+              const scoreEl = (el) => {
+                const raw = (el.innerText || el.textContent || el.value
+                  || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+                return { el, t: norm(raw), raw: String(raw || '').replace(/\\s+/g, ' ').trim() };
+              };
+              const isVisible = (el) => {
+                try {
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 2 || r.height < 2) return false;
+                  const st = window.getComputedStyle(el);
+                  if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0)
+                    return false;
+                  return true;
+                } catch (_) { return false; }
+              };
+              const tryClick = (el, label) => {
+                // Ưu tiên parent button/link nếu click vào span chữ «Dự án mới»
+                let target = el.closest('a,button,[role="button"]') || el;
+                // Nếu el là container lớn chứa icon + text, giữ el nếu rõ là toolbar chip
+                if (!isVisible(target) && isVisible(el)) target = el;
+                if (!isVisible(target) && !isVisible(el)) return null;
+                try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+                try {
+                  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                  target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                } catch (_) {}
+                try { target.click(); } catch (_) {}
+                return label || (target.innerText || '').trim() || 'clicked';
+              };
+
+              // 1) match wanted strings (đã strip +)
+              for (const { el, t, raw } of nodes.map(scoreEl)) {
+                if (!t || t.length > 60) continue;
+                for (const w of wanted) {
+                  if (t === w || t.includes(w) || (w.length >= 8 && w.includes(t) && t.length >= 6)) {
+                    const label = tryClick(el, raw || w);
+                    if (label) return label;
+                  }
+                }
+              }
+
+              // 2) Landing CTA «Create with Google Flow»
+              const ctaRe = /create\\s+with\\s+(google\\s+)?(ai\\s+)?flow|tạo\\s+bằng\\s+google\\s+flow|try\\s+google\\s+flow/i;
+              for (const { el, t, raw } of nodes.map(scoreEl)) {
+                if (!t || t.length > 80 || !ctaRe.test(t)) continue;
+                const label = tryClick(el, raw || t);
+                if (label) return label;
+              }
+
+              // 3) «+ Dự án mới» / New project (toolbar dark chip — screenshot)
+              const newRe = /^(new\\s+project|create\\s+(a\\s+)?(new\\s+)?project|dự\\s*án\\s+mới|du\\s*an\\s+moi|tạo\\s+dự\\s+án|tao\\s+du\\s+an)$/i;
+              const newLoose = /(new\\s+project|dự\\s*án\\s+mới|tạo\\s+dự\\s+án)/i;
+              // Ưu tiên match ngắn đúng chip; tránh click toàn header
+              const scored = nodes.map(scoreEl).filter(({ t }) => t && t.length <= 40 && newLoose.test(t));
+              scored.sort((a, b) => a.t.length - b.t.length);
+              for (const { el, t, raw } of scored) {
+                if (!newRe.test(t) && !(t.includes('dự án mới') || t.includes('new project'))) continue;
+                const label = tryClick(el, raw || t);
+                if (label) return label;
+              }
+              return null;
+            }""",
+            list(texts or []),
+        )
+        if hit and str(hit).strip():
+            return str(hit).strip()
+    except Exception as exc:
+        logger.debug("js_find_click_by_texts failed: %s", exc)
+    return None
+
+
+async def _click_by_texts(
+    page,
+    texts: list[str],
+    *,
+    timeout_ms: int = 18_000,
+    per_try_ms: int = 3_000,
+) -> str:
+    """Click first visible match — Playwright locators + JS fallback (landing CTA / Dự án mới)."""
     last_err: Exception | None = None
-    for text in texts:
-        candidates = [
-            lambda t=text: page.get_by_role("button", name=t),
-            lambda t=text: page.get_by_role("link", name=t),
-            lambda t=text: page.get_by_text(t, exact=True),
-            lambda t=text: page.get_by_text(t, exact=False),
-        ]
-        for make in candidates:
-            try:
-                loc = make().first
-                await loc.wait_for(state="visible", timeout=timeout_ms)
-                await loc.click(timeout=timeout_ms)
-                return text
-            except Exception as exc:
-                last_err = exc
-                continue
+    deadline = time.monotonic() + max(0.5, timeout_ms / 1000.0)
+    texts = [str(t).strip() for t in (texts or []) if str(t).strip()]
+
+    # Poll: Playwright → JS mỗi vòng (landing render trễ / custom component)
+    while time.monotonic() < deadline:
+        remain_ms = int((deadline - time.monotonic()) * 1000)
+        if remain_ms < 150:
+            break
+        try_ms = min(per_try_ms, remain_ms)
+
+        for text in texts:
+            patterns: list[Any] = [text]
+            low = text.lower()
+            if "flow" in low:
+                patterns.append(re.compile(re.escape(text), re.I))
+            if low == "create with google flow":
+                patterns.append(re.compile(r"create\s+with\s+google\s+flow", re.I))
+            if low in ("dự án mới", "du an moi", "new project", "+ dự án mới", "+ new project"):
+                # Button «+ Dự án mới» — name accessible có thể kèm dấu +
+                patterns.append(re.compile(r"\+?\s*dự\s*án\s+mới", re.I))
+                patterns.append(re.compile(r"\+?\s*new\s+project", re.I))
+            if "dự án" in low or "new project" in low:
+                patterns.append(re.compile(re.escape(text), re.I))
+                patterns.append(re.compile(r"\+?\s*" + re.escape(text), re.I))
+
+            for pat in patterns:
+                locators = []
+                try:
+                    if isinstance(pat, str):
+                        locators = [
+                            page.get_by_role("button", name=pat),
+                            page.get_by_role("link", name=pat),
+                            page.get_by_role("button", name=re.compile(re.escape(pat), re.I)),
+                            page.locator("a,button,[role='button']").filter(has_text=pat),
+                            page.get_by_text(pat, exact=True),
+                            page.get_by_text(pat, exact=False),
+                        ]
+                    else:
+                        locators = [
+                            page.get_by_role("button", name=pat),
+                            page.get_by_role("link", name=pat),
+                            page.locator("a,button,[role='button']").filter(has_text=pat),
+                            page.get_by_text(pat),
+                        ]
+                except Exception as exc:
+                    last_err = exc
+                    continue
+
+                for loc in locators:
+                    try:
+                        first = loc.first
+                        await first.wait_for(state="visible", timeout=min(1_200, try_ms))
+                        try:
+                            await first.scroll_into_view_if_needed(timeout=2_000)
+                        except Exception:
+                            pass
+                        try:
+                            await first.click(timeout=min(5_000, try_ms))
+                        except Exception:
+                            # Overlay / animation — force
+                            await first.click(timeout=3_000, force=True)
+                        return text
+                    except Exception as exc:
+                        last_err = exc
+                        continue
+
+        # JS fallback: pill Create / chip «+ Dự án mới»
+        js_hit = await _js_find_click_by_texts(page, texts)
+        if js_hit:
+            return js_hit
+
+        await page.wait_for_timeout(400)
+
     raise RuntimeError(
         f"Không tìm thấy nút nào trong {texts!r}: {last_err}"
     )
 
 
+async def _try_click_by_texts(
+    page,
+    texts: list[str],
+    *,
+    timeout_ms: int = 18_000,
+    per_try_ms: int = 3_000,
+) -> str | None:
+    """Soft click — None nếu không thấy (không raise)."""
+    try:
+        return await _click_by_texts(
+            page, texts, timeout_ms=timeout_ms, per_try_ms=per_try_ms
+        )
+    except Exception:
+        return None
+
+
+async def _flow_session_ready(page) -> bool:
+    """True nếu tab đã có NextAuth session-token (đủ để Sync)."""
+    try:
+        cookies = await page.context.cookies()
+        for c in cookies or []:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("name") or "") == "__Secure-next-auth.session-token":
+                return bool(str(c.get("value") or "").strip())
+    except Exception:
+        pass
+    return False
+
+
+_CREATE_CTA_TEXTS = [
+    "Create with Google Flow",
+    "Tạo bằng Google Flow",
+    "Create with Flow",
+    "Create with Google AI Flow",
+    "Try Google Flow",
+    "Get started",
+    "Bắt đầu",
+    "Start creating",
+]
+
+_SIGN_IN_TEXTS = [
+    "Sign in with Google",
+    "Đăng nhập bằng Google",
+    "Continue with Google",
+    "Tiếp tục với Google",
+    "Sign in",
+    "Đăng nhập",
+]
+
+# Chip toolbar: + icon + «Dự án mới» (accessible name có thể là "+ Dự án mới")
+_NEW_PROJECT_TEXTS = [
+    "Dự án mới",
+    "+ Dự án mới",
+    "＋ Dự án mới",
+    "New project",
+    "+ New project",
+    "New Project",
+    "Create project",
+    "Tạo dự án",
+    "Create new project",
+]
+
+
+async def _navigate_flow_ui(page, slot_id: str, *, flow_url: str) -> dict[str, Any]:
+    """Sau clear cookies: thử CTA / đăng nhập / dự án mới — không fail cứng nếu UI đã vào app.
+
+    Landing: pill trắng «Create with Google Flow».
+    Trong app: chip tối «+ Dự án mới» (icon + text).
+    """
+    # Chờ hydrate / soft redirect SSO / hero load
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=12_000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(1_200)
+
+    # Scroll nhẹ — CTA pill thường ở nửa dưới viewport landing
+    try:
+        await page.evaluate("() => window.scrollTo(0, Math.min(400, document.body.scrollHeight/3))")
+    except Exception:
+        pass
+
+    clicked_create = await _try_click_by_texts(
+        page, _CREATE_CTA_TEXTS, timeout_ms=22_000, per_try_ms=2_500
+    )
+    if clicked_create:
+        _log("info", f"{slot_id}: click «{clicked_create}»", slot_id=slot_id)
+        await page.wait_for_timeout(1_800)
+    else:
+        signed = await _try_click_by_texts(
+            page, _SIGN_IN_TEXTS, timeout_ms=8_000, per_try_ms=1_500
+        )
+        if signed:
+            _log("info", f"{slot_id}: click «{signed}» (SSO)", slot_id=slot_id)
+            await page.wait_for_timeout(3_000)
+            clicked_create = await _try_click_by_texts(
+                page, _CREATE_CTA_TEXTS, timeout_ms=18_000, per_try_ms=2_500
+            )
+            if clicked_create:
+                _log(
+                    "info",
+                    f"{slot_id}: click «{clicked_create}» (sau SSO)",
+                    slot_id=slot_id,
+                )
+                await page.wait_for_timeout(1_800)
+        else:
+            _log(
+                "info",
+                (
+                    f"{slot_id}: không thấy Create/Sign-in CTA "
+                    f"(có thể đã vào Flow UI) — tiếp tục New project / Sync"
+                ),
+                slot_id=slot_id,
+            )
+
+    clicked_new = await _try_click_by_texts(
+        page, _NEW_PROJECT_TEXTS, timeout_ms=20_000, per_try_ms=2_500
+    )
+    if clicked_new:
+        _log("info", f"{slot_id}: click «{clicked_new}»", slot_id=slot_id)
+    else:
+        if await _flow_session_ready(page):
+            _log(
+                "info",
+                f"{slot_id}: không thấy «Dự án mới» nhưng đã có session — Sync trực tiếp",
+                slot_id=slot_id,
+            )
+        else:
+            try:
+                await page.goto(flow_url, wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(1_500)
+            except Exception as exc:
+                _log("error", f"{slot_id}: reload Flow sau miss CTA: {exc}", slot_id=slot_id)
+            # Reload xong thử lại Create (đúng UI screenshot)
+            clicked_create = clicked_create or await _try_click_by_texts(
+                page, _CREATE_CTA_TEXTS, timeout_ms=18_000, per_try_ms=2_500
+            )
+            if clicked_create:
+                _log(
+                    "info",
+                    f"{slot_id}: click «{clicked_create}» (sau reload)",
+                    slot_id=slot_id,
+                )
+                await page.wait_for_timeout(1_500)
+            clicked_new = await _try_click_by_texts(
+                page, _NEW_PROJECT_TEXTS, timeout_ms=12_000, per_try_ms=2_000
+            )
+            if clicked_new:
+                _log("info", f"{slot_id}: click «{clicked_new}» (sau reload)", slot_id=slot_id)
+            elif not await _flow_session_ready(page):
+                raise RuntimeError(
+                    "Flow UI không hiện Create/New project và chưa có session-token. "
+                    "Mở CDP, đăng nhập Google Flow tay, rồi «Chạy ngay» / Sync lại."
+                )
+            else:
+                _log(
+                    "info",
+                    f"{slot_id}: vẫn không thấy New project — session OK, Sync",
+                    slot_id=slot_id,
+                )
+
+    return {
+        "clicked_create": clicked_create,
+        "clicked_new": clicked_new,
+        "session_ready": await _flow_session_ready(page),
+    }
+
+
 async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
     """
     Full cycle for one CDP:
-    open → flow URL → clear synced cookies → Create with Google Flow
-    → Dự án mới → wait → Sync → close CDP
+    open → flow URL → clear synced cookies → (Create / SSO / New project nếu có)
+    → wait → Sync → close CDP
+
+    Create CTA là optional: profile đã login Google có thể vào thẳng Flow UI.
     """
     from flow2api.services.flow_cdp_auto_settings import get_flow_cdp_auto_settings
 
@@ -908,34 +1309,13 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             meta["step"] = "clear_cookies"
             cleared = await _clear_synced_cookies(context, slot_id)
             _log("info", f"{slot_id}: đã clear {cleared} cookies", slot_id=slot_id)
-            # Reload so UI shows logged-out / create CTA
+            # Reload so UI shows logged-out / create CTA / auto SSO
             await page.goto(flow_url, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(1200)
 
-            meta["step"] = "click_create"
-            clicked_create = await _click_by_texts(
-                page,
-                [
-                    "Create with Google Flow",
-                    "Tạo bằng Google Flow",
-                    "Create with Flow",
-                ],
-                timeout_ms=35_000,
-            )
-            _log("info", f"{slot_id}: click «{clicked_create}»", slot_id=slot_id)
-            await page.wait_for_timeout(1500)
-
-            meta["step"] = "click_new_project"
-            clicked_new = await _click_by_texts(
-                page,
-                [
-                    "Dự án mới",
-                    "New project",
-                    "New Project",
-                ],
-                timeout_ms=35_000,
-            )
-            _log("info", f"{slot_id}: click «{clicked_new}»", slot_id=slot_id)
+            meta["step"] = "navigate_ui"
+            nav = await _navigate_flow_ui(page, slot_id, flow_url=flow_url)
+            clicked_create = nav.get("clicked_create")
+            clicked_new = nav.get("clicked_new")
 
             meta["step"] = "wait_sync"
             await asyncio.sleep(sync_delay)
