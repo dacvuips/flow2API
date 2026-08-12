@@ -136,6 +136,9 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
         try:
             params = apply_user_profile_assignment(params, pid)
         except ValueError as exc:
+            err = str(exc or "profile_not_found")
+            if err == "profile_not_accepting_jobs":
+                raise HTTPException(400, "profile_not_accepting_jobs") from exc
             raise HTTPException(400, "profile_not_found") from exc
     prompt = str(params.get("prompt") or "")
     model = (
@@ -398,6 +401,9 @@ async def assign_request_profile(
     try:
         params = apply_user_profile_assignment(params, body.profile_id)
     except ValueError as exc:
+        err = str(exc or "profile_not_found")
+        if err == "profile_not_accepting_jobs":
+            raise HTTPException(400, "profile_not_accepting_jobs") from exc
         raise HTTPException(400, "profile_not_found") from exc
     if was_running:
         activity.requeue_request(request_id, params)

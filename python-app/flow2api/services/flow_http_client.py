@@ -89,8 +89,9 @@ async def tls_fetch(
     headers: Optional[dict[str, Any]] = None,
     body: Any = None,
     timeout: float = 120.0,
+    allow_redirects: bool = True,
 ) -> dict[str, Any]:
-    """Low-level TLS impersonated fetch. Returns {status, body, headers}."""
+    """Low-level TLS impersonated fetch. Returns {status, body, headers, url}."""
     ua = _default_ua()
     hdrs = _merge_headers(_build_base_headers(url, ua), headers)
     is_cross = "googleapis.com" in url
@@ -137,12 +138,14 @@ async def tls_fetch(
             data=content if json_body is None else None,
             json=json_body,
             timeout=timeout,
+            allow_redirects=allow_redirects,
         )
         text = resp.text if resp.text is not None else ""
         return {
             "status": int(resp.status_code),
             "body": text,
             "headers": dict(resp.headers),
+            "url": str(getattr(resp, "url", None) or url),
         }
 
 
@@ -154,8 +157,9 @@ async def google_fetch(
     headers: Optional[dict[str, Any]] = None,
     body: Any = None,
     timeout: float = 180.0,
+    allow_redirects: bool = True,
 ) -> dict[str, Any]:
-    """Extension-compatible response: {status, data, error?}."""
+    """Extension-compatible response: {status, data, error?, headers, url}."""
     raw = await tls_fetch(
         profile_id=profile_id,
         url=url,
@@ -163,6 +167,7 @@ async def google_fetch(
         headers=headers,
         body=body,
         timeout=timeout,
+        allow_redirects=allow_redirects,
     )
     status = int(raw.get("status") or 0)
     body_text = str(raw.get("body") or "")
@@ -172,7 +177,12 @@ async def google_fetch(
             data = json.loads(body_text)
         except json.JSONDecodeError:
             data = body_text
-    out: dict[str, Any] = {"status": status, "data": data}
+    out: dict[str, Any] = {
+        "status": status,
+        "data": data,
+        "headers": raw.get("headers") or {},
+        "url": raw.get("url") or url,
+    }
     if status >= 400:
         out["error"] = f"HTTP_{status}"
     return out

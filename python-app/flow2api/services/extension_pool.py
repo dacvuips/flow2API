@@ -18,6 +18,17 @@ from flow2api.services.request_logs import append_request_log
 logger = logging.getLogger(__name__)
 
 
+def _response_header(resp: dict, name: str) -> str:
+    headers = resp.get("headers") if isinstance(resp, dict) else None
+    if not isinstance(headers, dict):
+        return ""
+    want = str(name or "").lower()
+    for key, val in headers.items():
+        if str(key).lower() == want:
+            return str(val or "").strip()
+    return ""
+
+
 def _url_requires_center_captcha(url: str) -> bool:
     """Gen image/video/text submit endpoints — bắt buộc token từ Captcha Center."""
     u = str(url or "")
@@ -688,6 +699,65 @@ class ExtensionSession:
         return await self.api_request(
             url, method="GET", timeout=timeout, raise_on_error=False
         )
+
+    async def get_media_url_redirect(
+        self,
+        media_id: str,
+        *,
+        media_url_type: str = "MEDIA_URL_TYPE_VIDEO",
+        timeout: float = 30.0,
+    ) -> dict:
+        """GET labs tRPC media.getMediaUrlRedirect — 307 Location → flow-content.google."""
+        from urllib.parse import urlencode
+
+        from flow2api.config import TRPC_BASE
+
+        params: dict[str, str] = {"name": str(media_id).strip()}
+        if media_url_type:
+            params["mediaUrlType"] = media_url_type
+        url = f"{TRPC_BASE}/media.getMediaUrlRedirect?{urlencode(params)}"
+        auth_headers = await self._with_auth_headers({})
+        if self._use_direct_http():
+            from flow2api.services.flow_http_client import google_fetch
+
+            resp = await google_fetch(
+                profile_id=self.profile_id,
+                url=url,
+                method="GET",
+                headers=auth_headers,
+                body=None,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        else:
+            if not self._ws:
+                raise RuntimeError("extension_not_connected")
+            resp = await self._send(
+                "trpc_request",
+                {
+                    "url": url,
+                    "method": "GET",
+                    "headers": auth_headers,
+                    "redirect": "manual",
+                },
+                timeout=timeout,
+            )
+        status = int(resp.get("status") or 0) if isinstance(resp, dict) else 0
+        location = _response_header(resp, "location") if isinstance(resp, dict) else ""
+        append_request_log(
+            self.trace_request_id,
+            "trpc",
+            f"media.getMediaUrlRedirect {media_id[:8]}… type={media_url_type or '-'} → {status}"
+            + (f" location={location[:120]}" if location else ""),
+            level="info" if 200 <= status < 400 else "warn",
+            data={
+                "url": url,
+                "status": status,
+                "location": location,
+                "final_url": (resp or {}).get("url") if isinstance(resp, dict) else None,
+            },
+        )
+        return resp if isinstance(resp, dict) else {"status": 0, "error": "empty_redirect_response"}
 
     async def labs_upload_video_start(
         self,

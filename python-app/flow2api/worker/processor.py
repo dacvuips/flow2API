@@ -396,15 +396,14 @@ class WorkerController:
         *,
         reason: str = "dispatch_disabled",
     ) -> int:
-        """Ngưng nhận job → dừng job đang chạy trên profile đó và đưa về queue profile khác."""
+        """Ngưng nhận job → bỏ gán queued/running khỏi profile, chuyển profile đang hoạt động."""
         pid = str(profile_id or "").strip()
         if not pid:
             return 0
         self._prune_running()
         targets: list[str] = []
-        for rid in list(self._running.keys()):
-            row = activity.get_request(rid)
-            if not row or row.status != "running":
+        for row in activity.list_active_requests():
+            if row.status not in ("queued", "running"):
                 continue
             try:
                 params = normalize_request_params(json.loads(row.params_json or "{}"))
@@ -412,7 +411,7 @@ class WorkerController:
                 continue
             if str(params.get("profile_id") or "").strip() != pid:
                 continue
-            targets.append(rid)
+            targets.append(row.id)
 
         if not targets:
             return 0
@@ -431,19 +430,22 @@ class WorkerController:
         moved = 0
         for rid in targets:
             row = activity.get_request(rid)
-            if not row or row.status != "running":
+            if not row or row.status not in ("queued", "running"):
                 continue
+            was_running = row.status == "running"
             try:
                 params = normalize_request_params(json.loads(row.params_json or "{}"))
             except Exception:
                 params = {"profile_id": pid}
             params["retry_exclude_profile_id"] = pid
+            params.pop("profile_assigned_by_user", None)
             rotated = apply_retry_profile_rotation(params, row.type)
             if str(rotated.get("profile_id") or "").strip() == pid:
                 rotated.pop("profile_id", None)
                 rotated.pop("profile_label", None)
                 rotated.pop("profile_email", None)
                 rotated["retry_exclude_profile_id"] = pid
+            rotated.pop("profile_assigned_by_user", None)
             rotated.pop("running_started_at", None)
             activity.update_request(rid, status="queued", params=rotated, error=None)
             append_request_log(
@@ -451,7 +453,7 @@ class WorkerController:
                 "worker",
                 (
                     f"Profile {pid[:12]} ngưng nhận job ({reason}) "
-                    "— dừng gọi API, chuyển profile khác"
+                    "— bỏ gán, chuyển profile đang hoạt động"
                 ),
                 level="warn",
                 profile_id=str(
@@ -461,16 +463,17 @@ class WorkerController:
             )
             events.publish("request_finished", {"id": rid, "status": "queued"})
             logger.warning(
-                "requeue running rid=%s off profile=%s reason=%s → %s",
+                "requeue rid=%s off profile=%s reason=%s → %s",
                 rid[:8],
                 pid[:12],
                 reason,
                 str(rotated.get("profile_id") or "-")[:12],
             )
-            task = self._running.get(rid)
-            self.request_cancel(rid)
-            if task and not task.done():
-                task.cancel()
+            if was_running:
+                task = self._running.get(rid)
+                self.request_cancel(rid)
+                if task and not task.done():
+                    task.cancel()
             moved += 1
         return moved
 
@@ -672,7 +675,12 @@ class WorkerController:
                 request_type=request_type,
             )
             if not profile_id:
-                raise RuntimeError("assigned_profile_not_available")
+                params.pop("profile_assigned_by_user", None)
+                profile_id = pick_profile_for_task(
+                    None,
+                    credit_required=credit_required,
+                    request_type=request_type,
+                )
         elif existing:
             profile_id = pick_profile_for_task(
                 str(existing),

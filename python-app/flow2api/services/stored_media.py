@@ -405,15 +405,94 @@ def normalize_publisher_urls(result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _external_https_urls(urls: Any) -> list[str]:
+def is_app_hosted_result_url(url: str) -> bool:
+    """True for local/public app paths (/video/{id}, /image/{id}, /outputs, …)."""
+    u = str(url or "").strip()
+    if not u:
+        return True
+    if u.startswith(("/outputs/", "/media/", "/inputs/", "/video/", "/image/")):
+        return True
+    base = get_public_base_url()
+    if base and (u == base or u.startswith(base + "/")):
+        path = u[len(base):] or "/"
+        if path.startswith(("/video/", "/image/", "/media/", "/outputs/", "/inputs/")):
+            return True
+    return False
+
+
+def _flow_https_urls(urls: Any) -> list[str]:
     if not isinstance(urls, list):
         return []
-    base = get_public_base_url()
     out: list[str] = []
     for raw in urls:
         u = str(raw or "").strip()
-        if u.startswith(("http://", "https://")) and not (base and u.startswith(f"{base}/")):
+        if u.startswith(("http://", "https://")) and not is_app_hosted_result_url(u):
             out.append(u)
+    return out
+
+
+def _external_https_urls(urls: Any) -> list[str]:
+    return _flow_https_urls(urls)
+
+
+def keep_flow_result_urls(result: dict[str, Any], *, kind: str = "") -> dict[str, Any]:
+    """Keep Flow fifeUrl CDN links in image_urls/video_urls/Link — never /image|/video rewrite."""
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    is_video = "video" in str(kind or "").lower()
+    primary_key = "video_urls" if is_video else "image_urls"
+    other_key = "image_urls" if is_video else "video_urls"
+    default_kind = "video" if is_video else "image"
+
+    primary = _flow_https_urls(out.get(primary_key))
+    entries = out.get("media_entries") if isinstance(out.get("media_entries"), list) else []
+    slim_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        url = str(item.get("url") or "").strip()
+        if url.startswith(("http://", "https://")) and not is_app_hosted_result_url(url):
+            item["url"] = url
+            if url not in primary:
+                primary.append(url)
+            slim_entries.append(item)
+        elif not url:
+            slim_entries.append(item)
+    if slim_entries:
+        out["media_entries"] = slim_entries
+    elif "media_entries" in out and not primary:
+        out.pop("media_entries", None)
+
+    link = str(out.get("Link") or "").strip()
+    if link.startswith(("http://", "https://")) and not is_app_hosted_result_url(link):
+        if link not in primary:
+            primary.insert(0, link)
+
+    if not primary:
+        out.pop("Local", None)
+        return out
+
+    out[primary_key] = primary
+    out["Link"] = primary[0]
+    media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
+    if not slim_entries:
+        built: list[dict[str, str]] = []
+        for idx, url in enumerate(primary):
+            entry: dict[str, str] = {"url": url, "kind": default_kind}
+            if idx < len(media_ids):
+                entry["media_id"] = media_ids[idx]
+            built.append(entry)
+        out["media_entries"] = built
+
+    other = _flow_https_urls(out.get(other_key))
+    if other:
+        out[other_key] = other
+    else:
+        out.pop(other_key, None)
+
+    out.pop("Local", None)
     return out
 
 
@@ -479,34 +558,10 @@ def apply_video_public_urls(request_id: str, result: dict[str, Any]) -> dict[str
 
 
 def finalize_video_result_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
-    """Pick playable HTTPS URLs for video tasks (mirror image CDN behavior)."""
+    """Keep Flow fifeUrl in video_urls/Link — do not rewrite to /video/{id}."""
+    _ = request_id
     out = rewrite_result_public_urls(dict(result))
-    external = _external_https_urls(out.get("video_urls") or [])
-    link = str(out.get("Link") or "").strip()
-    if link.startswith(("http://", "https://")):
-        rewritten_link = rewrite_public_base_url(link)
-        base = get_public_base_url()
-        if rewritten_link.startswith(("http://", "https://")) and (
-            not base or not rewritten_link.startswith(base)
-        ):
-            external = external or [rewritten_link]
-
-    if resolve_stored_video_path(request_id, 0):
-        out = apply_video_public_urls(request_id, out)
-    elif external:
-        out["video_urls"] = external
-        out["Link"] = external[0]
-    else:
-        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
-        if media_ids:
-            pub = public_media_url(media_ids[0])
-            out["video_urls"] = [pub]
-            out["Link"] = pub
-            out["media_entries"] = [
-                {"url": pub, "media_id": media_ids[0], "kind": "video"},
-            ]
-
-    return normalize_publisher_urls(rewrite_result_public_urls(out))
+    return normalize_publisher_urls(keep_flow_result_urls(out, kind="video"))
 
 
 def apply_image_public_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -553,35 +608,10 @@ def apply_image_public_urls(request_id: str, result: dict[str, Any]) -> dict[str
 
 
 def finalize_image_result_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
-    """Prefer stable public /image/{id} URLs when files are cached locally."""
+    """Keep Flow fifeUrl in image_urls/Link — do not rewrite to /image/{id}."""
+    _ = request_id
     out = rewrite_result_public_urls(dict(result))
-    external = _external_https_urls(out.get("image_urls") or [])
-    link = str(out.get("Link") or "").strip()
-    if link.startswith(("http://", "https://")):
-        rewritten_link = rewrite_public_base_url(link)
-        base = get_public_base_url()
-        if rewritten_link.startswith(("http://", "https://")) and (
-            not base or not rewritten_link.startswith(base)
-        ):
-            external = external or [rewritten_link]
-
-    if resolve_stored_image_path(request_id, 0):
-        out = apply_image_public_urls(request_id, out)
-    elif external:
-        out["image_urls"] = external
-        out["Link"] = external[0]
-    else:
-        media_ids = [str(m) for m in (out.get("media_ids") or []) if str(m).strip()]
-        if media_ids:
-            pubs = [public_media_url(mid) for mid in media_ids]
-            out["image_urls"] = pubs
-            out["Link"] = pubs[0]
-            out["media_entries"] = [
-                {"url": pub, "media_id": mid, "kind": "image"}
-                for pub, mid in zip(pubs, media_ids)
-            ]
-
-    return normalize_publisher_urls(rewrite_result_public_urls(out))
+    return normalize_publisher_urls(keep_flow_result_urls(out, kind="image"))
 
 
 def _load_request_video_result(request_id: str) -> dict[str, Any] | None:
@@ -691,42 +721,14 @@ async def persist_task_result(
     result: dict[str, Any],
     task_type: str,
 ) -> dict[str, Any]:
-    """Cache media on disk, clean watermarks, expose stable public /image|/video URLs."""
+    """Keep Flow fifeUrl in result fields — do not download or rewrite to /image|/video."""
     if not isinstance(result, dict) or not _safe_request_id(request_id):
         return result
 
-    out = dict(result)
     is_video = "video" in str(task_type or "").lower()
-
-    try:
-        if is_video:
-            local_paths = await _persist_videos(request_id, out)
-        else:
-            local_paths = await _persist_images(request_id, out)
-        if local_paths:
-            out["local_files"] = local_paths
-    except Exception as exc:
-        logger.warning("persist_task_result failed %s: %s", request_id[:12], exc)
-
     if is_video:
-        if not resolve_stored_video_path(request_id, 0):
-            materialized = await materialize_request_video(
-                request_id, 0, out, clean_watermarks=False
-            )
-            if not materialized:
-                logger.warning(
-                    "video not materialized for %s (media_ids=%s)",
-                    request_id[:12],
-                    [str(m)[:8] for m in (out.get("media_ids") or [])[:3]],
-                )
-        if resolve_stored_video_path(request_id, 0):
-            out = await _run_watermark_gateway(request_id, out, is_video=True)
-        out = finalize_video_result_urls(request_id, out)
-    else:
-        out = await _run_watermark_gateway(request_id, out, is_video=False)
-        out = finalize_image_result_urls(request_id, out)
-
-    return normalize_publisher_urls(out)
+        return finalize_video_result_urls(request_id, result)
+    return finalize_image_result_urls(request_id, result)
 
 
 def resolve_stored_video_path(request_id: str, index: int = 0) -> Optional[Path]:

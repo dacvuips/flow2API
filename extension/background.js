@@ -1593,6 +1593,7 @@ function isAllowedRawUrl(url) {
     if (u.protocol !== 'https:') return false;
     const host = u.hostname.toLowerCase();
     return host === 'storage.googleapis.com'
+      || host === 'flow-content.google'
       || host.endsWith('.googleapis.com')
       || host.endsWith('.googleusercontent.com');
   } catch {
@@ -1602,7 +1603,7 @@ function isAllowedRawUrl(url) {
 
 async function handleTrpcRequest(msg) {
   const { id, params } = msg;
-  const { url, method = 'POST', headers = {}, body } = params;
+  const { url, method = 'POST', headers = {}, body, redirect = 'follow' } = params;
 
   if (!isAllowedTrpcUrl(url)) {
     sendToAgent({ id, error: 'INVALID_TRPC_URL' });
@@ -1643,15 +1644,30 @@ async function handleTrpcRequest(msg) {
       body: hasBody ? JSON.stringify(body) : undefined,
       credentials: 'include',
       signal: controller.signal,
+      redirect: redirect === 'manual' ? 'manual' : 'follow',
     });
-    const text = await resp.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = text;
+    const location = resp.headers.get('Location') || resp.headers.get('location') || '';
+    const isRedirect =
+      resp.type === 'opaqueredirect'
+      || resp.status === 0
+      || (resp.status >= 300 && resp.status < 400);
+    let data = null;
+    if (!isRedirect) {
+      const text = await resp.text();
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = text;
+      }
     }
-    sendToAgent({ id, status: resp.status, data });
+    sendToAgent({
+      id,
+      status: resp.status,
+      data,
+      headers: { location },
+      url: resp.url,
+      type: resp.type,
+    });
     if (resp.ok && url.includes('project.createProject')) {
       try {
         const pid = data?.result?.data?.json?.result?.projectId;

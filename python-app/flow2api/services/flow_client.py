@@ -195,6 +195,10 @@ def apply_user_profile_assignment(
         session = get_extension_pool().get(pid)
         if not session or pid.startswith("_"):
             raise ValueError("profile_not_found")
+        from flow2api.services.worker_settings import is_profile_dispatch_enabled
+
+        if not is_profile_dispatch_enabled(pid) or not session.is_ready():
+            raise ValueError("profile_not_accepting_jobs")
         out["profile_id"] = pid
         out["profile_assigned_by_user"] = True
         out["profile_label"] = session.display_name()
@@ -219,7 +223,13 @@ def profile_available_for_queue(
     if params.get("profile_assigned_by_user") and pid:
         pinned = str(pid).strip()
         if not is_profile_dispatch_enabled(pinned):
-            return False
+            return bool(
+                pick_profile_for_task(
+                    None,
+                    credit_required=credit_required,
+                    request_type=request_type,
+                )
+            )
         return bool(
             pick_profile_for_task(
                 pinned,
@@ -280,12 +290,14 @@ def apply_retry_profile_rotation(
         out.pop("profile_id", None)
         out.pop("profile_label", None)
         out.pop("profile_email", None)
+        out.pop("profile_assigned_by_user", None)
         out["retry_exclude_profile_id"] = current
         return out
 
     if next_id != current:
         for media_key in ("start_media_id", "end_media_id", "reference_media_ids"):
             out.pop(media_key, None)
+        out.pop("profile_assigned_by_user", None)
 
     session = pool.get(next_id)
     out["profile_id"] = next_id

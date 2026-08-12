@@ -18,6 +18,7 @@
   "host_permissions": [
     "https://aisandbox-pa.googleapis.com/*",
     "https://labs.google/*",
+    "https://flow-content.google/*",
     "https://*.google.com/*",
     "https://google.com/*",
     "https://*.recaptcha.net/*",

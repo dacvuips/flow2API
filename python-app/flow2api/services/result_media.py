@@ -202,15 +202,10 @@ def slim_result_for_list(result: Any) -> Any:
 
 
 def _is_internal_result_url(url: str) -> bool:
-    """Paths that must not appear in external API payloads (not public download URLs)."""
-    u = str(url or "").strip()
-    if not u:
-        return True
-    if u.startswith(("/outputs/", "/media/", "/inputs/")):
-        return True
-    if u.startswith(("/video/", "/image/")):
-        return True
-    return False
+    """Paths that must not appear in external API payloads (not Flow CDN URLs)."""
+    from flow2api.services.stored_media import is_app_hosted_result_url
+
+    return is_app_hosted_result_url(url)
 
 
 def result_for_external_api(result: dict[str, Any]) -> dict[str, Any]:
@@ -288,9 +283,11 @@ def _list_preview_url_allowed(url: str, kind: str = "") -> bool:
     if not u:
         return False
     base = get_public_base_url()
+    if u.startswith(("http://", "https://")):
+        return True
     if base and u.startswith(base):
         return True
-    if u.startswith(("http://", "https://", "/inputs/", "/outputs/", "/video/", "/image/")):
+    if u.startswith(("/inputs/", "/outputs/", "/video/", "/image/")):
         return True
     mid = _extract_media_id(u)
     if mid and u.startswith("/media/"):
@@ -329,20 +326,14 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
         if mid:
             seen_mids.add(mid)
         item: dict[str, str] = {"url": u, "kind": k}
-        if local or u.startswith(("/outputs/", "/video/", "/image/")):
-            item["local"] = "1"
-        if mid and _local_video_exists(mid):
+        if mid:
             item["media_id"] = mid
+        if local or (
+            not u.startswith(("http://", "https://"))
+            and u.startswith(("/outputs/", "/video/", "/image/"))
+        ):
             item["local"] = "1"
-        elif mid and u.startswith(("http://", "https://")):
-            item["media_id"] = mid
         items.append(item)
-
-    local_files = [str(u) for u in (result.get("local_files") or []) if str(u or "").strip()]
-    for u in local_files:
-        add(u, default_kind, local=True)
-    if local_files:
-        return items[:1]
 
     image_urls = result.get("image_urls") or []
     media_ids = result.get("media_ids") or []
@@ -363,22 +354,10 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
             kind = "video" if "video" in kind_raw else "image"
             if entry.get("url"):
                 add(str(entry["url"]), kind, mid)
-            elif entry.get("local_url"):
-                add(str(entry["local_url"]), kind, mid)
-            elif entry.get("local_path"):
-                add(str(entry["local_path"]), kind, mid)
-            elif mid:
-                add(f"/media/{mid}", kind, mid)
 
-        for mid in result.get("media_ids") or []:
-            mid_s = str(mid or "").strip()
-            if mid_s:
-                if is_video:
-                    from flow2api.services.stored_media import public_media_url
-
-                    add(public_media_url(mid_s), default_kind, mid_s)
-                else:
-                    add(f"/media/{mid_s}", default_kind, mid_s)
+    if not items:
+        for u in result.get("local_files") or []:
+            add(str(u), default_kind, local=True)
 
     return items[:1]
 

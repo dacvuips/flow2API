@@ -2758,8 +2758,72 @@ async def _resolve_all_media_urls(
     return ok
 
 
+def _header_value(resp: dict, name: str) -> str:
+    headers = resp.get("headers") if isinstance(resp, dict) else None
+    if not isinstance(headers, dict):
+        return ""
+    want = str(name or "").lower()
+    for key, val in headers.items():
+        if str(key).lower() == want:
+            return str(val or "").strip()
+    return ""
+
+
+def _flow_cdn_url_from_redirect(resp: dict) -> str | None:
+    """Read 307 Location (or final URL) from media.getMediaUrlRedirect."""
+    if not isinstance(resp, dict):
+        return None
+    candidates = [
+        _header_value(resp, "location"),
+        str(resp.get("url") or "").strip(),
+    ]
+    data = resp.get("data")
+    if isinstance(data, str) and data.startswith("http"):
+        candidates.append(data.strip())
+    elif isinstance(data, dict):
+        for key in ("url", "result", "location"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                candidates.append(val.strip())
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if text.startswith("/"):
+            text = "https://labs.google" + text
+        if "flow-content.google/" in text:
+            return text
+    return None
+
+
+async def try_fetch_media_url_redirect(
+    client: FlowClient,
+    media_id: str,
+    *,
+    media_url_type: str = "MEDIA_URL_TYPE_VIDEO",
+) -> str | None:
+    """Resolve signed CDN URL via labs tRPC media.getMediaUrlRedirect (307 Location)."""
+    if not media_id or not hasattr(client, "get_media_url_redirect"):
+        return None
+    types = [media_url_type]
+    if media_url_type:
+        types.append("")
+    for url_type in types:
+        try:
+            resp = await client.get_media_url_redirect(
+                media_id, media_url_type=url_type or ""
+            )
+        except Exception:
+            continue
+        cdn = _flow_cdn_url_from_redirect(resp if isinstance(resp, dict) else {})
+        if cdn:
+            return cdn
+    return None
+
+
 async def try_fetch_media_video_url(client: FlowClient, media_id: str) -> str | None:
-    """GET /v1/media/{id} — Lower Priority / workflow models return MP4 inline."""
+    """Resolve playable video URL: tRPC CDN redirect, then GET /v1/media/{id}."""
+    redirected = await try_fetch_media_url_redirect(client, media_id)
+    if redirected:
+        return redirected
     resp = await client.get_media(media_id)
     status = get_media_http_status(resp)
     if status == 500:
