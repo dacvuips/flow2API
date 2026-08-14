@@ -21,7 +21,7 @@ class FlowCdpAutoSettings:
     parallel_center: int = 1
     # Khi Active (token còn lại) của profile nhận job < ngưỡng này (giờ) → mở CDP refresh
     min_active_hours: float = 2.0
-    sync_delay_s: float = 5.0
+    sync_delay_s: float = 2.0
     # Song song generate trên profile sau khi refresh (max_concurrent) + bật Nhận job
     job_parallel: int = 8
     flow_url: str = _FLOW_URL
@@ -34,7 +34,7 @@ class FlowCdpAutoSettings:
         if pg == 0 and pc == 0:
             pg = 1
         hours = max(0.1, min(48.0, float(self.min_active_hours or 2)))
-        sync_d = max(1.0, min(120.0, float(self.sync_delay_s or 5)))
+        sync_d = max(0.5, min(120.0, float(self.sync_delay_s or 2)))
         job_p = max(1, min(30, int(self.job_parallel or 8)))
         url = str(self.flow_url or _FLOW_URL).strip() or _FLOW_URL
         order: list[str] = []
@@ -103,7 +103,7 @@ def _from_raw(raw: dict[str, Any]) -> FlowCdpAutoSettings:
             raw.get("parallel_center") if raw.get("parallel_center") is not None else 1
         ),
         min_active_hours=float(hours),
-        sync_delay_s=float(raw.get("sync_delay_s") if raw.get("sync_delay_s") is not None else 5),
+        sync_delay_s=float(raw.get("sync_delay_s") if raw.get("sync_delay_s") is not None else 2),
         job_parallel=int(job_p),
         flow_url=str(raw.get("flow_url") or _FLOW_URL),
         slot_order=list(raw.get("slot_order") or []),

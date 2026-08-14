@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from typing import Any
 
@@ -18,6 +17,15 @@ from flow2api.services.flow_cdp_settings import get_flow_cdp_slot, list_flow_cdp
 logger = logging.getLogger(__name__)
 
 _DEFAULT_FLOW_URL = "https://labs.google/fx/vi/tools/flow"
+
+# Chỉ xóa session NextAuth của Flow — GIỮ cookie Google (SID/SAPISID) để SSO im lặng.
+_FLOW_SESSION_COOKIE_NAMES = frozenset(
+    {
+        "__Secure-next-auth.session-token",
+        "__Secure-next-auth.callback-url",
+        "__Host-next-auth.csrf-token",
+    }
+)
 
 _lock = asyncio.Lock()
 _scheduler_task: asyncio.Task | None = None
@@ -837,67 +845,76 @@ async def on_profile_http_block(
     }
 
 
-async def _clear_synced_cookies(context, slot_id: str) -> int:
-    """
-    Clear cookies that Sync session stores (Google/Labs), keep unrelated cookies.
-    If DB has a cookie name list, prefer clearing those names on google/labs domains.
-    """
-    from flow2api.services.cookie_service import get_profile_cookies_raw
-    from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
+def _is_flow_session_cookie(cookie: dict[str, Any]) -> bool:
+    name = str(cookie.get("name") or "")
+    if not name:
+        return False
+    if name in _FLOW_SESSION_COOKIE_NAMES:
+        return True
+    return "next-auth" in name.lower()
 
-    slot = get_flow_cdp_slot(slot_id)
-    pid = slot.profile_id() if slot else slot_id
-    raw = get_profile_cookies_raw(pid)
-    sync_names: set[str] = set()
-    if isinstance(raw, list):
-        for c in raw:
-            if isinstance(c, dict) and c.get("name"):
-                sync_names.add(str(c["name"]))
 
-    cookies = await context.cookies()
-    keep: list[dict[str, Any]] = []
-    removed = 0
-    for c in cookies:
-        if not isinstance(c, dict):
+async def _delete_one_cookie(context, cookie: dict[str, Any]) -> bool:
+    name = str(cookie.get("name") or "")
+    domain = str(cookie.get("domain") or "")
+    path = str(cookie.get("path") or "/") or "/"
+    if not name:
+        return False
+    attempts: list[dict[str, Any]] = []
+    if domain:
+        attempts.append({"name": name, "domain": domain, "path": path})
+        attempts.append({"name": name, "domain": domain})
+    attempts.append({"name": name})
+    for kwargs in attempts:
+        try:
+            await context.clear_cookies(**kwargs)
+            return True
+        except TypeError:
             continue
-        domain = str(c.get("domain") or "").lower()
-        name = str(c.get("name") or "")
-        is_flow = "google" in domain or "labs" in domain
-        if is_flow and (not sync_names or name in sync_names):
-            removed += 1
+        except Exception:
             continue
-        keep.append(c)
-
+    pages = getattr(context, "pages", None) or []
+    if not pages:
+        return False
     try:
-        await context.clear_cookies()
-        if keep:
-            # Playwright cookie shape may need url or domain/path
-            safe: list[dict[str, Any]] = []
-            for c in keep:
-                item = {
-                    "name": c.get("name"),
-                    "value": c.get("value"),
-                    "domain": c.get("domain"),
-                    "path": c.get("path") or "/",
-                }
-                if c.get("expires"):
-                    item["expires"] = c["expires"]
-                if "httpOnly" in c:
-                    item["httpOnly"] = c["httpOnly"]
-                if "secure" in c:
-                    item["secure"] = c["secure"]
-                if "sameSite" in c:
-                    item["sameSite"] = c["sameSite"]
-                if item.get("name") and item.get("value") is not None and item.get("domain"):
-                    safe.append(item)
-            if safe:
-                try:
-                    await context.add_cookies(safe)
-                except Exception as exc:
-                    logger.debug("re-add non-flow cookies failed: %s", exc)
+        client = await context.new_cdp_session(pages[0])
+        params: dict[str, Any] = {"name": name}
+        host = domain.lstrip(".")
+        if host:
+            params["domain"] = host
+        if path:
+            params["path"] = path
+        await client.send("Network.deleteCookies", params)
+        return True
+    except Exception:
+        return False
+
+
+async def _clear_synced_cookies(context, slot_id: str) -> int:
+    """Xóa session-token Flow để lấy token mới. Không đụng cookie đăng nhập Google."""
+    del slot_id  # giữ chữ ký cũ
+    try:
+        cookies = await context.cookies()
     except Exception as exc:
-        logger.warning("clear synced cookies failed slot=%s: %s", slot_id, exc)
+        logger.warning("list cookies failed: %s", exc)
         return 0
+
+    targets = [
+        c for c in cookies if isinstance(c, dict) and _is_flow_session_cookie(c)
+    ]
+    if not targets:
+        return 0
+
+    removed = 0
+    for c in targets:
+        if await _delete_one_cookie(context, c):
+            removed += 1
+
+    # Playwright cũ không hỗ trợ clear theo name → không xóa hàng loạt (tránh logout Google)
+    if removed == 0 and targets:
+        logger.warning(
+            "clear Flow session cookies failed — giữ nguyên Google login, thử reload"
+        )
     return removed
 
 
@@ -919,7 +936,7 @@ async def _js_find_click_by_texts(page, texts: list[str]) -> str | None:
               const selectors = [
                 'a', 'button', '[role="button"]',
                 'input[type="button"]', 'input[type="submit"]',
-                '[data-testid]', 'span', 'div'
+                '[data-testid]', 'span'
               ].join(',');
               const nodes = Array.from(document.querySelectorAll(selectors));
               const scoreEl = (el) => {
@@ -1001,80 +1018,20 @@ async def _click_by_texts(
     timeout_ms: int = 18_000,
     per_try_ms: int = 3_000,
 ) -> str:
-    """Click first visible match — Playwright locators + JS fallback (landing CTA / Dự án mới)."""
+    """Click via DOM JS (Flow dùng custom component — Playwright locator hay miss và rất chậm)."""
+    del per_try_ms  # giữ chữ ký cũ
     last_err: Exception | None = None
-    deadline = time.monotonic() + max(0.5, timeout_ms / 1000.0)
+    deadline = time.monotonic() + max(0.2, timeout_ms / 1000.0)
     texts = [str(t).strip() for t in (texts or []) if str(t).strip()]
 
-    # Poll: Playwright → JS mỗi vòng (landing render trễ / custom component)
     while time.monotonic() < deadline:
-        remain_ms = int((deadline - time.monotonic()) * 1000)
-        if remain_ms < 150:
-            break
-        try_ms = min(per_try_ms, remain_ms)
-
-        for text in texts:
-            patterns: list[Any] = [text]
-            low = text.lower()
-            if "flow" in low:
-                patterns.append(re.compile(re.escape(text), re.I))
-            if low == "create with google flow":
-                patterns.append(re.compile(r"create\s+with\s+google\s+flow", re.I))
-            if low in ("dự án mới", "du an moi", "new project", "+ dự án mới", "+ new project"):
-                # Button «+ Dự án mới» — name accessible có thể kèm dấu +
-                patterns.append(re.compile(r"\+?\s*dự\s*án\s+mới", re.I))
-                patterns.append(re.compile(r"\+?\s*new\s+project", re.I))
-            if "dự án" in low or "new project" in low:
-                patterns.append(re.compile(re.escape(text), re.I))
-                patterns.append(re.compile(r"\+?\s*" + re.escape(text), re.I))
-
-            for pat in patterns:
-                locators = []
-                try:
-                    if isinstance(pat, str):
-                        locators = [
-                            page.get_by_role("button", name=pat),
-                            page.get_by_role("link", name=pat),
-                            page.get_by_role("button", name=re.compile(re.escape(pat), re.I)),
-                            page.locator("a,button,[role='button']").filter(has_text=pat),
-                            page.get_by_text(pat, exact=True),
-                            page.get_by_text(pat, exact=False),
-                        ]
-                    else:
-                        locators = [
-                            page.get_by_role("button", name=pat),
-                            page.get_by_role("link", name=pat),
-                            page.locator("a,button,[role='button']").filter(has_text=pat),
-                            page.get_by_text(pat),
-                        ]
-                except Exception as exc:
-                    last_err = exc
-                    continue
-
-                for loc in locators:
-                    try:
-                        first = loc.first
-                        await first.wait_for(state="visible", timeout=min(1_200, try_ms))
-                        try:
-                            await first.scroll_into_view_if_needed(timeout=2_000)
-                        except Exception:
-                            pass
-                        try:
-                            await first.click(timeout=min(5_000, try_ms))
-                        except Exception:
-                            # Overlay / animation — force
-                            await first.click(timeout=3_000, force=True)
-                        return text
-                    except Exception as exc:
-                        last_err = exc
-                        continue
-
-        # JS fallback: pill Create / chip «+ Dự án mới»
-        js_hit = await _js_find_click_by_texts(page, texts)
-        if js_hit:
-            return js_hit
-
-        await page.wait_for_timeout(400)
+        try:
+            js_hit = await _js_find_click_by_texts(page, texts)
+            if js_hit:
+                return js_hit
+        except Exception as exc:
+            last_err = exc
+        await page.wait_for_timeout(160)
 
     raise RuntimeError(
         f"Không tìm thấy nút nào trong {texts!r}: {last_err}"
@@ -1100,7 +1057,17 @@ async def _try_click_by_texts(
 async def _flow_session_ready(page) -> bool:
     """True nếu tab đã có NextAuth session-token (đủ để Sync)."""
     try:
-        cookies = await page.context.cookies()
+        cookies = await page.context.cookies("https://labs.google/")
+        for c in cookies or []:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("name") or "") == "__Secure-next-auth.session-token":
+                return bool(str(c.get("value") or "").strip())
+    except TypeError:
+        try:
+            cookies = await page.context.cookies()
+        except Exception:
+            return False
         for c in cookies or []:
             if not isinstance(c, dict):
                 continue
@@ -1145,113 +1112,86 @@ _NEW_PROJECT_TEXTS = [
 ]
 
 
+async def _wait_session_or_timeout(page, *, timeout_s: float) -> bool:
+    """Return True as soon as NextAuth session-token appears (no fixed sleep)."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if await _flow_session_ready(page):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await page.wait_for_timeout(180)
+
+
 async def _navigate_flow_ui(page, slot_id: str, *, flow_url: str) -> dict[str, Any]:
-    """Sau clear cookies: thử CTA / đăng nhập / dự án mới — không fail cứng nếu UI đã vào app.
+    """Sau clear session Flow: poll CTA / SSO / New project — có token là dừng.
 
-    Landing: pill trắng «Create with Google Flow».
-    Trong app: chip tối «+ Dự án mới» (icon + text).
+    Landing: pill «Create with Google Flow». Trong app: chip «+ Dự án mới».
+    Sau khi bấm New project: không click thêm, chỉ chờ session-token.
     """
-    # Chờ hydrate / soft redirect SSO / hero load
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=20_000)
-    except Exception:
-        pass
-    try:
-        await page.wait_for_load_state("networkidle", timeout=12_000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(1_200)
-
-    # Scroll nhẹ — CTA pill thường ở nửa dưới viewport landing
+    del flow_url  # reload đã làm ở cycle; không goto lại ở đây
     try:
         await page.evaluate("() => window.scrollTo(0, Math.min(400, document.body.scrollHeight/3))")
     except Exception:
         pass
 
-    clicked_create = await _try_click_by_texts(
-        page, _CREATE_CTA_TEXTS, timeout_ms=22_000, per_try_ms=2_500
-    )
-    if clicked_create:
-        _log("info", f"{slot_id}: click «{clicked_create}»", slot_id=slot_id)
-        await page.wait_for_timeout(1_800)
-    else:
-        signed = await _try_click_by_texts(
-            page, _SIGN_IN_TEXTS, timeout_ms=8_000, per_try_ms=1_500
-        )
-        if signed:
-            _log("info", f"{slot_id}: click «{signed}» (SSO)", slot_id=slot_id)
-            await page.wait_for_timeout(3_000)
-            clicked_create = await _try_click_by_texts(
-                page, _CREATE_CTA_TEXTS, timeout_ms=18_000, per_try_ms=2_500
-            )
-            if clicked_create:
-                _log(
-                    "info",
-                    f"{slot_id}: click «{clicked_create}» (sau SSO)",
-                    slot_id=slot_id,
-                )
-                await page.wait_for_timeout(1_800)
-        else:
-            _log(
-                "info",
-                (
-                    f"{slot_id}: không thấy Create/Sign-in CTA "
-                    f"(có thể đã vào Flow UI) — tiếp tục New project / Sync"
-                ),
-                slot_id=slot_id,
-            )
+    clicked_create: str | None = None
+    clicked_new: str | None = None
+    signed: str | None = None
+    deadline = time.monotonic() + 18.0
 
-    clicked_new = await _try_click_by_texts(
-        page, _NEW_PROJECT_TEXTS, timeout_ms=20_000, per_try_ms=2_500
-    )
-    if clicked_new:
-        _log("info", f"{slot_id}: click «{clicked_new}»", slot_id=slot_id)
-    else:
+    while time.monotonic() < deadline:
         if await _flow_session_ready(page):
-            _log(
-                "info",
-                f"{slot_id}: không thấy «Dự án mới» nhưng đã có session — Sync trực tiếp",
-                slot_id=slot_id,
-            )
-        else:
-            try:
-                await page.goto(flow_url, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(1_500)
-            except Exception as exc:
-                _log("error", f"{slot_id}: reload Flow sau miss CTA: {exc}", slot_id=slot_id)
-            # Reload xong thử lại Create (đúng UI screenshot)
-            clicked_create = clicked_create or await _try_click_by_texts(
-                page, _CREATE_CTA_TEXTS, timeout_ms=18_000, per_try_ms=2_500
-            )
-            if clicked_create:
-                _log(
-                    "info",
-                    f"{slot_id}: click «{clicked_create}» (sau reload)",
-                    slot_id=slot_id,
-                )
-                await page.wait_for_timeout(1_500)
-            clicked_new = await _try_click_by_texts(
-                page, _NEW_PROJECT_TEXTS, timeout_ms=12_000, per_try_ms=2_000
-            )
-            if clicked_new:
-                _log("info", f"{slot_id}: click «{clicked_new}» (sau reload)", slot_id=slot_id)
-            elif not await _flow_session_ready(page):
-                raise RuntimeError(
-                    "Flow UI không hiện Create/New project và chưa có session-token. "
-                    "Mở CDP, đăng nhập Google Flow tay, rồi «Chạy ngay» / Sync lại."
-                )
-            else:
-                _log(
-                    "info",
-                    f"{slot_id}: vẫn không thấy New project — session OK, Sync",
-                    slot_id=slot_id,
-                )
+            return {
+                "clicked_create": clicked_create,
+                "clicked_new": clicked_new,
+                "session_ready": True,
+            }
 
-    return {
-        "clicked_create": clicked_create,
-        "clicked_new": clicked_new,
-        "session_ready": await _flow_session_ready(page),
-    }
+        # Đã bấm Dự án mới → chỉ chờ token, không dò CTA khác
+        if clicked_new:
+            await page.wait_for_timeout(120)
+            continue
+
+        groups: list[tuple[str, list[str]]] = []
+        if not clicked_create:
+            groups.append(("create", _CREATE_CTA_TEXTS))
+        if not clicked_new:
+            groups.append(("new", _NEW_PROJECT_TEXTS))
+        if not signed and not clicked_create:
+            groups.append(("signin", _SIGN_IN_TEXTS))
+
+        clicked_any = False
+        for key, texts in groups:
+            hit = await _js_find_click_by_texts(page, texts)
+            if not hit:
+                continue
+            clicked_any = True
+            if key == "create":
+                clicked_create = hit
+                _log("info", f"{slot_id}: click «{clicked_create}»", slot_id=slot_id)
+            elif key == "new":
+                clicked_new = hit
+                _log("info", f"{slot_id}: click «{clicked_new}» — chờ session", slot_id=slot_id)
+            else:
+                signed = hit
+                _log("info", f"{slot_id}: click «{signed}» (SSO)", slot_id=slot_id)
+            break
+
+        await page.wait_for_timeout(100 if clicked_any else 160)
+
+    ready = await _flow_session_ready(page)
+    if ready or clicked_new:
+        return {
+            "clicked_create": clicked_create,
+            "clicked_new": clicked_new,
+            "session_ready": ready,
+        }
+
+    raise RuntimeError(
+        "Flow UI không hiện Create/New project và chưa có session-token. "
+        "Mở CDP, đăng nhập Google Flow tay, rồi «Chạy ngay» / Sync lại."
+    )
 
 
 async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
@@ -1272,7 +1212,7 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
 
     cfg = get_flow_cdp_auto_settings()
     flow_url = str(cfg.flow_url or _DEFAULT_FLOW_URL).strip() or _DEFAULT_FLOW_URL
-    sync_delay = float(cfg.sync_delay_s or 5)
+    sync_delay = float(cfg.sync_delay_s or 2)
 
     meta = _running.setdefault(
         slot_id,
@@ -1302,15 +1242,22 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = context.pages[0] if context.pages else await context.new_page()
 
-            meta["step"] = "goto"
-            await page.goto(flow_url, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(800)
-
             meta["step"] = "clear_cookies"
+            # Clear session Flow trước — không cần đợi trang load xong
             cleared = await _clear_synced_cookies(context, slot_id)
-            _log("info", f"{slot_id}: đã clear {cleared} cookies", slot_id=slot_id)
-            # Reload so UI shows logged-out / create CTA / auto SSO
-            await page.goto(flow_url, wait_until="domcontentloaded", timeout=90_000)
+            _log(
+                "info",
+                f"{slot_id}: đã xóa {cleared} cookie session Flow (giữ login Google)",
+                slot_id=slot_id,
+            )
+            try:
+                cur = str(page.url or "")
+            except Exception:
+                cur = ""
+            if "labs.google" in cur.lower() or "flow" in cur.lower():
+                await page.reload(wait_until="commit", timeout=45_000)
+            else:
+                await page.goto(flow_url, wait_until="commit", timeout=60_000)
 
             meta["step"] = "navigate_ui"
             nav = await _navigate_flow_ui(page, slot_id, flow_url=flow_url)
@@ -1318,22 +1265,27 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             clicked_new = nav.get("clicked_new")
 
             meta["step"] = "wait_sync"
-            await asyncio.sleep(sync_delay)
+            if nav.get("session_ready"):
+                got_sess = True
+            else:
+                extra = max(sync_delay, 3.0) if clicked_new else sync_delay
+                got_sess = await _wait_session_or_timeout(page, timeout_s=extra)
+            if got_sess:
+                _log("info", f"{slot_id}: session-token sẵn sàng", slot_id=slot_id)
 
             meta["step"] = "sync"
-            sync = await sync_session(slot_id)
+            sync = await sync_session(slot_id, page=page, context=context, skip_goto=True)
             if not sync.get("ok"):
                 raise RuntimeError(sync.get("message") or sync.get("error") or "sync_failed")
             if not sync.get("email") and not sync.get("token_refreshed"):
-                # soft fail if no token — still try close
                 raise RuntimeError(sync.get("message") or "sync_incomplete")
 
             meta["step"] = "close"
             close = system_ops.close_flow_cdp_slot(slot_id)
 
-            # Chờ 10s để Chrome/DB flush cookies & token trước khi apply profile
+            # Cookie/token đã ghi DB trước khi đóng — chỉ nhường process Chrome thoát
             meta["step"] = "wait_db"
-            await asyncio.sleep(10.0)
+            await asyncio.sleep(1.0)
 
             job_cfg = None
             if (slot.role or "bridge") != "center":
