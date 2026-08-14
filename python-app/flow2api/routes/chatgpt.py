@@ -861,14 +861,32 @@ async def chatgpt_profile_dispatch(
         settings = set_chatgpt_dispatch_enabled(profile_id, bool(body.enabled))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    launch = None
+    if body.enabled and is_playwright_slot_id(profile_id):
+        launch = await asyncio.to_thread(system_ops.launch_playwright_slot, profile_id)
+        if launch.get("ok"):
+            logger.info("ChatGPT Nhận job — đã mở CDP %s", profile_id)
+        else:
+            logger.warning(
+                "ChatGPT Nhận job — mở CDP %s lỗi: %s",
+                profile_id,
+                launch.get("message") or launch.get("error"),
+            )
     nudge_scheduler()
     profiles = await list_chatgpt_profiles()
+    msg = f"Đã {'bật' if body.enabled else 'tắt'} nhận job {profile_id}"
+    if launch and launch.get("ok"):
+        msg += " · " + str(launch.get("message") or "đã mở CDP")
+    elif launch and not launch.get("ok"):
+        msg += " · CDP chưa mở: " + str(launch.get("message") or launch.get("error") or "")
     return {
         "ok": True,
         "profile_id": profile_id,
         "enabled": bool(body.enabled),
+        "launch": launch,
         "pool": settings.to_dict(),
         "profiles": profiles,
+        "message": msg,
     }
 
 

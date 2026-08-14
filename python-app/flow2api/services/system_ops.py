@@ -579,6 +579,7 @@ def launch_playwright_slot(
     port = int(slot.port)
 
     if cdp_endpoint_alive(cdp_url):
+        logger.info("ChatGPT CDP slot=%s already alive at %s", slot.id, cdp_url)
         return {
             "ok": True,
             "already_running": True,
@@ -587,7 +588,7 @@ def launch_playwright_slot(
             "cdp_url": cdp_url,
             "port": port,
             "user_data_dir": str(user_data),
-            "message": f"Slot {slot.id} CDP đã chạy tại {cdp_url}.",
+            "message": f"Slot {slot.id} CDP đã chạy tại {cdp_url} — kiểm tra cửa sổ Chrome nhỏ (có thể nằm sau cửa sổ khác).",
         }
 
     from flow2api.services.chatgpt_pool_settings import list_playwright_slots
@@ -608,9 +609,11 @@ def launch_playwright_slot(
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--disable-session-crashed-bubble",
+        "--new-window",
         *_chatgpt_chrome_window_args(slot_index=slot_index),
         start_url or "https://chatgpt.com/",
     ]
+    logger.info("launch ChatGPT CDP slot=%s port=%s chrome=%s", slot.id, port, chrome)
     try:
         _popen_detached(args, cwd=user_data)
     except Exception as exc:
