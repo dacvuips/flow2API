@@ -348,10 +348,18 @@ async def _ensure_slot_page(rt: _SlotRuntime, *, cdp_url: str, user_data_dir: st
             f"cdp_missing — Slot {rt.slot_id} chưa có CDP. Bấm Mở CDP cho slot này."
         )
     if not system_ops.cdp_endpoint_alive(cdp):
-        raise RuntimeError(
-            f"cdp_unreachable — Không kết nối được {cdp} (slot {rt.slot_id}). "
-            "Bấm 'Mở CDP' trên chip slot, đăng nhập chatgpt.com trong cửa sổ Chrome đó."
+        logger.info("ChatGPT CDP %s chưa chạy — tự mở Chrome", rt.slot_id)
+        launched = await asyncio.to_thread(
+            system_ops.launch_playwright_slot,
+            rt.slot_id,
+            start_url="https://chatgpt.com/",
         )
+        if not launched.get("ok") or not system_ops.cdp_endpoint_alive(cdp):
+            raise RuntimeError(
+                f"cdp_unreachable — Không kết nối được {cdp} (slot {rt.slot_id}). "
+                f"{launched.get('message') or launched.get('error') or ''} "
+                "Bấm 'Mở CDP' trên chip slot (tab ChatGPT → Profiles)."
+            )
     rt.browser = await rt.pw.chromium.connect_over_cdp(cdp)
     rt.launch_mode = "cdp"
     rt.cdp_url = cdp

@@ -21,6 +21,12 @@ def invalidate_health_cache() -> None:
     _cache["at"] = 0.0
 
 
+def peek_health_cache() -> dict[str, Any] | None:
+    """Last successful health payload — dùng khi rebuild bị timeout."""
+    cached = _cache.get("payload")
+    return dict(cached) if isinstance(cached, dict) else None
+
+
 def _captcha_public_stats() -> dict[str, Any]:
     try:
         from flow2api.services.captcha_broker import get_captcha_broker

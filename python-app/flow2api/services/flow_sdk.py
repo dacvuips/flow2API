@@ -1829,6 +1829,36 @@ def is_http_524_failure(
     return False
 
 
+def is_gateway_timeout_failure(
+    exc: Exception | None = None,
+    msg: str = "",
+    api_trace: list[dict] | None = None,
+) -> bool:
+    """Cloudflare/origin 524/502/504 or transport timeout — keep profile, retry."""
+    probe = exc if exc is not None else RuntimeError(str(msg or ""))
+    if is_http_524_failure(probe, msg, api_trace):
+        return True
+    text = str(msg or "").strip().upper()
+    if not text and exc is not None:
+        text = str(exc).strip().upper()
+    if "TASK_TIMEOUT" in text or "TASK TIMEOUT" in text:
+        return False
+    if "HTTP_504" in text or "HTTP_502" in text or "STATUS: 504" in text or "STATUS: 502" in text:
+        return True
+    if "GATEWAY TIMEOUT" in text or "GATEWAY TIME" in text:
+        return True
+    if "READ TIMEOUT" in text or "CONNECT TIMEOUT" in text or "READTIMEOUT" in text:
+        return True
+    if isinstance(exc, FlowApiError):
+        raw = exc.raw
+        if isinstance(raw, dict) and int(raw.get("status") or 0) in (502, 504):
+            return True
+    for entry in api_trace or []:
+        if int(entry.get("http_status") or 0) in (502, 504):
+            return True
+    return False
+
+
 def is_policy_rejection_failure(
     exc: Exception | None = None,
     msg: str = "",

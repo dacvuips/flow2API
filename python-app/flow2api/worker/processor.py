@@ -34,7 +34,7 @@ from flow2api.services.flow_sdk import (
     is_extension_timeout_error,
     is_http_403_failure,
     is_http_429_failure,
-    is_http_524_failure,
+    is_gateway_timeout_failure,
     is_policy_rejection_failure,
     is_profile_account_switch_failure,
     is_prominent_people_filter_failure,
@@ -1092,6 +1092,41 @@ class WorkerController:
                         failed_profile[:12] or "-",
                     )
                     return
+                if is_gateway_timeout_failure(exc, msg, api_trace):
+                    # 524/502/504/timeout = Cloudflare/origin — không phải lỗi tài khoản.
+                    # Retry cùng profile, không ngừng job / không ẩn profile.
+                    http_524_retry = int(retry_params.get("http_524_retry_count") or 0)
+                    if http_524_retry < RECAPTCHA_RETRY_MAX:
+                        delay_s = flow_sdk.recaptcha_retry_delay(http_524_retry)
+                        retry_params["http_524_retry_count"] = http_524_retry + 1
+                        retry_params["retry_not_before"] = time.time() + delay_s
+                        retry_params.pop("running_started_at", None)
+                        activity.update_request(
+                            rid, status="queued", params=retry_params, error=None
+                        )
+                        events.publish(
+                            "request_finished", {"id": rid, "status": "queued"}
+                        )
+                        append_request_log(
+                            rid,
+                            "worker",
+                            (
+                                f"HTTP timeout/524 — giữ profile, retry "
+                                f"{http_524_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                                f"sau {delay_s:.1f}s"
+                            ),
+                            level="warn",
+                            profile_id=str(retry_params.get("profile_id") or "") or None,
+                        )
+                        logger.warning(
+                            "HTTP timeout/524 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                            http_524_retry + 1,
+                            RECAPTCHA_RETRY_MAX,
+                            rid[:8],
+                            delay_s,
+                            str(retry_params.get("profile_id") or "-")[:12],
+                        )
+                        return
                 if is_profile_account_switch_failure(exc, msg, api_trace):
                     switch_label = "account_error"
                     low = str(msg or "").lower()
@@ -1109,7 +1144,8 @@ class WorkerController:
                         msg,
                         label=switch_label,
                     )
-                    return
+                        return
+                    # Hết retry → fail bình thường (không switch Gen / không ẩn profile)
                 if is_http_403_failure(exc, msg, api_trace):
                     http_403_retry = int(retry_params.get("http_403_retry_count") or 0)
                     if http_403_retry < RECAPTCHA_RETRY_MAX:
@@ -1176,42 +1212,6 @@ class WorkerController:
                             str(retry_params.get("profile_id") or "-")[:12],
                         )
                         return
-                if is_http_524_failure(exc, msg, api_trace):
-                    # 524 = Cloudflare/origin timeout — không phải lỗi tài khoản.
-                    # Retry cùng profile, không ngừng job / không mở Gen CDP mới.
-                    http_524_retry = int(retry_params.get("http_524_retry_count") or 0)
-                    if http_524_retry < RECAPTCHA_RETRY_MAX:
-                        delay_s = flow_sdk.recaptcha_retry_delay(http_524_retry)
-                        retry_params["http_524_retry_count"] = http_524_retry + 1
-                        retry_params["retry_not_before"] = time.time() + delay_s
-                        retry_params.pop("running_started_at", None)
-                        activity.update_request(
-                            rid, status="queued", params=retry_params, error=None
-                        )
-                        events.publish(
-                            "request_finished", {"id": rid, "status": "queued"}
-                        )
-                        append_request_log(
-                            rid,
-                            "worker",
-                            (
-                                f"HTTP 524 timeout — giữ profile, retry "
-                                f"{http_524_retry + 1}/{RECAPTCHA_RETRY_MAX} "
-                                f"sau {delay_s:.1f}s"
-                            ),
-                            level="warn",
-                            profile_id=str(retry_params.get("profile_id") or "") or None,
-                        )
-                        logger.warning(
-                            "HTTP 524 timeout retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                            http_524_retry + 1,
-                            RECAPTCHA_RETRY_MAX,
-                            rid[:8],
-                            delay_s,
-                            str(retry_params.get("profile_id") or "-")[:12],
-                        )
-                        return
-                    # Hết retry → fail bình thường (không switch Gen)
                 if isinstance(exc, FlowApiError):
                     logger.error(
                         "worker failed rid=%s step=%s err=%s api_trace=%s",

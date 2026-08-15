@@ -25,7 +25,7 @@ from flow2api.services.flow_sdk import (
     parse_get_media_image,
     upload_media,
 )
-from flow2api.services.health_cache import get_health_payload
+from flow2api.services.health_cache import get_health_payload, peek_health_cache
 from flow2api.services.image_upsample import run_upsample_image
 from flow2api.services.video_upsample import run_upsample_video
 
@@ -78,7 +78,17 @@ async def health():
     try:
         return await asyncio.wait_for(get_health_payload(), timeout=timeout)
     except asyncio.TimeoutError:
+        cached = peek_health_cache()
+        if cached:
+            cached["ok"] = False
+            cached["degraded"] = True
+            cached["error"] = "health_timeout"
+            return cached
         pool = get_extension_pool()
+        try:
+            profiles = pool.list_public()
+        except Exception:
+            profiles = []
         return {
             "ok": False,
             "degraded": True,
@@ -86,6 +96,7 @@ async def health():
             "extension_connected": pool.any_connected(),
             "profiles_online": pool.online_count(),
             "profiles_ready": pool.ready_count(),
+            "profiles": profiles,
             "debug_version": 4,
         }
 
