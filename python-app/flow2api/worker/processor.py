@@ -1144,8 +1144,7 @@ class WorkerController:
                         msg,
                         label=switch_label,
                     )
-                        return
-                    # Hết retry → fail bình thường (không switch Gen / không ẩn profile)
+                    return
                 if is_http_403_failure(exc, msg, api_trace):
                     http_403_retry = int(retry_params.get("http_403_retry_count") or 0)
                     if http_403_retry < RECAPTCHA_RETRY_MAX:
