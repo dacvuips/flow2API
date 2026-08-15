@@ -1,4 +1,4 @@
-"""Flow CDP auto schedule: open → clear synced cookies → click Flow UI → sync → close."""
+"""Flow CDP auto schedule: open → clear Flow cookies → click Flow UI → sync → close."""
 from __future__ import annotations
 
 import asyncio
@@ -18,12 +18,46 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_FLOW_URL = "https://labs.google/fx/vi/tools/flow"
 
-# Chỉ xóa session NextAuth của Flow — GIỮ cookie Google (SID/SAPISID) để SSO im lặng.
+# DevTools gom cookie theo origin https://labs.google/ (không phải chuỗi "https://...").
+# Cookie.domain thật là "labs.google" / ".labs.google". Panel còn hiện cookie .google.com (APISID) vì site Google.
+_FLOW_ORIGIN_URLS = (
+    "https://labs.google/",
+    "https://labs.google/fx/vi/tools/flow",
+)
 _FLOW_SESSION_COOKIE_NAMES = frozenset(
     {
         "__Secure-next-auth.session-token",
         "__Secure-next-auth.callback-url",
         "__Host-next-auth.csrf-token",
+    }
+)
+_FLOW_COOKIE_DOMAINS = ("labs.google", ".labs.google")
+_GOOGLE_SSO_COOKIE_NAMES = frozenset(
+    {
+        "__Secure-1PSID",
+        "__Secure-1PAPISID",
+        "__Secure-1PSIDTS",
+        "__Secure-1PSIDCC",
+        "__Secure-3PSID",
+        "__Secure-3PAPISID",
+        "__Secure-3PSIDTS",
+        "__Secure-3PSIDCC",
+        "SAPISID",
+        "APISID",
+        "SSID",
+        "SID",
+        "HSID",
+        "LSID",
+        "LSOSID",
+        "OSID",
+        "S",
+        "SIDCC",
+        "__Secure-OSID",
+        "ACCOUNT_CHOOSER",
+        "NID",
+        "__Secure-ENID",
+        "CONSENT",
+        "SOCS",
     }
 )
 
@@ -845,13 +879,28 @@ async def on_profile_http_block(
     }
 
 
-def _is_flow_session_cookie(cookie: dict[str, Any]) -> bool:
+def _is_google_sso_cookie(cookie: dict[str, Any]) -> bool:
+    """SID/APISID/.google.com — hiện trong panel labs.google nhưng là login Google, phải giữ."""
     name = str(cookie.get("name") or "")
-    if not name:
+    domain = str(cookie.get("domain") or "").lower()
+    if not name or "labs.google" in domain:
         return False
-    if name in _FLOW_SESSION_COOKIE_NAMES:
+    if name in _GOOGLE_SSO_COOKIE_NAMES:
         return True
-    return "next-auth" in name.lower()
+    return name.startswith("__Secure-1P") or name.startswith("__Secure-3P")
+
+
+def _is_flow_site_cookie(cookie: dict[str, Any]) -> bool:
+    """Cookie Flow: domain labs.google, NextAuth, hoặc cookie origin https://labs.google/ (trừ SSO)."""
+    name = str(cookie.get("name") or "")
+    if not name or _is_google_sso_cookie(cookie):
+        return False
+    domain = str(cookie.get("domain") or "").lower()
+    if "labs.google" in domain:
+        return True
+    if name in _FLOW_SESSION_COOKIE_NAMES or "next-auth" in name.lower():
+        return True
+    return bool(cookie.get("_flow_origin"))
 
 
 async def _delete_one_cookie(context, cookie: dict[str, Any]) -> bool:
@@ -864,7 +913,7 @@ async def _delete_one_cookie(context, cookie: dict[str, Any]) -> bool:
     if domain:
         attempts.append({"name": name, "domain": domain, "path": path})
         attempts.append({"name": name, "domain": domain})
-    attempts.append({"name": name})
+    # Không clear theo name-only — tránh xóa nhầm cookie Google cùng tên.
     for kwargs in attempts:
         try:
             await context.clear_cookies(**kwargs)
@@ -890,30 +939,78 @@ async def _delete_one_cookie(context, cookie: dict[str, Any]) -> bool:
         return False
 
 
-async def _clear_synced_cookies(context, slot_id: str) -> int:
-    """Xóa session-token Flow để lấy token mới. Không đụng cookie đăng nhập Google."""
-    del slot_id  # giữ chữ ký cũ
-    try:
-        cookies = await context.cookies()
-    except Exception as exc:
-        logger.warning("list cookies failed: %s", exc)
-        return 0
+async def _cookies_visible_on_labs(context) -> list[dict[str, Any]]:
+    """Cookie DevTools hiện khi chọn Cookies → https://labs.google/ (gồm cả .google.com)."""
+    batches: list[list[Any]] = []
+    for url in _FLOW_ORIGIN_URLS:
+        try:
+            batch = await context.cookies(url)
+        except TypeError:
+            try:
+                batch = await context.cookies(urls=[url])
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if isinstance(batch, list):
+            batches.append(batch)
+    if not batches:
+        try:
+            batch = await context.cookies()
+            if isinstance(batch, list):
+                batches.append(batch)
+        except Exception as exc:
+            logger.warning("list cookies failed: %s", exc)
+            return []
+    seen: set[tuple[Any, ...]] = set()
+    out: list[dict[str, Any]] = []
+    for batch in batches:
+        for c in batch:
+            if not isinstance(c, dict):
+                continue
+            key = (c.get("name"), c.get("domain"), c.get("path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            row = dict(c)
+            row["_flow_origin"] = True
+            out.append(row)
+    return out
 
-    targets = [
-        c for c in cookies if isinstance(c, dict) and _is_flow_session_cookie(c)
-    ]
+
+async def _clear_synced_cookies(context, slot_id: str) -> int:
+    """Xóa cookie origin https://labs.google/ (trừ login Google .google.com)."""
+    del slot_id  # giữ chữ ký cũ
+    cookies = await _cookies_visible_on_labs(context)
+    targets = [c for c in cookies if _is_flow_site_cookie(c)]
     if not targets:
         return 0
 
-    removed = 0
-    for c in targets:
+    bulk_ok = False
+    for domain in _FLOW_COOKIE_DOMAINS:
+        try:
+            await context.clear_cookies(domain=domain)
+            bulk_ok = True
+        except TypeError:
+            bulk_ok = False
+            break
+        except Exception:
+            continue
+
+    leftover = [c for c in await _cookies_visible_on_labs(context) if _is_flow_site_cookie(c)]
+    if not leftover and not bulk_ok:
+        leftover = targets
+
+    removed = max(0, len(targets) - len(leftover)) if bulk_ok else 0
+    for c in leftover:
         if await _delete_one_cookie(context, c):
             removed += 1
 
-    # Playwright cũ không hỗ trợ clear theo name → không xóa hàng loạt (tránh logout Google)
-    if removed == 0 and targets:
+    still = [c for c in await _cookies_visible_on_labs(context) if _is_flow_site_cookie(c)]
+    if still:
         logger.warning(
-            "clear Flow session cookies failed — giữ nguyên Google login, thử reload"
+            "clear Flow cookies leftover=%s — giữ Google login, thử reload",
+            len(still),
         )
     return removed
 
@@ -1197,8 +1294,8 @@ async def _navigate_flow_ui(page, slot_id: str, *, flow_url: str) -> dict[str, A
 async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
     """
     Full cycle for one CDP:
-    open → flow URL → clear synced cookies → (Create / SSO / New project nếu có)
-    → wait → Sync → close CDP
+    open → xóa cookie Flow → reload/click UI → chờ session-token mới
+    → Sync (cookies + access token) → close CDP
 
     Create CTA là optional: profile đã login Google có thể vào thẳng Flow UI.
     """
@@ -1243,11 +1340,11 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             page = context.pages[0] if context.pages else await context.new_page()
 
             meta["step"] = "clear_cookies"
-            # Clear session Flow trước — không cần đợi trang load xong
+            # Xóa toàn bộ cookie Flow trước — không đụng Google login
             cleared = await _clear_synced_cookies(context, slot_id)
             _log(
                 "info",
-                f"{slot_id}: đã xóa {cleared} cookie session Flow (giữ login Google)",
+                f"{slot_id}: đã xóa {cleared} cookie Flow (giữ login Google)",
                 slot_id=slot_id,
             )
             try:
