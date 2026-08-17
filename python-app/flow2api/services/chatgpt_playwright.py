@@ -23,6 +23,27 @@ logger = logging.getLogger(__name__)
 CHAT_URL = "https://chatgpt.com/"
 IMAGES_URL = "https://chatgpt.com/images"
 
+
+async def _goto_chatgpt_page(page, target_url: str) -> None:
+    """Navigate only when needed — skip reload if tab already on the right ChatGPT page."""
+    tgt = str(target_url or CHAT_URL).strip() or CHAT_URL
+    try:
+        cur = str(page.url or "")
+    except Exception:
+        cur = ""
+    low = cur.lower()
+    want_images = "/images" in tgt.lower()
+    if "chatgpt.com" in low:
+        on_images = "/images" in low
+        if want_images == on_images:
+            return
+    try:
+        await page.goto(tgt, wait_until="commit", timeout=45_000)
+    except Exception as exc:
+        logger.warning("goto chatgpt commit failed: %s — retry domcontentloaded", exc)
+        await page.goto(tgt, wait_until="domcontentloaded", timeout=60_000)
+
+
 def _is_noise_image_url(url: str) -> bool:
     """Skip favicons, SVG assets, UI icons — not generated result images."""
     u = (url or "").lower().strip()
@@ -2705,8 +2726,8 @@ async def run_playwright_chat(
                 cdp_url=slot.cdp_url(),
                 user_data_dir=slot.user_data_dir(),
             )
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(1.0)
+            await _goto_chatgpt_page(page, target_url)
+            await asyncio.sleep(0.25)
 
             await _dismiss_common_modals(page)
             await _dismiss_rate_limit_modal(page)

@@ -998,7 +998,8 @@ async def chatgpt_slots_launch(slot_id: str, _: int = Depends(auth_key_id)):
     from flow2api.services.chatgpt_playwright import reset_playwright_browser
 
     result = system_ops.launch_playwright_slot(slot_id)
-    await reset_playwright_browser(slot_id)
+    if not result.get("already_running"):
+        await reset_playwright_browser(slot_id)
     if not result.get("ok"):
         raise HTTPException(400, result.get("message") or result.get("error") or "launch_failed")
     nudge_scheduler()

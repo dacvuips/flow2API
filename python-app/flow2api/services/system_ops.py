@@ -229,6 +229,78 @@ def _chatgpt_chrome_window_args(*, slot_index: int = 0) -> list[str]:
     return []
 
 
+def _chatgpt_chrome_fast_args() -> list[str]:
+    """Flags that shorten cold start — Playwright navigates to chatgpt.com later."""
+    return [
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-domain-reliability",
+        "--disable-features=TranslateUI",
+        "--disable-hang-monitor",
+        "--disable-sync",
+        "--no-pings",
+    ]
+
+
+def _clear_chrome_profile_lock(user_data: Path) -> None:
+    """Remove stale lock files after Chrome crash (otherwise launch hangs/fails)."""
+    targets = [user_data]
+    default_prof = user_data / "Default"
+    if default_prof.is_dir():
+        targets.append(default_prof)
+    for base in targets:
+        for name in ("SingletonLock", "SingletonSocket", "lockfile"):
+            try:
+                p = base / name
+                if p.exists():
+                    p.unlink()
+            except Exception as exc:
+                logger.debug("clear chrome lock %s: %s", p, exc)
+
+
+def _free_stuck_cdp_port(port: int, cdp_url: str) -> list[int]:
+    """Port occupied but CDP dead → kill listener so relaunch can bind."""
+    if cdp_endpoint_alive(cdp_url):
+        return []
+    pids = _pids_listening_on_port(port)
+    if not pids:
+        return []
+    killed: list[int] = []
+    for pid in pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid), "/T"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            killed.append(pid)
+        except Exception as exc:
+            logger.debug("taskkill pid=%s port=%s: %s", pid, port, exc)
+    if killed:
+        logger.info("freed stuck CDP port %s — killed pids %s", port, killed)
+        time.sleep(0.4)
+    return killed
+
+
+def _wait_cdp_alive(cdp_url: str, *, timeout_s: float = 20.0) -> bool:
+    """Poll /json/version until CDP responds (Chrome cold start can exceed 6s)."""
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    delay = 0.08
+    while time.monotonic() < deadline:
+        if cdp_endpoint_alive(cdp_url):
+            return True
+        time.sleep(delay)
+        delay = min(0.35, delay * 1.12)
+    return cdp_endpoint_alive(cdp_url)
+
+
+def _chatgpt_cdp_launch_url(_start_url: str | None) -> str:
+    """Open blank tab first — CDP ready faster; Playwright loads chatgpt.com on attach."""
+    return "about:blank"
+
+
 def public_chatgpt_config() -> dict[str, Any]:
     return chatgpt_config()
 
@@ -493,6 +565,9 @@ def launch_chrome_for_playwright(
             "message": f"Chrome CDP đã chạy tại {cdp_url} — Playwright sẽ gắn vào profile đang mở.",
         }
 
+    _free_stuck_cdp_port(port, cdp_url)
+    _clear_chrome_profile_lock(user_data)
+
     chrome = str(paths[0])
     args = [
         chrome,
@@ -503,8 +578,9 @@ def launch_chrome_for_playwright(
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--disable-session-crashed-bubble",
+        *_chatgpt_chrome_fast_args(),
         *_chatgpt_chrome_window_args(slot_index=0),
-        start_url or "https://chatgpt.com/",
+        _chatgpt_cdp_launch_url(start_url),
     ]
     try:
         _popen_detached(args, cwd=user_data)
@@ -519,11 +595,7 @@ def launch_chrome_for_playwright(
             ),
         }
 
-    # Wait briefly for CDP
-    for _ in range(20):
-        time.sleep(0.25)
-        if cdp_endpoint_alive(cdp_url):
-            break
+    alive = _wait_cdp_alive(cdp_url, timeout_s=20.0)
 
     to_save = {
         k: v
@@ -537,7 +609,6 @@ def launch_chrome_for_playwright(
     }
     save_config({"chatgpt": to_save})
 
-    alive = cdp_endpoint_alive(cdp_url)
     return {
         "ok": alive,
         "cdp_url": cdp_url,
@@ -599,6 +670,9 @@ def launch_playwright_slot(
             slot_index = i
             break
 
+    _free_stuck_cdp_port(port, cdp_url)
+    _clear_chrome_profile_lock(user_data)
+
     chrome = str(paths[0])
     args = [
         chrome,
@@ -610,8 +684,9 @@ def launch_playwright_slot(
         "--hide-crash-restore-bubble",
         "--disable-session-crashed-bubble",
         "--new-window",
+        *_chatgpt_chrome_fast_args(),
         *_chatgpt_chrome_window_args(slot_index=slot_index),
-        start_url or "https://chatgpt.com/",
+        _chatgpt_cdp_launch_url(start_url),
     ]
     logger.info("launch ChatGPT CDP slot=%s port=%s chrome=%s", slot.id, port, chrome)
     try:
@@ -624,12 +699,7 @@ def launch_playwright_slot(
             "message": str(exc),
         }
 
-    for _ in range(24):
-        time.sleep(0.25)
-        if cdp_endpoint_alive(cdp_url):
-            break
-
-    alive = cdp_endpoint_alive(cdp_url)
+    alive = _wait_cdp_alive(cdp_url, timeout_s=20.0)
     return {
         "ok": alive,
         "slot_id": slot.id,
