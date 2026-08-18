@@ -1387,7 +1387,7 @@ class WorkerController:
 
         if req_type == "gen_text":
             prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
-            system_instruction = str(
+            system_instruction = flow_sdk.coerce_system_instruction(
                 params.get("system_instruction")
                 or params.get("systemInstruction")
                 or ""
@@ -1400,15 +1400,38 @@ class WorkerController:
             raw_level = (
                 params.get("thinking_level")
                 or params.get("thinkingLevel")
-                or "HIGH"
+                or flow_sdk.DEFAULT_TEXT_THINKING_LEVEL
             )
-            thinking_level = str(raw_level).strip().upper() or "HIGH"
+            thinking_level = str(raw_level).strip().upper() or flow_sdk.DEFAULT_TEXT_THINKING_LEVEL
             if thinking_level not in flow_sdk.TEXT_THINKING_LEVELS:
-                thinking_level = "HIGH"
+                thinking_level = flow_sdk.DEFAULT_TEXT_THINKING_LEVEL
+            n_img = len(params.get("image_base64s") or params.get("imageBase64s") or [])
+            schema = (
+                params.get("schema")
+                or params.get("response_schema")
+                or params.get("responseSchema")
+                or params.get("json_schema")
+                or params.get("jsonSchema")
+            )
+            force_json = bool(
+                params.get("json")
+                or params.get("force_json")
+                or params.get("forceJson")
+                or params.get("response_json")
+                or schema
+            )
+            mime = str(
+                params.get("response_mime_type")
+                or params.get("responseMimeType")
+                or (flow_sdk.TEXT_JSON_MIME if force_json else "")
+            ).strip()
             append_request_log(
                 rid,
                 "worker",
-                f"gen_text model={model_name} thinking={thinking_level} prompt={prompt[:80]}…",
+                f"gen_text model={model_name} thinking={thinking_level}"
+                + (f" images={n_img}" if n_img else "")
+                + (" json_schema" if schema else (" json" if force_json else ""))
+                + f" prompt={prompt[:80]}…",
                 level="info",
             )
             raw = await flow_sdk.gen_text(
@@ -1419,6 +1442,10 @@ class WorkerController:
                 thinking_level=thinking_level,
                 contents=params.get("contents") if isinstance(params.get("contents"), list) else None,
                 system_parts=params.get("system_parts") or params.get("systemParts"),
+                image_base64s=params.get("image_base64s") or params.get("imageBase64s"),
+                schema=schema,
+                response_mime_type=mime,
+                force_json=force_json,
                 applet_id=str(params.get("applet_id") or params.get("appletId") or flow_sdk.DEFAULT_TEXT_APPLET_ID),
                 applet_version_id=str(
                     params.get("applet_version_id")
@@ -1433,9 +1460,12 @@ class WorkerController:
                 "usage": raw.get("usage") or {},
                 "model": raw.get("model") or model_name,
                 "thinking_level": thinking_level,
+                "finish_reason": raw.get("finish_reason") or "",
                 "profile_id": profile_id,
-                "raw": raw.get("raw"),
             }
+            sig = str(raw.get("thought_signature") or "").strip()
+            if sig:
+                result["thought_signature"] = sig
             activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
@@ -1490,6 +1520,62 @@ class WorkerController:
                 params.pop("trpc_401_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
+            activity.update_request(rid, status="done", result=result, error=None)
+            events.publish("request_finished", {"id": rid, "status": "done"})
+            return
+
+        if req_type == "gen_audio":
+            dialog = str(
+                params.get("dialog")
+                or params.get("prompt")
+                or (_task_prompt(row, params) if row else "")
+                or ""
+            ).strip()
+            voice = (
+                params.get("voice")
+                or params.get("reference_audio")
+                or params.get("referenceAudio")
+                or "achernar"
+            )
+            audio_model = str(
+                params.get("modelKey")
+                or params.get("model_key")
+                or params.get("audio_model")
+                or flow_sdk.DEFAULT_AUDIO_MODEL_KEY
+            )
+            append_request_log(
+                rid,
+                "worker",
+                f"gen_audio voice={voice} dialog={dialog[:80]}…",
+                level="info",
+            )
+            raw = await flow_sdk.gen_audio(
+                client,
+                project_id=project_id,
+                dialog=dialog,
+                voice=str(voice),
+                model_key=audio_model,
+                generation_type=str(
+                    params.get("generation_type")
+                    or params.get("generationType")
+                    or flow_sdk.AUDIO_GENERATION_TYPE_PREVIEW
+                ),
+            )
+            media_ids = flow_sdk.extract_audio_media_ids(raw)
+            urls = await flow_sdk.resolve_audio_urls(client, media_ids)
+            media_entries = flow_sdk.build_audio_media_entries(raw, urls)
+            result = {
+                "audio_urls": urls,
+                "media_ids": media_ids,
+                "media_entries": media_entries,
+                "project_id": project_id,
+                "profile_id": profile_id,
+                "voice": flow_sdk.normalize_voice_media_id(voice) or "achernar",
+                "dialog": dialog,
+                "audio_model": audio_model,
+                "modelKey": audio_model,
+            }
+            result = await persist_task_result(rid, result, req_type)
             activity.update_request(rid, status="done", result=result, error=None)
             events.publish("request_finished", {"id": rid, "status": "done"})
             return

@@ -414,21 +414,26 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 
 function classifyUrl(url) {
   if (url.includes('batchGenerateImages'))     return 'GEN_IMG';
+  if (url.includes('batchGenerateAudio'))      return 'GEN_AUD';
   if (url.includes('batchAsyncGenerateVideo')) return 'GEN_VID';
   if (url.includes('batchCheckAsync'))         return 'POLL';
   return 'API';
 }
 
-/** Gen image/video submit — bắt buộc captchaToken từ Captcha Center (agent broker). */
+/** Gen image/video/audio/text submit — bắt buộc captchaToken từ Captcha Center (agent broker). */
 function requiresCenterCaptcha(url) {
   if (!url || url.includes('batchCheckAsync')) return false;
-  if (url.includes('batchGenerateImages')) return true;
-  if (url.includes('batchAsyncGenerateVideo')) return true;
+  const u = String(url).toLowerCase();
+  if (u.includes('batchgenerateimages')) return true;
+  if (u.includes('batchgenerateaudio') || u.includes('flow:batchgenerateaudio') || u.includes('flow%3abatchgenerateaudio')) return true;
+  if (u.includes('batchasyncgeneratevideo')) return true;
+  if (u.includes('flow:generatecontent') || u.includes('flow%3ageneratecontent')) return true;
   return false;
 }
 
 function bodyHasRecaptchaToken(body) {
   if (!body || typeof body !== 'object') return false;
+  if (body.recaptchaContext?.token) return true;
   if (body.clientContext?.recaptchaContext?.token) return true;
   if (Array.isArray(body.requests)) {
     return body.requests.some((req) => req?.clientContext?.recaptchaContext?.token);
@@ -970,7 +975,7 @@ async function handleApiRequest(msg) {
     let captchaToken = preSuppliedCaptchaToken;
     let headerTab = await pickPrimaryFlowTab();
     if (mustHaveCenterCaptcha && !captchaToken) {
-      console.error('[Flow2API] Blocked gen image/video — missing Center captchaToken');
+      console.error('[Flow2API] Blocked gen image/video/audio — missing Center captchaToken');
       sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_CAPTCHA_CENTER'; }
       chrome.storage.local.set({ metrics });
@@ -1007,6 +1012,9 @@ async function handleApiRequest(msg) {
     let finalBody = body;
     if (captchaToken && finalBody) {
       finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
+      if (finalBody.recaptchaContext) {
+        finalBody.recaptchaContext.token = captchaToken;
+      }
       if (finalBody.clientContext?.recaptchaContext) {
         finalBody.clientContext.recaptchaContext.token = captchaToken;
       }
@@ -1020,7 +1028,7 @@ async function handleApiRequest(msg) {
     }
 
     if (mustHaveCenterCaptcha && finalBody && !bodyHasRecaptchaToken(finalBody)) {
-      console.error('[Flow2API] Blocked gen image/video — captchaToken not injected into body');
+      console.error('[Flow2API] Blocked gen image/video/audio — captchaToken not injected into body');
       sendToAgent({ id, status: 503, error: 'NO_CAPTCHA_CENTER' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_CAPTCHA_CENTER'; }
       chrome.storage.local.set({ metrics });

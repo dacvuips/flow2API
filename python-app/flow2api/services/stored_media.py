@@ -436,14 +436,23 @@ def _external_https_urls(urls: Any) -> list[str]:
 
 
 def keep_flow_result_urls(result: dict[str, Any], *, kind: str = "") -> dict[str, Any]:
-    """Keep Flow fifeUrl CDN links in image_urls/video_urls/Link — never /image|/video rewrite."""
+    """Keep Flow fifeUrl CDN links in image_urls/video_urls/audio_urls/Link — never /image|/video rewrite."""
     if not isinstance(result, dict):
         return result
     out = dict(result)
-    is_video = "video" in str(kind or "").lower()
-    primary_key = "video_urls" if is_video else "image_urls"
-    other_key = "image_urls" if is_video else "video_urls"
-    default_kind = "video" if is_video else "image"
+    kind_lower = str(kind or "").lower()
+    if "video" in kind_lower:
+        primary_key = "video_urls"
+        other_key = "image_urls"
+        default_kind = "video"
+    elif "audio" in kind_lower:
+        primary_key = "audio_urls"
+        other_key = "video_urls"
+        default_kind = "audio"
+    else:
+        primary_key = "image_urls"
+        other_key = "video_urls"
+        default_kind = "image"
 
     primary = _flow_https_urls(out.get(primary_key))
     entries = out.get("media_entries") if isinstance(out.get("media_entries"), list) else []
@@ -614,6 +623,13 @@ def finalize_image_result_urls(request_id: str, result: dict[str, Any]) -> dict[
     return normalize_publisher_urls(keep_flow_result_urls(out, kind="image"))
 
 
+def finalize_audio_result_urls(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Keep Flow CDN audio URLs in audio_urls/Link."""
+    _ = request_id
+    out = rewrite_result_public_urls(dict(result))
+    return normalize_publisher_urls(keep_flow_result_urls(out, kind="audio"))
+
+
 def _load_request_video_result(request_id: str) -> dict[str, Any] | None:
     from flow2api.services import activity
 
@@ -728,6 +744,8 @@ async def persist_task_result(
     is_video = "video" in str(task_type or "").lower()
     if is_video:
         return finalize_video_result_urls(request_id, result)
+    if "audio" in str(task_type or "").lower():
+        return finalize_audio_result_urls(request_id, result)
     return finalize_image_result_urls(request_id, result)
 
 

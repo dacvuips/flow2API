@@ -196,8 +196,11 @@ def slim_result_for_list(result: Any) -> Any:
     if not isinstance(result, dict):
         return result
     out = dict(result)
-    for key in ("video_urls", "image_urls", "local_files", "Link", "raw"):
+    for key in ("video_urls", "image_urls", "local_files", "Link", "raw", "thought_signature"):
         out.pop(key, None)
+    text = out.get("text")
+    if isinstance(text, str) and len(text) > 500:
+        out["text"] = text[:500] + "…"
     return out
 
 
@@ -303,7 +306,8 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
     if not isinstance(result, dict):
         return []
     is_video = "video" in str(task_type or "").lower()
-    default_kind = "video" if is_video else "image"
+    is_audio = "audio" in str(task_type or "").lower()
+    default_kind = "video" if is_video else ("audio" if is_audio else "image")
     items: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     seen_mids: set[str] = set()
@@ -342,6 +346,8 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
         add(str(u), "image", mid)
     for u in result.get("video_urls") or []:
         add(str(u), "video")
+    for u in result.get("audio_urls") or []:
+        add(str(u), "audio")
     if result.get("Link"):
         add(str(result["Link"]), default_kind)
 
@@ -351,7 +357,7 @@ def preview_items_from_result(result: dict, task_type: str = "") -> list[dict[st
                 continue
             mid = str(entry.get("media_id") or entry.get("mediaId") or "").strip()
             kind_raw = str(entry.get("kind") or entry.get("mediaType") or default_kind).lower()
-            kind = "video" if "video" in kind_raw else "image"
+            kind = "video" if "video" in kind_raw else ("audio" if "audio" in kind_raw else "image")
             if entry.get("url"):
                 add(str(entry["url"]), kind, mid)
 

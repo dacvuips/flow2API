@@ -30,17 +30,51 @@ def _response_header(resp: dict, name: str) -> str:
 
 
 def _url_requires_center_captcha(url: str) -> bool:
-    """Gen image/video/text submit endpoints — bắt buộc token từ Captcha Center."""
-    u = str(url or "")
-    if "batchCheckAsync" in u:
+    """Gen image/video/audio/text submit — bắt buộc reCAPTCHA token từ Captcha Center."""
+    u = str(url or "").lower()
+    if "batchcheckasync" in u:
         return False
-    if "batchGenerateImages" in u:
+    if "batchgenerateimages" in u:
         return True
-    if "batchAsyncGenerateVideo" in u:
+    if "batchasyncgeneratevideo" in u:
         return True
-    if "flow:generateContent" in u or "flow%3AgenerateContent" in u:
+    if "flow:generatecontent" in u or "flow%3ageneratecontent" in u:
+        return True
+    if "batchgenerateaudio" in u or "flow:batchgenerateaudio" in u or "flow%3abatchgenerateaudio" in u:
         return True
     return False
+
+
+def _captcha_action_for_url(url: str) -> str | None:
+    """Infer reCAPTCHA pageAction from Google Flow endpoint URL."""
+    u = str(url or "").lower()
+    if "batchasyncgeneratevideo" in u:
+        return "VIDEO_GENERATION"
+    if "flow:generatecontent" in u or "flow%3ageneratecontent" in u:
+        return "TEXT_GENERATION"
+    if (
+        "batchgenerateimages" in u
+        or "upsampleimage" in u
+        or "batchgenerateaudio" in u
+        or "flow:batchgenerateaudio" in u
+        or "flow%3abatchgenerateaudio" in u
+    ):
+        return "IMAGE_GENERATION"
+    return None
+
+
+def _captcha_kind_label(url: str) -> str:
+    """Short request kind for logs (gen_audio / gen_video / …)."""
+    u = str(url or "").lower()
+    if "batchgenerateaudio" in u or "flow:batchgenerateaudio" in u or "flow%3abatchgenerateaudio" in u:
+        return "gen_audio"
+    if "batchasyncgeneratevideo" in u:
+        return "gen_video"
+    if "batchgenerateimages" in u:
+        return "gen_image"
+    if "flow:generatecontent" in u or "flow%3ageneratecontent" in u:
+        return "gen_text"
+    return "gen"
 
 
 def _inject_captcha_into_body(body: Any, captcha_token: str) -> Any:
@@ -338,6 +372,7 @@ class ExtensionSession:
         headers: Optional[dict],
         body: Any,
         captcha_token: Optional[str] = None,
+        captcha_action: Optional[str] = None,
         timeout: float = 180.0,
     ) -> dict:
         if self._use_direct_http():
@@ -359,6 +394,8 @@ class ExtensionSession:
         }
         if captcha_token:
             params["captchaToken"] = captcha_token
+        if captcha_action:
+            params["captchaAction"] = captcha_action
         return await self._send("api_request", params, timeout=timeout)
 
     def resolve_callback(self, payload: dict) -> bool:
@@ -481,10 +518,13 @@ class ExtensionSession:
         }
         needs_gen_captcha = _url_requires_center_captcha(url)
         if needs_gen_captcha and not captcha_action:
+            captcha_action = _captcha_action_for_url(url)
+        captcha_kind = _captcha_kind_label(url)
+        if needs_gen_captcha and not captcha_action:
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                "Gen image/video bị chặn — thiếu captcha Center (captcha_action)",
+                "Gen image/video/audio bị chặn — thiếu captcha Center (captcha_action)",
                 level="error",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
@@ -496,7 +536,7 @@ class ExtensionSession:
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                f"Đang xin reCAPTCHA từ Captcha Center ({captcha_action})",
+                f"Đang xin reCAPTCHA từ Captcha Center ({captcha_kind} · {captcha_action})",
                 level="info",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
@@ -515,7 +555,7 @@ class ExtensionSession:
             append_request_log(
                 self.trace_request_id,
                 "captcha",
-                "Gen image/video bị chặn — không có captchaToken từ Center",
+                "Gen image/video/audio bị chặn — không có captchaToken từ Center",
                 level="error",
                 profile_id=self.profile_id,
                 profile_email=self.email or None,
@@ -532,6 +572,7 @@ class ExtensionSession:
                     headers=auth_headers,
                     body=body,
                     captcha_token=captcha_tok,
+                    captcha_action=captcha_action,
                     timeout=timeout,
                 )
             except Exception as exc:
@@ -569,9 +610,16 @@ class ExtensionSession:
                     "Mở Chrome profile → Get Connection Status → thử gen lại."
                     f" ({err})"
                 )
-        # Nếu Google trả 403 (score thấp) → yêu cầu 1 center hard_reset
+        # Chỉ hard_reset khi Google báo lỗi reCAPTCHA — HTTP_403 chung (vd. sai action / quyền)
+        # không đồng nghĩa score thấp (ảnh/video cùng Center vẫn chạy bình thường).
         if captcha_action and status_probe == 403:
-            self._request_center_hard_reset(reason=f"api_403:{captcha_action}")
+            from flow2api.services.flow_sdk import error_from_response, is_recaptcha_error
+
+            err_text = error_from_response(resp if isinstance(resp, dict) else {})
+            if is_recaptcha_error(err_text):
+                self._request_center_hard_reset(
+                    reason=f"api_403:{captcha_kind}:{captcha_action}"
+                )
         if not raise_on_error:
             return resp
         status = int(resp.get("status") or 0)

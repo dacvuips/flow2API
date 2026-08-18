@@ -54,6 +54,8 @@ def _label_from_url(url: str, method: str) -> str:
         return "gen_image"
     if "flow:generatecontent" in u or "flow%3Ageneratecontent" in u:
         return "gen_text"
+    if "batchgenerateaudio" in u or "flow%3Abatchgenerateaudio" in u:
+        return "gen_audio"
     if "uploadimage" in u:
         return "upload_image"
     if "batchasyncgeneratevideoedit" in u:

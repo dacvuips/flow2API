@@ -63,13 +63,18 @@ class Flow2APIClient:
         system_instruction: str = "",
         model: str = "gemini-3-flash-preview",
         thinking_level: Optional[str] = None,
+        image_base64s: Optional[list[str]] = None,
+        schema: Optional[dict] = None,
+        json: Optional[bool] = None,
         profile_id: Optional[str] = None,
         **extra: Any,
     ) -> dict:
         """Text via aisandbox flow:generateContent (Gemini).
 
         thinking_level: optional MINIMAL|LOW|MEDIUM|HIGH.
-        Omit to use server default (HIGH).
+        Omit to use server default (LOW — Flow UI). Empty system_instruction
+        uses Flow screenplay convention unless image_base64s is set (vision).
+        schema / json=True → generationConfig.responseMimeType=application/json.
         """
         params: dict[str, Any] = {
             "prompt": prompt,
@@ -80,6 +85,12 @@ class Flow2APIClient:
             params["thinking_level"] = str(thinking_level).strip().upper()
         if system_instruction:
             params["system_instruction"] = system_instruction
+        if image_base64s:
+            params["image_base64s"] = list(image_base64s)
+        if schema:
+            params["schema"] = schema
+        if json:
+            params["json"] = True
         if profile_id:
             params["profile_id"] = profile_id
         with httpx.Client(timeout=self.timeout) as client:
@@ -96,6 +107,39 @@ class Flow2APIClient:
 
     def create_text_video(self, **kwargs: Any) -> dict:
         return self.create("gen_text_video", **kwargs)
+
+    def create_audio(
+        self,
+        *,
+        prompt: str = "",
+        dialog: str = "",
+        voice: str = "achernar",
+        model_key: str = "gemini_v4s_tts_flow",
+        audio_model: Optional[str] = None,
+        modelKey: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        **extra: Any,
+    ) -> dict:
+        text = str(dialog or prompt or "").strip()
+        mk = str(modelKey or model_key or audio_model or "gemini_v4s_tts_flow").strip()
+        params: dict[str, Any] = {
+            "dialog": text,
+            "prompt": text,
+            "voice": voice,
+            "modelKey": mk,
+            "audio_model": mk,
+            **extra,
+        }
+        if profile_id:
+            params["profile_id"] = profile_id
+        with httpx.Client(timeout=self.timeout) as client:
+            r = client.post(
+                f"{self.base_url}/api/requests",
+                headers=self._headers(),
+                json={"type": "gen_audio", "params": params},
+            )
+            r.raise_for_status()
+            return r.json()
 
     def upload(
         self,

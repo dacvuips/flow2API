@@ -97,7 +97,7 @@ def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
                 out["profile_id"] = str(out[key]).strip()
                 break
 
-    # gen_text: frontend may send thinking_level / thinkingLevel (default HIGH on worker)
+    # gen_text: thinking_level / thinkingLevel (default LOW — Flow UI capture)
     if not out.get("thinking_level"):
         for key in ("thinkingLevel", "thinking_config", "thinkingConfig"):
             raw = out.get(key)
@@ -114,13 +114,65 @@ def normalize_request_params(params: dict[str, Any]) -> dict[str, Any]:
     if not out.get("system_instruction"):
         for key in ("systemInstruction",):
             if out.get(key) is not None:
-                out["system_instruction"] = out[key]
+                from flow2api.services.flow_sdk import coerce_system_instruction
+
+                out["system_instruction"] = coerce_system_instruction(out[key])
                 break
+    elif not isinstance(out.get("system_instruction"), str):
+        from flow2api.services.flow_sdk import coerce_system_instruction
+
+        out["system_instruction"] = coerce_system_instruction(out.get("system_instruction"))
 
     if not out.get("model") and not out.get("image_model"):
         for key in ("text_model", "textModel"):
             if out.get(key) is not None and str(out.get(key) or "").strip():
                 out["model"] = str(out[key]).strip()
                 break
+
+    if not out.get("audio_model"):
+        for key in ("audioModel", "model_key", "modelKey"):
+            raw = out.get(key)
+            if raw is not None and str(raw).strip():
+                out["audio_model"] = str(raw).strip()
+                break
+    elif out.get("audio_model") is not None:
+        out["audio_model"] = str(out.get("audio_model")).strip()
+
+    if out.get("audio_model") and not out.get("modelKey"):
+        out["modelKey"] = out["audio_model"]
+    if out.get("modelKey") and not out.get("audio_model"):
+        out["audio_model"] = str(out.get("modelKey")).strip()
+
+    if not out.get("dialog") and out.get("prompt"):
+        out["dialog"] = out["prompt"]
+
+    if not out.get("schema"):
+        for key in ("response_schema", "responseSchema", "json_schema", "jsonSchema"):
+            raw = out.get(key)
+            if raw is not None:
+                from flow2api.services.flow_sdk import coerce_json_schema
+
+                parsed = coerce_json_schema(raw)
+                if parsed:
+                    out["schema"] = parsed
+                    break
+    elif not isinstance(out.get("schema"), dict):
+        from flow2api.services.flow_sdk import coerce_json_schema
+
+        parsed = coerce_json_schema(out.get("schema"))
+        if parsed:
+            out["schema"] = parsed
+
+    if not out.get("response_mime_type"):
+        for key in ("responseMimeType",):
+            if out.get(key) is not None and str(out.get(key) or "").strip():
+                out["response_mime_type"] = str(out[key]).strip()
+                break
+
+    json_flag = out.get("json")
+    if json_flag in (True, "true", "True", 1, "1"):
+        out["json"] = True
+    elif json_flag in (False, "false", "False", 0, "0"):
+        out["json"] = False
 
     return out

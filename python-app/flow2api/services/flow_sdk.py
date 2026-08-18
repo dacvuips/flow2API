@@ -131,6 +131,46 @@ OMNI_COMPONENT_MAX_IMAGES_WITH_VIDEO = 5
 OMNI_COMPONENT_MAX_IMAGES_ONLY = 7
 OMNI_COMPONENT_MAX_VIDEOS = 1
 
+AUDIO_BATCH_PATH = "/v1/flow:batchGenerateAudio"
+DEFAULT_AUDIO_MODEL_KEY = "gemini_v4s_tts_flow"
+AUDIO_GENERATION_TYPE_PREVIEW = "PREVIEW"
+# TTS trên PINHOLE — cùng reCAPTCHA pageAction với gen ảnh / text (không phải VIDEO).
+AUDIO_CAPTCHA_ACTION = "IMAGE_GENERATION"
+
+# Flow TTS voices — params.voice is lowercase; API voiceConfigs use display name.
+AUDIO_VOICE_DISPLAY: dict[str, str] = {
+    "achernar": "Achernar",
+    "achird": "Achird",
+    "algenib": "Algenib",
+    "algieba": "Algieba",
+    "alnilam": "Alnilam",
+    "aoede": "Aoede",
+    "autonoe": "Autonoe",
+    "callirrhoe": "Callirrhoe",
+    "charon": "Charon",
+    "despina": "Despina",
+    "enceladus": "Enceladus",
+    "erinome": "Erinome",
+    "fenrir": "Fenrir",
+    "gacrux": "Gacrux",
+    "iapetus": "Iapetus",
+    "kore": "Kore",
+    "laomedeia": "Laomedeia",
+    "leda": "Leda",
+    "orus": "Orus",
+    "puck": "Puck",
+    "pulcherrima": "Pulcherrima",
+    "rasalgethi": "Rasalgethi",
+    "sadachbia": "Sadachbia",
+    "sadaltager": "Sadaltager",
+    "schedar": "Schedar",
+    "sulafat": "Sulafat",
+    "umbriel": "Umbriel",
+    "vindemiatrix": "Vindemiatrix",
+    "zephyr": "Zephyr",
+    "zubenelgenubi": "Zubenelgenubi",
+}
+
 
 def normalize_voice_media_id(raw: Any) -> str:
     """Flow referenceAudio mediaId = voice display name lowercased (Achernar → achernar)."""
@@ -159,11 +199,81 @@ def _generate_content_url() -> str:
     return _api_url("/v1/flow:generateContent")
 
 
+def _audio_batch_url() -> str:
+    return _api_url(AUDIO_BATCH_PATH)
+
+
+def voice_display_name(voice_id: str) -> str:
+    vid = normalize_voice_media_id(voice_id)
+    if not vid:
+        return AUDIO_VOICE_DISPLAY["achernar"]
+    return AUDIO_VOICE_DISPLAY.get(vid, vid[:1].upper() + vid[1:])
+
+
 # Flow Prop Writer / text gemini defaults (from labs.google traffic).
 DEFAULT_TEXT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TEXT_APPLET_ID = "eb4a10c1-5f61-4c76-9c95-bc6aa5d446f1"
 DEFAULT_TEXT_APPLET_VERSION_ID = "e4b4151a-2716-42f2-ab14-f39ec21b6473"
+DEFAULT_TEXT_THINKING_LEVEL = "LOW"
+TEXT_CAPTCHA_ACTION = "TEXT_GENERATION"
 TEXT_THINKING_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH", "MINIMAL"})
+TEXT_MAX_IMAGES = 10
+TEXT_JSON_MIME = "application/json"
+DEFAULT_TEXT_VISION_PROMPT = "Phân tích bức ảnh này: mô tả nội dung, bố cục và chi tiết nổi bật."
+# Flow UI default systemInstruction for ``flow:generateContent`` (screenplay convention).
+DEFAULT_TEXT_SYSTEM_INSTRUCTION = """## PERSONA:
+You are an expert in screenplay writing, a specific Markdown convention for writing screenplays. For all screenplay-related tasks, you MUST adhere strictly to the following formatting rules without deviation.
+
+
+## ASSETS:
+None provided.
+
+
+## CURRENT SCRIPT:
+
+
+## SCREENPLAY CONVENTION RULES:
+1.  **Title or Act Number**: The script must begin with a title page. The title page must be in all CAPS. If the script has acts, use the same visual treatment.
+    *   **TITLE**: A Level 1 Header (#).
+2.  **Scene Heading (Slugline)**: Use a Level 2 Header (###). The text MUST be in ALL CAPS.
+    *   Example: ### INT. SPACESHIP COCKPIT - NIGHT
+3.  **Action/Description**: Use standard paragraph text. This is the default format for describing scenes and character actions.
+4.  **Character Names in Action Lines**: CRITICAL - Character names in action/description paragraphs follow specific rules:
+    *   **First appearance only**: Normal weight and ALL CAPS (EVA) when a character first appears in the script
+    *   **All subsequent appearances**: Title Case (Eva) without bold or ALL CAPS.
+    *   Never use ALL CAPS for character names in action lines except for their first introduction
+    *   Example: EVA enters the cockpit. Eva checks the controls.
+5.  **Character Name** for Dialogue: Use bold all caps text (**CHARACTER**) when the character's name is used in dialogue. The name MUST be in ALL CAPS and appear on its own line directly above their dialogue.
+    *   Example: **EVA**
+    *   CRITICAL: Bold (**) must ONLY be used for character names before dialogue. NEVER use bold for emphasis, action text, comments, or any other purpose in the script.
+6.  **Dialogue**: Must preceed a Character name or parenthetical and be on it's own line. Never add to line breaks between multiple lines of dialogue. Never use blockquotes (>) for dialogue. All lines of dialogue.
+    *   Example: Get me a damage report.
+7.  **Parenthetical**: Use italic text (_(text)_) enclosed in parentheses. It MUST be placed on its own line between the Character Name and the Dialogue block.
+8.  **Transition**: Use a Level 5 Header (#####). The text MUST be in ALL CAPS and end with a colon.
+    *   Example: ##### FADE TO BLACK:
+    *   Example: ##### CUT TO:
+9. **Non-script Notes**: To add notes, comments or additional information to the script, use blockquotes (> text). These will be removed from the final script. Note Titles are optional. Don't nest blockquotes. NEVER use bold in blockquote comments.
+
+Estimate approximately 1 page per minute of screen time.
+
+## CRITICAL EDITING INSTRUCTIONS:
+- Make ONLY the specific changes requested in the feedback
+- PRESERVE all content that is not being edited
+- Preserve the scene heading format (### INT./EXT.)
+- PRESERVE all existing blockquote comments (lines starting with >) unless explicitly asked to remove them
+- PRESERVE all scene-id comments EXACTLY as they appear (e.g., <!-- scene-id: abc123 -->)
+- NEVER generate, create, or modify scene-id comments - these are system-generated
+- If the user asks to "clean up" or "format" the script, fix formatting issues to match the rules above
+- Return the complete screenplay with edits applied
+- NEVER escape Markdown characters in your output - use literal ** for bold, _ for italics, # for headers. Do not use backslash escaping like \\*\\* or \\_ in the screenplay text
+- Include a diverse range of characters in your script. Try to use out of distribution, unique names for characters.
+- NEVER use bold (**) for anything other than character names before dialogue lines. No bold in action lines, comments, or descriptions.
+
+CRITICAL OUTPUT FORMATTING:
+- NEVER escape Markdown characters in your output - use literal ** for bold, _ for italics, # for headers.
+- NEVER generate, create, or add scene-id comments - these are system-generated.
+- If the current script contains scene-id comments, DO NOT include them in new content you generate.
+"""
 
 
 def _require_tier(client: FlowClient) -> str:
@@ -719,6 +829,260 @@ async def gen_image(
     raise FlowApiError(last_err, step="gen_image", raw=last_resp)
 
 
+def _unwrap_audio_batch_response(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("responses", "media", "results", "items"):
+        inner = data.get(key)
+        if isinstance(inner, list):
+            return [x for x in inner if isinstance(x, dict)]
+    if data.get("name") or data.get("audio"):
+        return [data]
+    inner = data.get("data")
+    if isinstance(inner, list):
+        return [x for x in inner if isinstance(x, dict)]
+    if isinstance(inner, dict) and (inner.get("name") or inner.get("audio")):
+        return [inner]
+    return []
+
+
+def extract_audio_media_ids(data: Any) -> list[str]:
+    ids: list[str] = []
+    for entry in _unwrap_audio_batch_response(data):
+        mid = entry.get("name") or entry.get("mediaId") or entry.get("media_id")
+        if mid:
+            ids.append(str(mid))
+    return ids
+
+
+def build_audio_media_entries(
+    data: Any,
+    urls: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    items = _unwrap_audio_batch_response(data)
+    url_list = list(urls or [])
+    for idx, entry in enumerate(items):
+        mid = entry.get("name") or entry.get("mediaId") or entry.get("media_id")
+        url = url_list[idx] if idx < len(url_list) else None
+        if mid or url:
+            entries.append({"url": url, "media_id": mid, "kind": "audio"})
+    if not entries and url_list:
+        for idx, url in enumerate(url_list):
+            entries.append({"url": url, "kind": "audio"})
+    return entries
+
+
+async def gen_audio(
+    client: FlowClient,
+    *,
+    project_id: str,
+    dialog: str,
+    voice: str = "achernar",
+    model_key: str = DEFAULT_AUDIO_MODEL_KEY,
+    generation_type: str = AUDIO_GENERATION_TYPE_PREVIEW,
+) -> Any:
+    """TTS via aisandbox ``/v1/flow:batchGenerateAudio`` (Flow PINHOLE)."""
+    tier = _require_tier(client)
+    text = str(dialog or "").strip()
+    if not text:
+        raise FlowApiError("missing_dialog", step="gen_audio")
+    voice_name = voice_display_name(voice)
+    model = str(model_key or DEFAULT_AUDIO_MODEL_KEY).strip() or DEFAULT_AUDIO_MODEL_KEY
+    gen_type = str(generation_type or AUDIO_GENERATION_TYPE_PREVIEW).strip() or AUDIO_GENERATION_TYPE_PREVIEW
+
+    last_err = "audio_generation_failed"
+    last_resp: dict = {}
+    for attempt in range(RECAPTCHA_RETRY_MAX):
+        ts_try = int(time.time() * 1000) + attempt
+        ctx_try = _client_context(project_id, tier, ts_try)
+        body: dict[str, Any] = {
+            "clientContext": ctx_try,
+            "requests": [
+                {
+                    "dialog": text,
+                    "voicePerformance": "",
+                    "modelKey": model,
+                    "voiceConfigs": [
+                        {"speaker": voice_name, "voice": voice_name},
+                    ],
+                    "generationType": gen_type,
+                }
+            ],
+        }
+        resp = await client.api_request(
+            _audio_batch_url(),
+            body=body,
+            captcha_action=AUDIO_CAPTCHA_ACTION,
+            timeout=300,
+            raise_on_error=False,
+        )
+        last_resp = resp if isinstance(resp, dict) else {}
+        status = int(resp.get("status") or 0)
+        if 200 <= status < 400:
+            payload = resp.get("data")
+            if payload is None:
+                payload = {}
+            return payload
+        last_err = error_from_response(resp)
+        if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = _recaptcha_retry_delay(attempt)
+            log_task_event(
+                client,
+                "gen_audio",
+                f"reCAPTCHA retry {attempt + 1}/{RECAPTCHA_RETRY_MAX}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        if is_transient_flow_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:
+            delay = min(300, (2**attempt) * 10)
+            log_task_event(
+                client,
+                "gen_audio",
+                f"transient retry {attempt + 1}: {last_err} — wait {delay}s",
+            )
+            await asyncio.sleep(delay)
+            continue
+        break
+    raise FlowApiError(last_err, step="gen_audio", raw=last_resp)
+
+
+async def try_fetch_media_audio_url(client: FlowClient, media_id: str) -> str | None:
+    """Resolve signed flow-content.google/audio URL via media.getMediaUrlRedirect."""
+    if not media_id:
+        return None
+    for url_type in ("MEDIA_URL_TYPE_AUDIO", "MEDIA_URL_TYPE_UNSPECIFIED", ""):
+        redirected = await try_fetch_media_url_redirect(
+            client, media_id, media_url_type=url_type
+        )
+        if redirected and "flow-content.google/" in redirected:
+            return redirected
+    return None
+
+
+async def resolve_audio_urls(client: FlowClient, media_ids: list[str]) -> list[str]:
+    urls: list[str] = []
+    for mid in media_ids:
+        url = await try_fetch_media_audio_url(client, mid)
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _inline_image_parts(image_base64s: Any) -> list[dict[str, Any]]:
+    """Gemini ``inlineData`` parts for flow:generateContent (vision)."""
+    if not isinstance(image_base64s, list):
+        return []
+    parts: list[dict[str, Any]] = []
+    for raw in image_base64s[:TEXT_MAX_IMAGES]:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        data = _strip_data_url(s).strip()
+        if not data:
+            continue
+        mime = _guess_upload_mime(s)
+        if not str(mime).startswith("image/"):
+            mime = "image/jpeg"
+        parts.append({"inlineData": {"mimeType": mime, "data": data}})
+    return parts
+
+
+def coerce_json_schema(raw: Any) -> dict[str, Any] | None:
+    """Accept dict or JSON string for structured output."""
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            raw = json.loads(s)
+        except Exception:
+            return None
+    if isinstance(raw, dict) and raw:
+        return raw
+    return None
+
+
+_OPENAPI_TYPES = {
+    "string": "STRING",
+    "number": "NUMBER",
+    "integer": "INTEGER",
+    "boolean": "BOOLEAN",
+    "array": "ARRAY",
+    "object": "OBJECT",
+    "null": "NULL",
+}
+
+
+def _to_gemini_response_schema(node: Any) -> Any:
+    """JSON Schema lowercase types → Gemini OpenAPI uppercase types."""
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    t = out.get("type")
+    if isinstance(t, str) and t.lower() in _OPENAPI_TYPES and t not in _OPENAPI_TYPES.values():
+        out["type"] = _OPENAPI_TYPES[t.lower()]
+    props = out.get("properties")
+    if isinstance(props, dict):
+        out["properties"] = {k: _to_gemini_response_schema(v) for k, v in props.items()}
+    items = out.get("items")
+    if isinstance(items, dict):
+        out["items"] = _to_gemini_response_schema(items)
+    for key in ("anyOf", "oneOf", "allOf"):
+        seq = out.get(key)
+        if isinstance(seq, list):
+            out[key] = [_to_gemini_response_schema(x) for x in seq]
+    return out
+
+
+def coerce_system_instruction(raw: Any) -> str:
+    """Accept string, ``{parts:[{text}]}``, or list of parts from frontend params."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        if raw.get("text") is not None:
+            return str(raw.get("text") or "").strip()
+        return "\n".join(
+            str(p.get("text") or "").strip()
+            for p in (raw.get("parts") or [])
+            if isinstance(p, dict) and str(p.get("text") or "").strip()
+        ).strip()
+    if isinstance(raw, list):
+        chunks: list[str] = []
+        for p in raw:
+            if isinstance(p, str) and p.strip():
+                chunks.append(p.strip())
+            elif isinstance(p, dict) and str(p.get("text") or "").strip():
+                chunks.append(str(p.get("text") or "").strip())
+        return "\n".join(chunks).strip()
+    return str(raw).strip()
+
+
+def _extract_generate_content_meta(data: dict[str, Any]) -> dict[str, Any]:
+    """finishReason + thoughtSignature from the first candidate (Flow preview)."""
+    out: dict[str, Any] = {}
+    for cand in data.get("candidates") or []:
+        if not isinstance(cand, dict):
+            continue
+        if cand.get("finishReason"):
+            out["finish_reason"] = str(cand.get("finishReason") or "")
+        content = cand.get("content") or {}
+        if isinstance(content, dict):
+            for part in content.get("parts") or []:
+                if isinstance(part, dict) and part.get("thoughtSignature"):
+                    out["thought_signature"] = str(part.get("thoughtSignature") or "")
+                    break
+        if out:
+            break
+    return out
+
+
 def _normalize_text_parts(parts: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if isinstance(parts, str) and parts.strip():
@@ -789,33 +1153,45 @@ async def gen_text(
     prompt: str,
     system_instruction: str = "",
     model: str = DEFAULT_TEXT_MODEL,
-    thinking_level: str = "HIGH",
+    thinking_level: str = DEFAULT_TEXT_THINKING_LEVEL,
     contents: Optional[list[dict[str, Any]]] = None,
     system_parts: Optional[list[Any]] = None,
+    image_base64s: Optional[list[str]] = None,
+    schema: Optional[Any] = None,
+    response_mime_type: str = "",
+    force_json: bool = False,
     applet_id: str = DEFAULT_TEXT_APPLET_ID,
     applet_version_id: str = DEFAULT_TEXT_APPLET_VERSION_ID,
     extra_body: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Text generation via aisandbox-pa ``/v1/flow:generateContent``
-    (Gemini text models on Flow — Prop Writer, etc.).
+    (Gemini text / vision on Flow — screenplay or image analysis).
     """
     user_text = str(prompt or "").strip()
+    image_parts = _inline_image_parts(image_base64s)
     body_contents = contents if isinstance(contents, list) and contents else None
     if not body_contents:
-        if not user_text:
+        if not user_text and not image_parts:
             raise FlowApiError("missing_prompt", step="gen_text")
-        body_contents = [{"role": "user", "parts": [{"text": user_text}]}]
+        parts: list[dict[str, Any]] = list(image_parts)
+        if user_text:
+            parts.append({"text": user_text})
+        elif image_parts:
+            parts.append({"text": DEFAULT_TEXT_VISION_PROMPT})
+        body_contents = [{"role": "user", "parts": parts}]
 
     sys_parts = _normalize_text_parts(system_parts)
     if not sys_parts:
-        sys_text = str(system_instruction or "").strip()
+        sys_text = coerce_system_instruction(system_instruction)
+        if not sys_text and not image_parts:
+            sys_text = DEFAULT_TEXT_SYSTEM_INSTRUCTION
         if sys_text:
             sys_parts = [{"text": sys_text}]
 
-    level = str(thinking_level or "HIGH").strip().upper() or "HIGH"
+    level = str(thinking_level or DEFAULT_TEXT_THINKING_LEVEL).strip().upper() or DEFAULT_TEXT_THINKING_LEVEL
     if level not in TEXT_THINKING_LEVELS:
-        level = "HIGH"
+        level = DEFAULT_TEXT_THINKING_LEVEL
     model_name = str(model or DEFAULT_TEXT_MODEL).strip() or DEFAULT_TEXT_MODEL
 
     body: dict[str, Any] = {
@@ -841,6 +1217,17 @@ async def gen_text(
             if k in ("recaptchaContext",):
                 continue
             body[k] = v
+    json_schema = coerce_json_schema(schema)
+    mime = str(response_mime_type or "").strip()
+    if json_schema or force_json or mime.lower() in ("application/json", "json"):
+        gen_cfg = body.get("generationConfig")
+        gen_cfg = dict(gen_cfg) if isinstance(gen_cfg, dict) else {}
+        gen_cfg["responseMimeType"] = (
+            mime if mime and mime.lower() != "json" else "application/json"
+        )
+        if json_schema:
+            gen_cfg["responseSchema"] = _to_gemini_response_schema(json_schema)
+        body["generationConfig"] = gen_cfg
 
     url = _generate_content_url()
     last_err = "text_generation_failed"
@@ -849,7 +1236,7 @@ async def gen_text(
         resp = await client.api_request(
             url,
             body=body,
-            captcha_action="IMAGE_GENERATION",
+            captcha_action=TEXT_CAPTCHA_ACTION,
             timeout=300,
             raise_on_error=False,
         )
@@ -861,17 +1248,21 @@ async def gen_text(
                 # Some bridges put body at top-level
                 if resp.get("candidates"):
                     data = resp
-            text = _extract_generate_content_text(data if isinstance(data, dict) else {})
+            payload = data if isinstance(data, dict) else {}
+            text = _extract_generate_content_text(payload)
             parsed = _try_parse_json_object(text)
             usage = {}
-            if isinstance(data, dict) and isinstance(data.get("usageMetadata"), dict):
-                usage = data.get("usageMetadata") or {}
+            if isinstance(payload.get("usageMetadata"), dict):
+                usage = payload.get("usageMetadata") or {}
+            meta = _extract_generate_content_meta(payload)
             return {
                 "text": text,
                 "json": parsed,
-                "raw": data,
+                "raw": payload,
                 "usage": usage,
                 "model": model_name,
+                "thinking_level": level,
+                **meta,
             }
         last_err = error_from_response(resp)
         if is_recaptcha_error(last_err) and attempt < RECAPTCHA_RETRY_MAX - 1:

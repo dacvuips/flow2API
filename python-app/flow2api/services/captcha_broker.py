@@ -137,7 +137,7 @@ class Command:
 
     command_id: str
     method: str  # 'get_captcha' | 'soft_reset' | 'hard_reset'
-    action: str = ""  # với get_captcha: pageAction (IMAGE_GENERATION / VIDEO_GENERATION / ...)
+    action: str = ""  # với get_captcha: pageAction (IMAGE_GENERATION / VIDEO_GENERATION / TEXT_GENERATION / …)
     bridge_profile_id: str = ""  # profile ID của Bridge đã yêu cầu (chỉ để log)
     created_at: float = field(default_factory=time.time)
 

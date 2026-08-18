@@ -246,6 +246,10 @@ def slim_params_for_list(params: dict[str, Any]) -> dict[str, Any]:
         out["image_base64s_count"] = len(params["image_base64s"])
     elif params.get("imageBase64s"):
         out["image_base64s_count"] = len(params["imageBase64s"])
+    for key in ("system_instruction", "systemInstruction"):
+        val = out.get(key)
+        if isinstance(val, str) and len(val) > 160:
+            out[key] = val[:160] + "…"
     return out
 
 
