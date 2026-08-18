@@ -597,10 +597,12 @@ class WorkerController:
         if not ref_ids:
             image_base64s = params.get("image_base64s") or []
             if image_base64s:
+                refs = image_base64s[:max_images]
                 ref_ids = await flow_sdk.upload_images(
                     client,
                     project_id=project_id,
-                    image_base64s=image_base64s[:max_images],
+                    image_base64s=refs,
+                    max_concurrent=flow_sdk.UPLOAD_IMAGES_MAX_CONCURRENT,
                 )
         if ref_ids:
             params["reference_media_ids"] = ref_ids

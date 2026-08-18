@@ -130,6 +130,8 @@ OMNI_COMPONENT_WITH_VIDEO_END_FRAME = 240  # 8s @ 30fps
 OMNI_COMPONENT_MAX_IMAGES_WITH_VIDEO = 5
 OMNI_COMPONENT_MAX_IMAGES_ONLY = 7
 OMNI_COMPONENT_MAX_VIDEOS = 1
+# Parallel /v1/flow/uploadImage — giữ thứ tự mediaId theo input.
+UPLOAD_IMAGES_MAX_CONCURRENT = 10
 
 AUDIO_BATCH_PATH = "/v1/flow:batchGenerateAudio"
 DEFAULT_AUDIO_MODEL_KEY = "gemini_v4s_tts_flow"
@@ -462,24 +464,37 @@ async def upload_images(
     *,
     project_id: str,
     image_base64s: list[str],
+    max_concurrent: int = UPLOAD_IMAGES_MAX_CONCURRENT,
 ) -> list[str]:
-    """Upload user images via /v1/flow/uploadImage — returns media UUIDs for video APIs."""
-    ids: list[str] = []
-    for idx, b64 in enumerate(image_base64s):
-        if not b64:
-            continue
+    """Upload user images via /v1/flow/uploadImage — media UUIDs in input order.
+
+    Images are uploaded in parallel (capped by ``max_concurrent``). Results are
+    collected by original index so start/end/reference order is preserved even
+    if Google finishes later images first.
+    """
+    jobs: list[tuple[int, str]] = [
+        (idx, b64) for idx, b64 in enumerate(image_base64s or []) if b64
+    ]
+    if not jobs:
+        return []
+
+    limit = max(1, min(int(max_concurrent or 1), UPLOAD_IMAGES_MAX_CONCURRENT, len(jobs)))
+    sem = asyncio.Semaphore(limit)
+
+    async def _one(idx: int, b64: str) -> str:
         mime = "image/png" if str(b64).startswith("data:image/png") else "image/jpeg"
         ext = "png" if mime == "image/png" else "jpg"
-        ids.append(
-            await upload_image(
+        async with sem:
+            return await upload_image(
                 client,
                 project_id=project_id,
                 image_base64=b64,
                 mime_type=mime,
                 file_name=f"upload_{idx}.{ext}",
             )
-        )
-    return ids
+
+    # gather preserves coroutine order = original image_base64s order.
+    return list(await asyncio.gather(*(_one(idx, b64) for idx, b64 in jobs)))
 
 
 async def _upload_media_bytes(
@@ -758,12 +773,20 @@ async def gen_image(
     aspect = IMAGE_ASPECT.get(aspect_ratio, IMAGE_ASPECT["16:9"])
 
     uploaded_ids: list[str] = []
+    input_kinds: list[str] = []
     if image_base64s:
-        types = image_input_types or ["reference"] * len(image_base64s)
-        for b64, _kind in zip(image_base64s, types):
-            uploaded_ids.append(
-                await upload_image(client, project_id=project_id, image_base64=b64)
-            )
+        raw_types = image_input_types or ["reference"] * len(image_base64s)
+        to_upload: list[str] = []
+        for b64, kind in zip(image_base64s, raw_types):
+            if not b64:
+                continue
+            to_upload.append(b64)
+            input_kinds.append(kind)
+        uploaded_ids = await upload_images(
+            client,
+            project_id=project_id,
+            image_base64s=to_upload,
+        )
 
     last_err = "image_generation_failed"
     last_resp: dict = {}
@@ -780,7 +803,7 @@ async def gen_image(
                 "imageModelName": model_name,
             }
             if uploaded_ids:
-                types = image_input_types or ["reference"] * len(uploaded_ids)
+                kinds = input_kinds or ["reference"] * len(uploaded_ids)
                 item["imageInputs"] = [
                     {
                         "name": mid,
@@ -788,7 +811,7 @@ async def gen_image(
                         if kind == "reference"
                         else "IMAGE_INPUT_TYPE_BASE_IMAGE",
                     }
-                    for mid, kind in zip(uploaded_ids, types)
+                    for mid, kind in zip(uploaded_ids, kinds)
                 ]
             requests_try.append(item)
         body: dict[str, Any] = {"clientContext": ctx_try, "requests": requests_try}
