@@ -53,12 +53,12 @@ def _captcha_action_for_url(url: str) -> str | None:
     if "flow:generatecontent" in u or "flow%3ageneratecontent" in u:
         return "TEXT_GENERATION"
     if (
-        "batchgenerateimages" in u
-        or "upsampleimage" in u
-        or "batchgenerateaudio" in u
+        "batchgenerateaudio" in u
         or "flow:batchgenerateaudio" in u
         or "flow%3abatchgenerateaudio" in u
     ):
+        return "AUDIO_GENERATION"
+    if "batchgenerateimages" in u or "upsampleimage" in u:
         return "IMAGE_GENERATION"
     return None
 

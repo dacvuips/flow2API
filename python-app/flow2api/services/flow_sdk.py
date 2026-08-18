@@ -134,8 +134,8 @@ OMNI_COMPONENT_MAX_VIDEOS = 1
 AUDIO_BATCH_PATH = "/v1/flow:batchGenerateAudio"
 DEFAULT_AUDIO_MODEL_KEY = "gemini_v4s_tts_flow"
 AUDIO_GENERATION_TYPE_PREVIEW = "PREVIEW"
-# TTS trên PINHOLE — cùng reCAPTCHA pageAction với gen ảnh / text (không phải VIDEO).
-AUDIO_CAPTCHA_ACTION = "IMAGE_GENERATION"
+# reCAPTCHA pageAction for ``flow:batchGenerateAudio`` (distinct from IMAGE / VIDEO / TEXT).
+AUDIO_CAPTCHA_ACTION = "AUDIO_GENERATION"
 
 # Flow TTS voices — params.voice is lowercase; API voiceConfigs use display name.
 AUDIO_VOICE_DISPLAY: dict[str, str] = {
