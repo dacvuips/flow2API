@@ -1148,38 +1148,14 @@ class WorkerController:
                     )
                     return
                 if is_http_403_failure(exc, msg, api_trace):
-                    http_403_retry = int(retry_params.get("http_403_retry_count") or 0)
-                    if http_403_retry < RECAPTCHA_RETRY_MAX:
-                        delay_s = flow_sdk.recaptcha_retry_delay(http_403_retry)
-                        retry_params["http_403_retry_count"] = http_403_retry + 1
-                        retry_params["retry_not_before"] = time.time() + delay_s
-                        retry_params.pop("running_started_at", None)
-                        activity.update_request(
-                            rid, status="queued", params=retry_params, error=None
-                        )
-                        events.publish(
-                            "request_finished", {"id": rid, "status": "queued"}
-                        )
-                        append_request_log(
-                            rid,
-                            "worker",
-                            (
-                                f"HTTP 403 tạm thời — giữ profile, retry "
-                                f"{http_403_retry + 1}/{RECAPTCHA_RETRY_MAX} "
-                                f"sau {delay_s:.1f}s"
-                            ),
-                            level="warn",
-                            profile_id=str(retry_params.get("profile_id") or "") or None,
-                        )
-                        logger.warning(
-                            "HTTP 403 transient retry %s/%s rid=%s — chờ %.1fs, profile=%s",
-                            http_403_retry + 1,
-                            RECAPTCHA_RETRY_MAX,
-                            rid[:8],
-                            delay_s,
-                            str(retry_params.get("profile_id") or "-")[:12],
-                        )
-                        return
+                    retry_params.pop("http_403_retry_count", None)
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="HTTP 403",
+                    )
+                    return
                 if is_http_429_failure(exc, msg, api_trace):
                     http_429_retry = int(retry_params.get("http_429_retry_count") or 0)
                     if http_429_retry < RECAPTCHA_RETRY_MAX:

@@ -2169,7 +2169,7 @@ def is_http_403_failure(
     msg: str = "",
     api_trace: list[dict] | None = None,
 ) -> bool:
-    """HTTP 403 / PERMISSION_DENIED thoáng qua — retry cùng profile."""
+    """HTTP 403 / PERMISSION_DENIED thoáng qua — worker chuyển profile khác."""
     if is_profile_account_switch_failure(exc, msg, api_trace):
         return False
     if is_recaptcha_error(str(msg or "")):
