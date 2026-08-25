@@ -674,10 +674,10 @@ function setClass(id,v){const el=byId(id);if(el)el.className=v}
 function setHtml(id,v){const el=document.getElementById(id);if(el)el.innerHTML=v}
 function setText(id,v){const el=document.getElementById(id);if(el)el.textContent=v}
 async function forceHealthPill(){if(!DASHBOARD_UNLOCKED)return;const p=document.getElementById('pill');if(!p)return;try{const r=await fetch('/api/health?ts='+Date.now(),{headers:authHeaders(),cache:'no-store'});const j=await r.json();const ok=!!(j&&j.ok&&(j.extension?.connected||j.extension_connected||j.ws_stats?.connected));p.className=ok?'pill pill-ok':'pill pill-err';p.innerHTML='<i></i> '+(ok?'Extension OK':'Extension Offline')}catch(e){p.className='pill pill-err';p.innerHTML='<i></i> Health error';console.error('forceHealthPill failed',e)}}
-function connectDashboardEvents(){if(!DASHBOARD_UNLOCKED||!window.EventSource||window.__flow2apiEvents)return;if(window.__flow2apiEvents){try{window.__flow2apiEvents.close()}catch(_e){}window.__flow2apiEvents=null}try{const tokenQ=API_TOKEN?`?access_token=${encodeURIComponent(API_TOKEN)}`:'';const es=new EventSource('/api/events'+tokenQ);const refresh=()=>{if(!DASHBOARD_UNLOCKED)return;forceHealthPill();loadHealth();loadTasks()};['extension_connected','extension_disconnected','extension_ready','extension_heartbeat','paygate_tier_resolved','queue_changed','profile_connected','profile_disconnected','profile_dispatch_changed','profile_credit_changed','profile_proxy_changed','profile_media_changed','request_started','request_finished'].forEach(ev=>es.addEventListener(ev,refresh));es.onerror=()=>console.warn('dashboard events disconnected');window.__flow2apiEvents=es}catch(e){console.warn('dashboard events unavailable',e)}}
+function connectDashboardEvents(){if(!DASHBOARD_UNLOCKED||!window.EventSource||window.__flow2apiEvents)return;if(window.__flow2apiEvents){try{window.__flow2apiEvents.close()}catch(_e){}window.__flow2apiEvents=null}try{const tokenQ=API_TOKEN?`?access_token=${encodeURIComponent(API_TOKEN)}`:'';const es=new EventSource('/api/events'+tokenQ);const refreshHealth=()=>{if(!DASHBOARD_UNLOCKED)return;forceHealthPill();loadHealth()};const refreshTasksSoft=()=>{if(!DASHBOARD_UNLOCKED)return;refreshActiveTasks()};['extension_connected','extension_disconnected','extension_ready','extension_heartbeat','paygate_tier_resolved','profile_connected','profile_disconnected','profile_dispatch_changed','profile_credit_changed','profile_proxy_changed','profile_media_changed'].forEach(ev=>es.addEventListener(ev,refreshHealth));['queue_changed','request_started','request_finished'].forEach(ev=>es.addEventListener(ev,()=>{refreshHealth();refreshTasksSoft()}));es.onerror=()=>console.warn('dashboard events disconnected');window.__flow2apiEvents=es}catch(e){console.warn('dashboard events unavailable',e)}}
 setInterval(()=>{if(!DASHBOARD_UNLOCKED)return;if(!byId('p-tasks')?.classList.contains('on'))return;loadHealth()},15000);
 const started=Date.now();function tickUptime(){const s=Math.floor((Date.now()-started)/1000),h=String(Math.floor(s/3600)).padStart(2,'0'),m=String(Math.floor(s%3600/60)).padStart(2,'0'),ss=String(s%60).padStart(2,'0');setText('uptime',`${h}h ${m}m ${ss}s`)}setInterval(tickUptime,1000);tickUptime();
-let TASK_CACHE=[];let TASK_PAGE=1;const TASK_PAGE_SIZE=20;let TASK_STATUS_FILTER=localStorage.getItem('flow2api_task_filter')||'all';let __tasksLoadSeq=0;
+let TASK_CACHE=[];let TASK_PAGE=1;const TASK_PAGE_SIZE=20;let TASK_STATUS_FILTER=localStorage.getItem('flow2api_task_filter')||'all';let __tasksLoadSeq=0;let __tasksSoftSeq=0;
 function readTasksQueryFromUrl(){
   try{
     const q=new URLSearchParams(location.search);
@@ -885,6 +885,85 @@ function taskPreviewItems(j){const fromApi=taskPreviewItemsFromApi(j?.preview_it
 function taskListMediaPreviewHtml(items,defaultKind,extraClass,maxShow){maxShow=maxShow==null?3:Math.max(1,maxShow);if(!items.length)return '<span class="task-preview-empty">—</span>';const show=items.slice(0,maxShow);const extra=items.length-show.length;const previewPayload=esc(JSON.stringify(items.map(it=>({url:it.src,kind:it.kind||defaultKind||'image',fb:''}))));const thumbClass='task-preview-thumb'+(extraClass?' '+extraClass:'');return `<div class="task-preview-row" onclick="event.stopPropagation()">${show.map((it,i)=>{const u=esc(it.src);const isVid=it.kind==='video'||/video/i.test(it.kind||'')||/\.mp4(\?|$)|video/i.test(it.src);const isAud=it.kind==='audio'||/audio/i.test(it.kind||'')||/flow-content\.google\/audio|\.mp3(\?|$)|\.wav(\?|$)|\.m4a(\?|$)/i.test(it.src);const moreBadge=i===show.length-1&&extra?`<span class="task-preview-more">+${extra}</span>`:'';return `<span class="${thumbClass}">${isAud?`<audio src="${u}" controls preload="metadata" onclick="openPreview('${u}','audio',JSON.parse('${previewPayload}'),${i})"></audio>`:(isVid?`<video src="${u}" muted preload="metadata" onclick="openPreview('${u}','video',JSON.parse('${previewPayload}'),${i})"></video>`:`<img src="${u}" loading="lazy" onclick="openPreview(this.currentSrc||this.src,'image',JSON.parse('${previewPayload}'),${i})" onerror="this.closest('.task-preview-thumb')?.classList.add('broken')">`)}${moreBadge}</span>`}).join('')}</div>`}
 function taskListInputPreviewHtml(j){return taskListMediaPreviewHtml(taskInputPreviewItems(j),'image','input')}
 function taskListPreviewHtml(j){if(taskOutputKind(j)==='text'){const t=String(j?.result?.text||'').trim();if(!t)return'<span style="color:var(--t4)">—</span>';return`<span class="prompt" title="${esc(t)}">${esc(short(t,48))}</span>`}return taskListMediaPreviewHtml(taskPreviewItems(j).slice(0,1),taskOutputKind(j),'',1)}
+function taskRowHtml(j){
+  const prompt=j.prompt||j.params?.prompt||'-';
+  const stopBtn=taskCanStop(j)?`<button class="btn btn-stop" type="button" onclick="stopTask('${esc(j.id)}',event)">Dừng</button>`:'';
+  const retryBtn=`<button class="btn btn-retry" type="button" onclick="recreateTask('${esc(j.id)}',event)">Tạo lại</button>`;
+  const isDoneVideo=String(j.status||'').toLowerCase()==='done'&&taskOutputKind(j)==='video';
+  const upscale1080Btn=isDoneVideo?`<button class="btn btn-retry" type="button" onclick="downloadUpscaleVideoByRequest('${esc(j.id)}',event)">Tải 1080p</button>`:'';
+  const rid=esc(j.id);
+  return `<tr data-task-id="${rid}" onclick="openLogDetailById('${rid}')" style="cursor:pointer"><td>${taskIdProfileCell(j)}</td><td>${taskTypeModelCell(j)}</td><td>${statusHtml(taskListStatusLabel(j.status))}</td><td>${taskPromptWithErrHtml(prompt,j.status,j.error,72)}</td><td class="td-preview">${taskListInputPreviewHtml(j)}</td><td class="td-preview">${taskListPreviewHtml(j)}</td><td onclick="event.stopPropagation()"><div class="task-actions">${upscale1080Btn}${retryBtn}${stopBtn}</div></td></tr>`;
+}
+function taskActiveSig(j){
+  return [
+    String(j?.status||''),
+    String(j?.error||''),
+    String(j?.params?.profile_id||j?.profile_id||''),
+    String(j?.profile_label||j?.profile_email||''),
+    String(j?.params?.profile_assigned_by_user?'1':'0')
+  ].join('|');
+}
+async function refreshActiveTasks(){
+  if(!DASHBOARD_UNLOCKED)return;
+  const softSeq=++__tasksSoftSeq;
+  const loadSeqAtStart=__tasksLoadSeq;
+  try{
+    await ensureToken();
+    if(softSeq!==__tasksSoftSeq||loadSeqAtStart!==__tasksLoadSeq)return;
+    const r=await fetch('/api/activity?page=1&page_size=100&status=active&summary=true',{headers:authHeaders(),cache:'no-store'});
+    if(softSeq!==__tasksSoftSeq||loadSeqAtStart!==__tasksLoadSeq)return;
+    if(!r.ok)return;
+    const data=await r.json();
+    if(softSeq!==__tasksSoftSeq||loadSeqAtStart!==__tasksLoadSeq)return;
+    const stats=data.summary||{};
+    applyFlowKpi({
+      total:Number(stats.total)||0,
+      done:Number(stats.done)||0,
+      running:Number(stats.running)||0,
+      failed:Number(stats.failed)||0
+    });
+    const activeItems=data.items||[];
+    const activeMap=new Map(activeItems.map(j=>[String(j.id||''),j]));
+    const cache=Array.isArray(TASK_CACHE)?TASK_CACHE:[];
+    const prevActiveIds=cache.filter(taskCanStop).map(j=>String(j.id||'')).filter(Boolean);
+    let needFull=false;
+    for(const id of prevActiveIds){
+      if(!activeMap.has(id)){needFull=true;break}
+    }
+    const filter=TASK_STATUS_FILTER||'all';
+    const showNew=filter==='all'||filter==='active'||filter==='queued'||filter==='running';
+    if(!needFull&&showNew&&TASK_PAGE===1){
+      const cacheIds=new Set(cache.map(j=>String(j.id||'')));
+      for(const id of activeMap.keys()){
+        if(id&&!cacheIds.has(id)){needFull=true;break}
+      }
+    }
+    if(!needFull&&(filter==='active'||filter==='queued'||filter==='running')){
+      const filteredActive=[...activeMap.values()].filter(j=>{
+        const st=String(j.status||'').toLowerCase();
+        if(filter==='queued')return st==='queued';
+        if(filter==='running')return st==='running';
+        return st==='queued'||st==='running';
+      });
+      const pageIds=new Set(cache.map(j=>String(j.id||'')));
+      const pageSlice=filteredActive.slice((TASK_PAGE-1)*TASK_PAGE_SIZE,TASK_PAGE*TASK_PAGE_SIZE).map(j=>String(j.id||''));
+      if(pageSlice.length!==pageIds.size||pageSlice.some(id=>!pageIds.has(id)))needFull=true;
+    }
+    if(needFull){loadTasks();return}
+    const body=byId('tasks-body');
+    if(!body||!cache.length)return;
+    TASK_CACHE=cache.map(j=>{
+      const id=String(j.id||'');
+      const next=activeMap.get(id);
+      if(!next)return j;
+      const merged={...j,...next,params:{...(j.params||{}),...(next.params||{})},result:next.result!=null?next.result:j.result};
+      if(taskActiveSig(j)===taskActiveSig(merged))return merged;
+      const tr=body.querySelector(`tr[data-task-id="${CSS.escape(id)}"]`);
+      if(tr)tr.outerHTML=taskRowHtml(merged);
+      return merged;
+    });
+  }catch(_e){}
+}
 async function loadTasks(page){
   const body=byId('tasks-body');
   if(!body)return;
@@ -921,7 +1000,7 @@ async function loadTasks(page){
     syncTasksQueryToUrl(true);
     renderTaskPagination(pag);
     if(!jobs.length){const emptyMsg=requestedStatus&&requestedStatus!=='all'?`Không có task (${taskStatusFilterLabel(requestedStatus)})`:'No tasks yet';body.innerHTML=`<tr><td colspan="7" class="empty">${esc(emptyMsg)}</td></tr>`;return}
-    body.innerHTML=jobs.map(j=>{const prompt=j.prompt||j.params?.prompt||'-';const stopBtn=taskCanStop(j)?`<button class="btn btn-stop" type="button" onclick="stopTask('${esc(j.id)}',event)">Dừng</button>`:'';const retryBtn=`<button class="btn btn-retry" type="button" onclick="recreateTask('${esc(j.id)}',event)">Tạo lại</button>`;const isDoneVideo=String(j.status||'').toLowerCase()==='done'&&taskOutputKind(j)==='video';const upscale1080Btn=isDoneVideo?`<button class="btn btn-retry" type="button" onclick="downloadUpscaleVideoByRequest('${esc(j.id)}',event)">Tải 1080p</button>`:'';const rid=esc(j.id);return `<tr onclick="openLogDetailById('${rid}')" style="cursor:pointer"><td>${taskIdProfileCell(j)}</td><td>${taskTypeModelCell(j)}</td><td>${statusHtml(taskListStatusLabel(j.status))}</td><td>${taskPromptWithErrHtml(prompt,j.status,j.error,72)}</td><td class="td-preview">${taskListInputPreviewHtml(j)}</td><td class="td-preview">${taskListPreviewHtml(j)}</td><td onclick="event.stopPropagation()"><div class="task-actions">${upscale1080Btn}${retryBtn}${stopBtn}</div></td></tr>`}).join('');
+    body.innerHTML=jobs.map(taskRowHtml).join('');
     const usage=jobs[0]?.result?.project_id||jobs[0]?.input?.project_id;setText('project-usage',usage?short(usage,26):'cache file');
   }catch(e){
     if(seq!==__tasksLoadSeq)return;
@@ -1902,7 +1981,7 @@ async function saveProxyRotateSettings(opts){const body={};if(opts&&opts.enabled
 async function sysControl(action){const map={refresh:'/api/settings/system/force-refresh',launch:'/api/settings/system/launch-profiles',close:'/api/settings/system/close-chrome'};const url=map[action];if(!url)return;if(action==='close'&&!confirm('Đóng toàn bộ Chrome trên máy?'))return;try{await ensureToken();const r=await fetch(url,{method:'POST',headers:authHeaders()});const j=await r.json();showToast(j.message||'OK',j.ok!==false?'success':'info')}catch(e){showToast('Lỗi: '+(e.message||e),'error')}}
 function initSettingsPanel(){loadSettingsPanel();const au=byId('setAutostart');if(au)au.onchange=()=>toggleSettingsAutostart(au.checked);const px=byId('setProxyEnabled');if(px)px.onchange=()=>toggleSettingsProxyEnabled(px.checked);const rot=byId('setProxyRotateEnabled');if(rot)rot.onchange=()=>saveProxyRotateSettings({enabled:rot.checked});const rotMin=byId('setProxyRotateMin');if(rotMin)rotMin.onchange=()=>saveProxyRotateSettings({intervalOnly:true});const poolTa=byId('setProxyPool');if(poolTa)poolTa.oninput=()=>updateProxySettingsUi()}
 function fitGenerateHeight(){const pane=byId("p-generate");if(!pane||!pane.classList.contains("on"))return;const top=pane.getBoundingClientRect().top;const vh=window.visualViewport?.height||window.innerHeight;const paneH=Math.max(420,Math.floor(vh-top-17));document.documentElement.style.setProperty("--gen-pane-h",paneH+"px");const chatOn=byId("generateChatPanel")&&byId("generateChatPanel").style.display!=="none";const flowShell=pane.querySelector(".gen-shell");const chatShell=byId("generateChatPanel")?.querySelector(".cgpt-shell");if(chatOn&&chatShell){chatShell.style.height="100%"}else if(flowShell){const shellTop=flowShell.getBoundingClientRect().top||top;const shellH=Math.max(380,Math.floor(vh-shellTop-17));flowShell.style.setProperty("--gen-h",shellH+"px")}}window.addEventListener("resize",fitGenerateHeight);window.visualViewport?.addEventListener("resize",fitGenerateHeight);window.addEventListener("scroll",()=>{if(byId("genOptions")?.classList.contains("on"))positionGenOptions()},{passive:true});window.addEventListener("resize",()=>{if(byId("genOptions")?.classList.contains("on"))positionGenOptions()});
-function updateGenerateLock(){const on=byId("p-generate")?.classList.contains("on");document.body.classList.toggle("generate-active",!!on);document.documentElement.classList.toggle("generate-active",!!on);try{window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0}catch(_e){}if(on)fitGenerateHeight()}async function refreshAll(){if(!DASHBOARD_UNLOCKED)return;updateGenerateLock();renderTaskStatusFilters();renderDocs();await Promise.all([loadHealth(),loadTasks(),loadKeyInfo(),loadWorkerSettings()])}function bootDashboard(){if(window.__FLOW2_BOOTED)return;window.__FLOW2_BOOTED=true;bindTokenEntry();window.addEventListener('popstate',()=>{readTasksQueryFromUrl();renderTaskStatusFilters();if(DASHBOARD_UNLOCKED)loadTasks()});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(DASHBOARD_UNLOCKED)closeTokenModal();closePreview();closeLogModal();closeProfileSettingsModal()}if(e.key==='Enter'&&byId('tokenModal')?.classList.contains('on'))saveTokenFromModal();if(byId('previewModal')?.classList.contains('on')){if(e.key==='ArrowLeft'){e.preventDefault();movePreview(-1)}if(e.key==='ArrowRight'){e.preventDefault();movePreview(1)}}});document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('p-'+b.dataset.p).classList.add('on');updateGenerateLock();refreshKpiDisplay();if(b.dataset.p==='generate'){requestAnimationFrame(fitGenerateHeight);setTimeout(fitGenerateHeight,80)}if(b.dataset.p==='settings')loadSettingsPanel();if(b.dataset.p==='chatgpt'){const ws=(localStorage.getItem('flow2api_cgpt_workspace')||'profiles');switchCgptWorkspace(ws);refreshCgptPanel()}if(b.dataset.p==='tasks'){const ws=(localStorage.getItem('flow2api_tasks_workspace')||'tasks');switchTasksWorkspace(ws)}});initGenerate();loadGeneratePrefs();renderDocs();initSettingsPanel();initCgptPanel();updateGenerateLock();verifyDashboardAccess().then(ok=>{if(!ok)return;refreshAll();connectDashboardEvents();setTimeout(()=>refreshAll(),600);setTimeout(fitGenerateHeight,120);if(!window.__flow2apiHealthTimer)window.__flow2apiHealthTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED)loadHealth()},4000);if(!window.__flow2apiTasksTimer)window.__flow2apiTasksTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED)loadTasks()},10000);if(!window.__flow2apiCgptTimer)window.__flow2apiCgptTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED&&byId('cgptTasksPanel')?.style.display!=='none')loadCgptJobs()},10000);if(!window.__flow2apiPillTimer)window.__flow2apiPillTimer=setInterval(forceHealthPill,4000)})}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',bootDashboard,{once:true})}else{bootDashboard()}window.addEventListener('load',()=>{if(DASHBOARD_UNLOCKED)setTimeout(refreshAll,250)},{once:true});window.addEventListener('resize',()=>fitGenGalleryThumbs(byId('genGallery')));
+function updateGenerateLock(){const on=byId("p-generate")?.classList.contains("on");document.body.classList.toggle("generate-active",!!on);document.documentElement.classList.toggle("generate-active",!!on);try{window.scrollTo(0,0);document.documentElement.scrollTop=0;document.body.scrollTop=0}catch(_e){}if(on)fitGenerateHeight()}async function refreshAll(){if(!DASHBOARD_UNLOCKED)return;updateGenerateLock();renderTaskStatusFilters();renderDocs();await Promise.all([loadHealth(),loadTasks(),loadKeyInfo(),loadWorkerSettings()])}function bootDashboard(){if(window.__FLOW2_BOOTED)return;window.__FLOW2_BOOTED=true;bindTokenEntry();window.addEventListener('popstate',()=>{readTasksQueryFromUrl();renderTaskStatusFilters();if(DASHBOARD_UNLOCKED)loadTasks()});document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(DASHBOARD_UNLOCKED)closeTokenModal();closePreview();closeLogModal();closeProfileSettingsModal()}if(e.key==='Enter'&&byId('tokenModal')?.classList.contains('on'))saveTokenFromModal();if(byId('previewModal')?.classList.contains('on')){if(e.key==='ArrowLeft'){e.preventDefault();movePreview(-1)}if(e.key==='ArrowRight'){e.preventDefault();movePreview(1)}}});document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('p-'+b.dataset.p).classList.add('on');updateGenerateLock();refreshKpiDisplay();if(b.dataset.p==='generate'){requestAnimationFrame(fitGenerateHeight);setTimeout(fitGenerateHeight,80)}if(b.dataset.p==='settings')loadSettingsPanel();if(b.dataset.p==='chatgpt'){const ws=(localStorage.getItem('flow2api_cgpt_workspace')||'profiles');switchCgptWorkspace(ws);refreshCgptPanel()}if(b.dataset.p==='tasks'){const ws=(localStorage.getItem('flow2api_tasks_workspace')||'tasks');switchTasksWorkspace(ws)}});initGenerate();loadGeneratePrefs();renderDocs();initSettingsPanel();initCgptPanel();updateGenerateLock();verifyDashboardAccess().then(ok=>{if(!ok)return;refreshAll();connectDashboardEvents();setTimeout(()=>refreshAll(),600);setTimeout(fitGenerateHeight,120);if(!window.__flow2apiHealthTimer)window.__flow2apiHealthTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED)loadHealth()},4000);if(!window.__flow2apiTasksTimer)window.__flow2apiTasksTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED)refreshActiveTasks()},10000);if(!window.__flow2apiCgptTimer)window.__flow2apiCgptTimer=setInterval(()=>{if(DASHBOARD_UNLOCKED&&byId('cgptTasksPanel')?.style.display!=='none')loadCgptJobs()},10000);if(!window.__flow2apiPillTimer)window.__flow2apiPillTimer=setInterval(forceHealthPill,4000)})}if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',bootDashboard,{once:true})}else{bootDashboard()}window.addEventListener('load',()=>{if(DASHBOARD_UNLOCKED)setTimeout(refreshAll,250)},{once:true});window.addEventListener('resize',()=>fitGenGalleryThumbs(byId('genGallery')));
 </script></body></html>
 
 
