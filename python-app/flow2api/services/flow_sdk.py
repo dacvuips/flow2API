@@ -220,8 +220,25 @@ DEFAULT_TEXT_THINKING_LEVEL = "LOW"
 TEXT_CAPTCHA_ACTION = "TEXT_GENERATION"
 TEXT_THINKING_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH", "MINIMAL"})
 TEXT_MAX_IMAGES = 10
+TEXT_MAX_AUDIO = 4
 TEXT_JSON_MIME = "application/json"
 DEFAULT_TEXT_VISION_PROMPT = "Phân tích bức ảnh này: mô tả nội dung, bố cục và chi tiết nổi bật."
+DEFAULT_TEXT_AUDIO_PROMPT = (
+    "Phân tích file audio này: nội dung lời nói (nếu có), giọng điệu, ngôn ngữ và các chi tiết nổi bật."
+)
+DEFAULT_TEXT_MEDIA_PROMPT = "Phân tích các ảnh và audio đính kèm."
+_AUDIO_MIME_ALIASES = {
+    "audio/mpeg": "audio/mp3",
+    "audio/x-mp3": "audio/mp3",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/vnd.wave": "audio/wav",
+    "audio/x-aiff": "audio/aiff",
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+    "audio/x-flac": "audio/flac",
+    "audio/opus": "audio/ogg",
+}
 # Flow UI default systemInstruction for ``flow:generateContent`` (screenplay convention).
 DEFAULT_TEXT_SYSTEM_INSTRUCTION = """## PERSONA:
 You are an expert in screenplay writing, a specific Markdown convention for writing screenplays. For all screenplay-related tasks, you MUST adhere strictly to the following formatting rules without deviation.
@@ -1013,6 +1030,37 @@ def _inline_image_parts(image_base64s: Any) -> list[dict[str, Any]]:
     return parts
 
 
+def _normalize_audio_mime(mime: str) -> str:
+    m = str(mime or "").strip().lower().split(";", 1)[0].strip()
+    return _AUDIO_MIME_ALIASES.get(m, m)
+
+
+def _guess_audio_mime(raw: str) -> str:
+    mime = _normalize_audio_mime(_guess_upload_mime(raw, default=""))
+    if mime.startswith("audio/"):
+        return mime
+    return "audio/mp3"
+
+
+def _inline_audio_parts(audio_base64s: Any) -> list[dict[str, Any]]:
+    """Gemini ``inlineData`` parts for flow:generateContent (audio analysis)."""
+    if not isinstance(audio_base64s, list):
+        return []
+    parts: list[dict[str, Any]] = []
+    for raw in audio_base64s[:TEXT_MAX_AUDIO]:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        data = _strip_data_url(s).strip()
+        if not data:
+            continue
+        mime = _guess_audio_mime(s)
+        if not str(mime).startswith("audio/"):
+            continue
+        parts.append({"inlineData": {"mimeType": mime, "data": data}})
+    return parts
+
+
 def coerce_json_schema(raw: Any) -> dict[str, Any] | None:
     """Accept dict or JSON string for structured output."""
     if raw is None or raw is False:
@@ -1180,6 +1228,7 @@ async def gen_text(
     contents: Optional[list[dict[str, Any]]] = None,
     system_parts: Optional[list[Any]] = None,
     image_base64s: Optional[list[str]] = None,
+    audio_base64s: Optional[list[str]] = None,
     schema: Optional[Any] = None,
     response_mime_type: str = "",
     force_json: bool = False,
@@ -1189,17 +1238,23 @@ async def gen_text(
 ) -> dict[str, Any]:
     """
     Text generation via aisandbox-pa ``/v1/flow:generateContent``
-    (Gemini text / vision on Flow — screenplay or image analysis).
+    (Gemini text / vision / audio on Flow — screenplay, image or audio analysis).
     """
     user_text = str(prompt or "").strip()
     image_parts = _inline_image_parts(image_base64s)
+    audio_parts = _inline_audio_parts(audio_base64s)
+    media_parts = list(image_parts) + list(audio_parts)
     body_contents = contents if isinstance(contents, list) and contents else None
     if not body_contents:
-        if not user_text and not image_parts:
+        if not user_text and not media_parts:
             raise FlowApiError("missing_prompt", step="gen_text")
-        parts: list[dict[str, Any]] = list(image_parts)
+        parts: list[dict[str, Any]] = list(media_parts)
         if user_text:
             parts.append({"text": user_text})
+        elif image_parts and audio_parts:
+            parts.append({"text": DEFAULT_TEXT_MEDIA_PROMPT})
+        elif audio_parts:
+            parts.append({"text": DEFAULT_TEXT_AUDIO_PROMPT})
         elif image_parts:
             parts.append({"text": DEFAULT_TEXT_VISION_PROMPT})
         body_contents = [{"role": "user", "parts": parts}]
@@ -1207,7 +1262,7 @@ async def gen_text(
     sys_parts = _normalize_text_parts(system_parts)
     if not sys_parts:
         sys_text = coerce_system_instruction(system_instruction)
-        if not sys_text and not image_parts:
+        if not sys_text and not media_parts:
             sys_text = DEFAULT_TEXT_SYSTEM_INSTRUCTION
         if sys_text:
             sys_parts = [{"text": sys_text}]

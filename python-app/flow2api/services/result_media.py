@@ -428,6 +428,139 @@ def persist_input_previews(
     return urls
 
 
+_AUDIO_EXT_BY_MIME = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
+    "audio/mp4": "m4a",
+    "audio/m4a": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/aiff": "aiff",
+    "audio/x-aiff": "aiff",
+    "audio/webm": "webm",
+}
+
+_AUDIO_MIME_BY_EXT = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".flac": "audio/flac",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".webm": "audio/webm",
+}
+
+
+def _audio_mime_from_header(header: str) -> str:
+    lower = str(header or "").lower()
+    if "wav" in lower:
+        return "audio/wav"
+    if "ogg" in lower or "oga" in lower or "opus" in lower:
+        return "audio/ogg"
+    if "flac" in lower:
+        return "audio/flac"
+    if "m4a" in lower or "mp4" in lower:
+        return "audio/mp4"
+    if "aac" in lower:
+        return "audio/aac"
+    if "aiff" in lower or "aif" in lower:
+        return "audio/aiff"
+    if "webm" in lower:
+        return "audio/webm"
+    return "audio/mpeg"
+
+
+def _audio_mime_from_bytes(raw: bytes) -> str:
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        return "audio/wav"
+    if raw[:4] == b"OggS":
+        return "audio/ogg"
+    if raw[:4] == b"fLaC":
+        return "audio/flac"
+    if raw[:4] == b"FORM" and raw[8:12] in (b"AIFF", b"AIFC"):
+        return "audio/aiff"
+    if len(raw) >= 12 and raw[4:8] == b"ftyp":
+        return "audio/mp4"
+    if raw[:3] == b"ID3" or (len(raw) >= 2 and raw[0] == 0xFF and raw[1] in (0xFB, 0xF3, 0xF2, 0xFA)):
+        return "audio/mpeg"
+    return "audio/mpeg"
+
+
+def _decode_audio_bytes(b64: str) -> tuple[bytes, str] | None:
+    s = str(b64 or "").strip()
+    if not s:
+        return None
+    if s.startswith("data:"):
+        header, _, payload = s.partition(",")
+        mime = _audio_mime_from_header(header)
+        try:
+            return base64.b64decode(payload), mime
+        except Exception:
+            return None
+    if _is_probably_pure_base64(s):
+        try:
+            raw = base64.b64decode(s)
+            return raw, _audio_mime_from_bytes(raw)
+        except Exception:
+            return None
+    return None
+
+
+def persist_audio_previews(
+    request_id: str,
+    audio_base64s: list[str],
+    *,
+    max_items: int = 4,
+) -> list[str]:
+    """Save input audio locally for lightweight list previews."""
+    from flow2api.config import INPUTS_DIR
+
+    if not audio_base64s:
+        return []
+    out_dir = INPUTS_DIR / request_id
+    urls: list[str] = []
+    for idx, b64 in enumerate(audio_base64s[:max_items]):
+        decoded = _decode_audio_bytes(b64)
+        if not decoded:
+            continue
+        raw, mime = decoded
+        ext = _AUDIO_EXT_BY_MIME.get(str(mime).lower(), "mp3")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"audio-{idx}.{ext}"
+        (out_dir / filename).write_bytes(raw)
+        urls.append(f"/inputs/{request_id}/{filename}")
+    return urls
+
+
+def load_input_audio_base64s_from_storage(request_id: str, *, max_items: int = 4) -> list[str]:
+    """Restore input audio from local preview files for manual retry."""
+    from flow2api.config import INPUTS_DIR
+
+    folder = INPUTS_DIR / request_id
+    if not folder.is_dir():
+        return []
+    allowed = set(_AUDIO_MIME_BY_EXT)
+    files = sorted(
+        (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in allowed and p.name.startswith("audio-")),
+        key=lambda p: p.name,
+    )
+    out: list[str] = []
+    for path in files[:max_items]:
+        raw = path.read_bytes()
+        mime = _AUDIO_MIME_BY_EXT.get(path.suffix.lower(), "audio/mpeg")
+        b64 = base64.b64encode(raw).decode("ascii")
+        out.append(f"data:{mime};base64,{b64}")
+    return out
+
+
 def load_input_base64s_from_storage(request_id: str, *, max_items: int = 10) -> list[str]:
     """Restore input images from local preview files for manual retry."""
     from flow2api.config import INPUTS_DIR
@@ -463,6 +596,10 @@ def _restore_input_images(params: dict[str, Any], request_id: str) -> dict[str, 
         restored = load_input_base64s_from_storage(request_id)
         if restored:
             out["image_base64s"] = restored
+    if not (out.get("audio_base64s") or out.get("audioBase64s")):
+        restored_audio = load_input_audio_base64s_from_storage(request_id)
+        if restored_audio:
+            out["audio_base64s"] = restored_audio
     return out
 
 
@@ -522,7 +659,14 @@ def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:
         if u.startswith("data:") or _is_probably_pure_base64(u):
             return
         seen.add(u)
-        item: dict[str, str] = {"url": u, "kind": "image"}
+        lu = u.lower()
+        kind = "image"
+        if any(
+            lu.endswith(ext) or f"{ext}?" in lu
+            for ext in (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".flac", ".aiff", ".aif", ".webm")
+        ) or "/audio-" in lu:
+            kind = "audio"
+        item: dict[str, str] = {"url": u, "kind": kind}
         mid = str(media_id or "").strip() or (_extract_media_id(u) or "")
         if mid:
             item["media_id"] = mid
@@ -536,7 +680,7 @@ def input_preview_items_from_params(params: dict) -> list[dict[str, str]]:
     for u in preview_urls:
         add(u)
 
-    return items[:3]
+    return items[:7]
 
 
 async def with_base64_media(

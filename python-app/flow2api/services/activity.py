@@ -222,6 +222,10 @@ _LIST_HEAVY_PARAM_KEYS = frozenset(
         "imageBase64",
         "image_base64s",
         "imageBase64s",
+        "audio_base64",
+        "audioBase64",
+        "audio_base64s",
+        "audioBase64s",
         "video_base64",
         "videoBase64",
         "encoded_video",
@@ -246,6 +250,10 @@ def slim_params_for_list(params: dict[str, Any]) -> dict[str, Any]:
         out["image_base64s_count"] = len(params["image_base64s"])
     elif params.get("imageBase64s"):
         out["image_base64s_count"] = len(params["imageBase64s"])
+    if params.get("audio_base64s"):
+        out["audio_base64s_count"] = len(params["audio_base64s"])
+    elif params.get("audioBase64s"):
+        out["audio_base64s_count"] = len(params["audioBase64s"])
     for key in ("system_instruction", "systemInstruction"):
         val = out.get(key)
         if isinstance(val, str) and len(val) > 160:

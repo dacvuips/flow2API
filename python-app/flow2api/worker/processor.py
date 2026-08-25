@@ -1384,6 +1384,7 @@ class WorkerController:
             if thinking_level not in flow_sdk.TEXT_THINKING_LEVELS:
                 thinking_level = flow_sdk.DEFAULT_TEXT_THINKING_LEVEL
             n_img = len(params.get("image_base64s") or params.get("imageBase64s") or [])
+            n_aud = len(params.get("audio_base64s") or params.get("audioBase64s") or [])
             schema = (
                 params.get("schema")
                 or params.get("response_schema")
@@ -1408,6 +1409,7 @@ class WorkerController:
                 "worker",
                 f"gen_text model={model_name} thinking={thinking_level}"
                 + (f" images={n_img}" if n_img else "")
+                + (f" audio={n_aud}" if n_aud else "")
                 + (" json_schema" if schema else (" json" if force_json else ""))
                 + f" prompt={prompt[:80]}…",
                 level="info",
@@ -1421,6 +1423,7 @@ class WorkerController:
                 contents=params.get("contents") if isinstance(params.get("contents"), list) else None,
                 system_parts=params.get("system_parts") or params.get("systemParts"),
                 image_base64s=params.get("image_base64s") or params.get("imageBase64s"),
+                audio_base64s=params.get("audio_base64s") or params.get("audioBase64s"),
                 schema=schema,
                 response_mime_type=mime,
                 force_json=force_json,

@@ -183,6 +183,16 @@ async def serve_input_image(request_id: str, filename: str):
         ".jpeg": "image/jpeg",
         ".png": "image/png",
         ".webp": "image/webp",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".oga": "audio/ogg",
+        ".flac": "audio/flac",
+        ".aiff": "audio/aiff",
+        ".aif": "audio/aiff",
+        ".webm": "audio/webm",
     }.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=mime)
 

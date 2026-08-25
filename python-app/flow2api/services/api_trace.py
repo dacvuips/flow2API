@@ -23,8 +23,17 @@ def _compact_body(body: Any) -> Any:
         return body
     out: dict[str, Any] = {}
     for k, v in body.items():
-        if k in ("imageBytes", "image_base64", "imageBase64s", "image_base64s"):
+        if k in (
+            "imageBytes",
+            "image_base64",
+            "imageBase64s",
+            "image_base64s",
+            "audio_base64s",
+            "audioBase64s",
+        ):
             out[k] = f"[omitted: {len(v) if isinstance(v, (str, list)) else type(v).__name__}]"
+        elif k == "data" and isinstance(v, str) and len(v) > 200:
+            out[k] = f"[omitted: {len(v)} chars]"
         elif isinstance(v, str) and len(v) > 500:
             out[k] = v[:500] + f"... [{len(v)} chars]"
         elif isinstance(v, dict):

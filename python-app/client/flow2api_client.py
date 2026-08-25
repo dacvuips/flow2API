@@ -64,6 +64,7 @@ class Flow2APIClient:
         model: str = "gemini-3-flash-preview",
         thinking_level: Optional[str] = None,
         image_base64s: Optional[list[str]] = None,
+        audio_base64s: Optional[list[str]] = None,
         schema: Optional[dict] = None,
         json: Optional[bool] = None,
         profile_id: Optional[str] = None,
@@ -73,7 +74,8 @@ class Flow2APIClient:
 
         thinking_level: optional MINIMAL|LOW|MEDIUM|HIGH.
         Omit to use server default (LOW — Flow UI). Empty system_instruction
-        uses Flow screenplay convention unless image_base64s is set (vision).
+        uses Flow screenplay convention unless image_base64s / audio_base64s
+        is set (vision / audio analysis).
         schema / json=True → generationConfig.responseMimeType=application/json.
         """
         params: dict[str, Any] = {
@@ -87,6 +89,8 @@ class Flow2APIClient:
             params["system_instruction"] = system_instruction
         if image_base64s:
             params["image_base64s"] = list(image_base64s)
+        if audio_base64s:
+            params["audio_base64s"] = list(audio_base64s)
         if schema:
             params["schema"] = schema
         if json:

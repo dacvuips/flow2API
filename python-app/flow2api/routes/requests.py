@@ -44,6 +44,7 @@ class RequestParams(BaseModel):
     variant_count: Optional[int] = 1
     video_quality: Optional[str] = None
     image_base64s: Optional[list[str]] = None
+    audio_base64s: Optional[list[str]] = None
     image_input_types: Optional[list[str]] = None
     video_mode: Optional[str] = None  # "frame" | "component" — bắt buộc với gen_image_video
     video_media_id: Optional[str] = None
@@ -149,11 +150,16 @@ async def create_request(body: CreateRequestBody, api_key_id: int = Depends(_aut
         or ""
     )
     rid = new_request_id()
+    preview_urls: list[str] = []
     image_base64s = params.get("image_base64s") or params.get("imageBase64s") or []
-    if image_base64s:
-        from flow2api.services.result_media import persist_input_previews
+    audio_base64s = params.get("audio_base64s") or params.get("audioBase64s") or []
+    if image_base64s or audio_base64s:
+        from flow2api.services.result_media import persist_audio_previews, persist_input_previews
 
-        preview_urls = persist_input_previews(rid, image_base64s)
+        if image_base64s:
+            preview_urls.extend(persist_input_previews(rid, image_base64s))
+        if audio_base64s:
+            preview_urls.extend(persist_audio_previews(rid, audio_base64s))
         if preview_urls:
             params["input_preview_urls"] = preview_urls
     activity.create_request(rid, body.type, prompt, str(model), params, api_key_id=api_key_id)

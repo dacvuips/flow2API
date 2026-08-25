@@ -71,7 +71,7 @@ logging.getLogger("asyncio").addFilter(_SuppressAsyncioClientDisconnect())
 
 
 class _SuppressNoisyAccessLog(logging.Filter):
-    """Hide dashboard polling from CMD (health, auth scan, task list, …)."""
+    """Hide dashboard polling / extension heartbeats from CMD."""
 
     _QUIET_PATHS = (
         "/api/health",
@@ -84,8 +84,7 @@ class _SuppressNoisyAccessLog(logging.Filter):
         "/api/settings",
         "/api/activity",
         "/api/ext/callback",
-        "/api/internal/chatgpt/poll",
-        "/api/internal/captcha/poll",
+        "/api/internal/",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -286,7 +285,8 @@ def main() -> None:
     kwargs: dict = {
         "host": HTTP_HOST,
         "port": HTTP_PORT,
-        "log_level": "info",
+        "log_level": "warning",
+        "access_log": False,
     }
     # PyInstaller / frozen: must pass app object (string import path breaks in bootloader).
     if getattr(sys, "frozen", False):
