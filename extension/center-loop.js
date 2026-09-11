@@ -33,6 +33,7 @@ const CENTER_ANCHOR_TOP_LEVEL_SITES = [
 const CENTER_FLOW_URLS = [
   'https://labs.google/fx/tools/flow*',
   'https://labs.google/fx/*/tools/flow*',
+  'https://flow.google.com/*',
 ];
 
 const CENTER_EXTENSION_VERSION = chrome.runtime.getManifest().version;
@@ -152,7 +153,8 @@ function centerIsFlowUrl(url) {
   if (!url) return false;
   return (
     /\/fx\/tools\/flow/i.test(url) ||
-    /\/fx\/[^/]+\/tools\/flow/i.test(url)
+    /\/fx\/[^/]+\/tools\/flow/i.test(url) ||
+    /^https:\/\/flow\.google\.com\//i.test(url)
   );
 }
 
