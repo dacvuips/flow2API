@@ -16,7 +16,7 @@
 // ── Constants (parity với veo3) ────────────────────────────────────────
 const CENTER_DEFAULT_BASE = 'http://127.0.0.1:1994';
 const CENTER_POLL_TIMEOUT_MS = 25_000;
-const CENTER_FLOW_URL = 'https://labs.google/fx/tools/flow';
+const CENTER_FLOW_URL = 'https://flow.google.com/about';
 const CENTER_KEEPALIVE_MIN = 0.4; // ~24s alarm interval
 const CENTER_HARD_RESET_BLANK_MS = 1500;
 const CENTER_HARD_RESET_DWELL_MS = 2500;
