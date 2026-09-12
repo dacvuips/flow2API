@@ -178,6 +178,15 @@ class ExtensionSession:
 
         return profile_direct_lane_ready(self.profile_id)
 
+    def has_cdp_only_lane(self) -> bool:
+        """True if this profile is only ready via the CDP/batchexecute lane —
+        cookies + a configured CDP slot, but no OAuth access_token. Generation for
+        these profiles goes through flow_batchexecute_client instead of the token
+        based REST API, so callers must not require a fresh access_token first."""
+        if self.flow_key:
+            return False
+        return self.has_direct_lane()
+
     def is_ready(self) -> bool:
         if self.has_direct_lane():
             return True

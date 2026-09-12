@@ -33,6 +33,70 @@ from flow2api.services.request_logs import log_task_event
 
 logger = logging.getLogger(__name__)
 
+
+_SESSION_EXPIRED_MARKERS = ("http_401", "http_400")
+
+
+def _looks_like_session_expired(exc: Exception) -> bool:
+    """Google doesn't only return HTTP 401 for a stale/invalid f.sid/at/cookie
+    session — verified empirically with a deliberately corrupted session that
+    got HTTP 400 back (bad f.sid format) instead of 401. Treat both as the
+    same "session needs re-capturing" signal rather than risk missing real
+    401-equivalents that happen to come back as 400."""
+    text = str(exc)
+    return any(marker in text for marker in _SESSION_EXPIRED_MARKERS)
+
+
+async def _call_with_401_retry(profile_id: str, call: Any) -> Any:
+    """Run a batchexecute call, and if it fails with what looks like an
+    expired session (see _looks_like_session_expired — HTTP 401 or 400; the
+    cached f.sid/bl/at/cookie session expired, which happens periodically
+    under normal use, not a bug), re-capture the session and retry the call
+    exactly once. `call` is a zero-arg async callable so retrying re-runs the
+    whole thing (including minting a fresh reCAPTCHA token), not just the
+    HTTP POST — a stale token would fail just as surely as a stale session.
+
+    Session re-capture is coalesced across concurrent tasks on the same
+    profile (see recapture_session_coalesced) so N tasks hitting this at once
+    don't each try to open their own CDP connection.
+
+    If the retry itself fails, that means recapture couldn't actually recover
+    a working session (most likely: the profile's CDP tab isn't open/reachable
+    right now) — this raises BatchExecuteSessionRecoveryFailed so callers
+    (processor.py) can treat it as an account-level problem and switch to
+    another profile instead of just failing the task outright.
+    """
+    from flow2api.services.flow_batchexecute_client import (
+        BatchExecuteError,
+        BatchExecuteSessionRecoveryFailed,
+        recapture_session_coalesced,
+    )
+
+    try:
+        return await call()
+    except BatchExecuteError as exc:
+        if not _looks_like_session_expired(exc):
+            raise
+        logger.info(
+            "batchexecute session likely expired profile=%s (%s) — re-capturing and retrying once",
+            profile_id[:12],
+            str(exc)[:60],
+        )
+        try:
+            await recapture_session_coalesced(profile_id)
+        except Exception as recapture_exc:
+            raise BatchExecuteSessionRecoveryFailed(
+                f"session_recapture_failed profile={profile_id[:12]}: {recapture_exc}"
+            ) from recapture_exc
+        try:
+            return await call()
+        except BatchExecuteError as retry_exc:
+            if not _looks_like_session_expired(retry_exc):
+                raise
+            raise BatchExecuteSessionRecoveryFailed(
+                f"still_failing_after_recapture profile={profile_id[:12]}: {retry_exc}"
+            ) from retry_exc
+
 IMAGE_MODELS = {
     "NANO_BANANA_PRO": "GEM_PIX_2",
     "NANO_BANANA_2": "NARWHAL",
@@ -590,6 +654,26 @@ async def upload_image(
 ) -> str:
     mime_type = mime_type or _guess_upload_mime(image_base64)
     file_name = _guess_upload_file_name(mime_type, file_name, fallback_stem="upload")
+
+    # CDP-only lane (no OAuth access_token — see gen_image's comment for why):
+    # upload via batchexecute instead of the REST API below, which would 401
+    # without a token that Flow no longer issues.
+    if not client.flow_key:
+        from flow2api.services.flow_batchexecute_client import (
+            upload_image_via_batchexecute,
+        )
+
+        return await _call_with_401_retry(
+            client.profile_id,
+            lambda: upload_image_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                image_base64=image_base64,
+                mime_type=mime_type,
+                file_name=file_name,
+            ),
+        )
+
     result = await _upload_media_bytes(
         client,
         project_id=project_id,
@@ -785,6 +869,35 @@ async def gen_image(
     image_base64s: Optional[list[str]] = None,
     image_input_types: Optional[list[str]] = None,
 ) -> dict:
+    # Google no longer issues OAuth access_token for Flow (moved off labs.google's
+    # NextAuth session) — aisandbox-pa.googleapis.com REST below requires one and
+    # will always 401 without it. When a profile has no token, generate via
+    # batchexecute instead (works with or without reference images — uploads for
+    # this lane already route through upload_image()'s own batchexecute branch).
+    # See flow_batchexecute_client.py docstring for why this is the only working path.
+    if not client.flow_key and max(1, min(variant_count, 4)) == 1:
+        from flow2api.services.flow_batchexecute_client import gen_image_via_batchexecute
+
+        model_name_be = IMAGE_MODELS.get(image_model, IMAGE_MODELS["NANO_BANANA_PRO"])
+
+        async def _do() -> dict:
+            image_media_ids: list[str] | None = None
+            if image_base64s:
+                to_upload = [b64 for b64 in image_base64s if b64]
+                image_media_ids = await upload_images(
+                    client, project_id=project_id, image_base64s=to_upload
+                )
+            return await gen_image_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                prompt=prompt,
+                image_model_key=model_name_be,
+                aspect_ratio=aspect_ratio,
+                image_media_ids=image_media_ids,
+            )
+
+        return await _call_with_401_retry(client.profile_id, _do)
+
     tier = _require_tier(client)
     model_name = IMAGE_MODELS.get(image_model, IMAGE_MODELS["NANO_BANANA_PRO"])
     aspect = IMAGE_ASPECT.get(aspect_ratio, IMAGE_ASPECT["16:9"])
@@ -1240,6 +1353,41 @@ async def gen_text(
     Text generation via aisandbox-pa ``/v1/flow:generateContent``
     (Gemini text / vision / audio on Flow — screenplay, image or audio analysis).
     """
+    # CDP-only lane — see gen_image's comment for why. Only plain text-in/
+    # text-out has been captured over batchexecute so far (no multi-turn
+    # contents, image/audio input, or JSON schema/structured output — that
+    # last one doesn't even exist in Flow's own UI, so there's no real request
+    # to capture its field shape from). Reject those explicitly rather than
+    # silently ignoring them.
+    if not client.flow_key:
+        if contents or image_base64s or audio_base64s:
+            raise RuntimeError(
+                "batchexecute_gen_text_unsupported: multi-turn contents / image / audio "
+                "input chưa hỗ trợ cho profile không có access_token."
+            )
+        json_schema = coerce_json_schema(schema)
+        mime = str(response_mime_type or "").strip()
+        if json_schema or force_json or mime.lower() in ("application/json", "json"):
+            raise RuntimeError(
+                "batchexecute_gen_text_schema_unsupported: JSON schema/structured output "
+                "chưa hỗ trợ cho profile không có access_token (tính năng này không tồn tại "
+                "trên UI Flow nên chưa xác định được cấu trúc request đúng)."
+            )
+        from flow2api.services.flow_batchexecute_client import gen_text_via_batchexecute
+
+        sys_text = coerce_system_instruction(system_instruction)
+        return await _call_with_401_retry(
+            client.profile_id,
+            lambda: gen_text_via_batchexecute(
+                profile_id=client.profile_id,
+                prompt=str(prompt or "").strip(),
+                system_instruction=sys_text,
+                model=str(model or DEFAULT_TEXT_MODEL).strip() or DEFAULT_TEXT_MODEL,
+                applet_id=str(applet_id or DEFAULT_TEXT_APPLET_ID),
+                applet_version_id=str(applet_version_id or DEFAULT_TEXT_APPLET_VERSION_ID),
+            ),
+        )
+
     user_text = str(prompt or "").strip()
     image_parts = _inline_image_parts(image_base64s)
     audio_parts = _inline_audio_parts(audio_base64s)
@@ -1509,10 +1657,28 @@ async def upsample_image(
     target_resolution: str = "UPSAMPLE_IMAGE_RESOLUTION_4K",
 ) -> dict[str, Any]:
     """Upscale a generated image via /v1/flow/upsampleImage (2K or 4K)."""
-    tier = _require_tier(client)
     media_id = str(media_id or "").strip()
     if not media_id:
         raise ValueError("missing_media_id")
+
+    # CDP-only lane — see gen_image's comment for why. batchexecute's upsample
+    # returns the image bytes directly (no new media id / URL of its own),
+    # unlike the REST path — see upsample_image_via_batchexecute's docstring.
+    if not client.flow_key:
+        from flow2api.services.flow_batchexecute_client import (
+            upsample_image_via_batchexecute,
+        )
+
+        target = "4k" if "4K" in target_resolution.upper() else "2k"
+        encoded = await _call_with_401_retry(
+            client.profile_id,
+            lambda: upsample_image_via_batchexecute(
+                profile_id=client.profile_id, media_id=media_id, target=target
+            ),
+        )
+        return {"encoded_image": encoded}
+
+    tier = _require_tier(client)
 
     last_err = "upsample_image_failed"
     last_resp: dict = {}
@@ -1622,6 +1788,34 @@ async def upsample_video(
     media_id = normalize_source_video_media_id(media_id)
     if not media_id:
         raise ValueError("missing_media_id")
+
+    # CDP-only lane — see gen_text_video's comment. upsample_video_via_batchexecute
+    # needs the source video's generation id, not just its media id (see its
+    # docstring) — look it up via a poll call since callers here only ever pass
+    # the media id.
+    if not client.flow_key:
+        from flow2api.services.flow_batchexecute_client import (
+            get_video_generation_id,
+            poll_video_via_batchexecute,
+            upsample_video_via_batchexecute,
+        )
+
+        async def _do() -> dict:
+            generation_id = await get_video_generation_id(
+                profile_id=client.profile_id, media_id=media_id
+            )
+            upsampled_media_id = await upsample_video_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                media_id=media_id,
+                generation_id=generation_id,
+            )
+            url = await poll_video_via_batchexecute(
+                profile_id=client.profile_id, media_id=upsampled_media_id
+            )
+            return {"video_urls": [url], "media_ids": [upsampled_media_id]}
+
+        return await _call_with_401_retry(client.profile_id, _do)
 
     aspect = VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"])
     workflow_id = str(workflow_id or "").strip()
@@ -1877,7 +2071,35 @@ async def gen_text_video(
     aspect_ratio: str,
     video_quality: str,
     variant_count: int = 1,
+    duration_s: int | None = None,
 ) -> dict:
+    # CDP-only lane (no access_token — see gen_image's comment for why): submit,
+    # poll, and resolve entirely via batchexecute, returning an already-finished
+    # result so the caller (processor.py's _poll_video) can skip its own REST
+    # polling pipeline. duration_s picks 4/5/6/7/8s (default 8) — confirmed by
+    # capturing real Generate clicks on Flow's UI: duration is baked into the
+    # model key string itself (see video_duration_model_key), not a separate
+    # request field.
+    if not client.flow_key and max(1, min(variant_count, 4)) == 1:
+        from flow2api.services.flow_batchexecute_client import (
+            gen_t2v_video_via_batchexecute,
+            poll_video_via_batchexecute,
+        )
+
+        async def _do() -> dict:
+            media_id = await gen_t2v_video_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                prompt=prompt,
+                duration_s=duration_s,
+            )
+            url = await poll_video_via_batchexecute(
+                profile_id=client.profile_id, media_id=media_id
+            )
+            return {"_batchexecute_done": True, "video_urls": [url], "media_ids": [media_id]}
+
+        return await _call_with_401_retry(client.profile_id, _do)
+
     tier = _require_tier(client)
     model_key = _video_model_key("t2v", tier, aspect_ratio, video_quality)
     aspect = VIDEO_ASPECT.get(aspect_ratio, VIDEO_ASPECT["16:9"])
@@ -1913,7 +2135,32 @@ async def gen_video_start_image(
     video_quality: str,
     start_media_id: str,
     variant_count: int = 1,
+    duration_s: int | None = None,
 ) -> dict:
+    # CDP-only lane — see gen_text_video's comment. start_media_id is expected
+    # to already be a batchexecute media id (upload_image() routes there too
+    # when there's no access_token, so callers don't need to special-case this).
+    if not client.flow_key and max(1, min(variant_count, 4)) == 1:
+        from flow2api.services.flow_batchexecute_client import (
+            gen_i2v_video_via_batchexecute,
+            poll_video_via_batchexecute,
+        )
+
+        async def _do() -> dict:
+            media_id = await gen_i2v_video_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                prompt=prompt,
+                start_media_id=start_media_id,
+                duration_s=duration_s,
+            )
+            url = await poll_video_via_batchexecute(
+                profile_id=client.profile_id, media_id=media_id
+            )
+            return {"_batchexecute_done": True, "video_urls": [url], "media_ids": [media_id]}
+
+        return await _call_with_401_retry(client.profile_id, _do)
+
     tier = _require_tier(client)
     model_key = _video_model_key("i2v", tier, aspect_ratio, video_quality)
     request_item = {
@@ -1940,7 +2187,31 @@ async def gen_video_start_end_image(
     start_media_id: str,
     end_media_id: str,
     variant_count: int = 1,
+    duration_s: int | None = None,
 ) -> dict:
+    # CDP-only lane — see gen_text_video's comment.
+    if not client.flow_key and max(1, min(variant_count, 4)) == 1:
+        from flow2api.services.flow_batchexecute_client import (
+            gen_i2v_fl_video_via_batchexecute,
+            poll_video_via_batchexecute,
+        )
+
+        async def _do() -> dict:
+            media_id = await gen_i2v_fl_video_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                prompt=prompt,
+                start_media_id=start_media_id,
+                end_media_id=end_media_id,
+                duration_s=duration_s,
+            )
+            url = await poll_video_via_batchexecute(
+                profile_id=client.profile_id, media_id=media_id
+            )
+            return {"_batchexecute_done": True, "video_urls": [url], "media_ids": [media_id]}
+
+        return await _call_with_401_retry(client.profile_id, _do)
+
     tier = _require_tier(client)
     model_key = _video_model_key("i2v_fl", tier, aspect_ratio, video_quality)
     request_item = {
@@ -1969,7 +2240,37 @@ async def gen_multi_image_video(
     variant_count: int = 1,
     voice: str | None = None,
     reference_audio_media_id: str | None = None,
+    duration_s: int | None = None,
 ) -> dict:
+    # CDP-only lane — see gen_text_video's comment. With a voice: Flow's own UI
+    # bakes the narration line into the prompt text (no separate dialogue
+    # field observed over batchexecute — see _build_gen_r2v_video_params's
+    # docstring), so the caller-supplied prompt is used as-is; make sure it
+    # already reads like dialogue if a voice is set, the way the REST lane's
+    # own callers format it.
+    if not client.flow_key and max(1, min(variant_count, 4)) == 1:
+        voice_id = normalize_voice_media_id(reference_audio_media_id or voice)
+        from flow2api.services.flow_batchexecute_client import (
+            gen_r2v_video_via_batchexecute,
+            poll_video_via_batchexecute,
+        )
+
+        async def _do() -> dict:
+            media_id = await gen_r2v_video_via_batchexecute(
+                profile_id=client.profile_id,
+                project_id=project_id,
+                prompt=prompt,
+                reference_media_ids=reference_media_ids,
+                voice=voice_id or None,
+                duration_s=duration_s,
+            )
+            url = await poll_video_via_batchexecute(
+                profile_id=client.profile_id, media_id=media_id
+            )
+            return {"_batchexecute_done": True, "video_urls": [url], "media_ids": [media_id]}
+
+        return await _call_with_401_retry(client.profile_id, _do)
+
     tier = _require_tier(client)
     model_key = _video_model_key("r2v", tier, aspect_ratio, video_quality)
     request_item: dict[str, Any] = {

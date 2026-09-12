@@ -77,6 +77,17 @@ class FlowProfile(Base):
     cookies_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     cookies_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     paygate_tier: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # batchexecute session (flow.google.com no longer issues OAuth access_token —
+    # generation goes through flow.google.com's own batchexecute RPC instead, which
+    # needs a project id + the f.sid/bl/at triple read from the page's own
+    # window.WIZ_global_data). These are captured once from a live CDP tab and can
+    # be reused across many generate calls without keeping that tab open — see
+    # flow_batchexecute_client.py for details on what each field is and why.
+    flow_project_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    flow_fsid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    flow_bl: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    flow_at: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    flow_session_captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -108,3 +119,13 @@ def init_db() -> None:
             conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_captured_at DATETIME"))
         if fp_cols and "cookies_expires_at" not in fp_cols:
             conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN cookies_expires_at DATETIME"))
+        if fp_cols and "flow_project_id" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN flow_project_id VARCHAR(64)"))
+        if fp_cols and "flow_fsid" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN flow_fsid VARCHAR(64)"))
+        if fp_cols and "flow_bl" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN flow_bl VARCHAR(128)"))
+        if fp_cols and "flow_at" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN flow_at VARCHAR(128)"))
+        if fp_cols and "flow_session_captured_at" not in fp_cols:
+            conn.execute(text("ALTER TABLE flow_profiles ADD COLUMN flow_session_captured_at DATETIME"))

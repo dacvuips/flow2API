@@ -17,6 +17,7 @@ from flow2api.services.flow_cdp_control import (
     click_selector,
     delete_slot_fully,
     flow_cdp_public_status,
+    get_slot_cookies,
     logout_flow,
     open_flow_login,
     schedule_auto_attach,
@@ -296,6 +297,25 @@ async def flow_cdp_sync(slot_id: str, _: int = Depends(auth_key_id)):
         logger.exception("sync failed slot=%s", slot_id)
         raise HTTPException(500, str(exc)) from exc
     return {**result, "profiles": _profiles_payload()}
+
+
+@router.get("/slots/{slot_id}/cookies")
+async def flow_cdp_get_cookies(
+    slot_id: str,
+    url: str = "https://flow.google.com/",
+    _: int = Depends(auth_key_id),
+):
+    """Đọc cookie thô qua CDP (không lưu DB) — debug / gọi batchexecute ngoài."""
+    try:
+        result = await get_slot_cookies(slot_id, url=url)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("get cookies failed slot=%s", slot_id)
+        raise HTTPException(500, str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "cookies_failed")
+    return result
 
 
 @router.post("/slots/{slot_id}/logout")

@@ -328,6 +328,57 @@ def save_access_token(
     )
 
 
+def save_batchexecute_session(
+    profile_id: str,
+    *,
+    project_id: str,
+    fsid: str,
+    bl: str,
+    at: str,
+) -> None:
+    """Cache the project id + f.sid/bl/at triple read from a live Flow tab.
+
+    These authenticate calls to flow.google.com's own batchexecute RPC (the only
+    living generate path now that Google stopped issuing OAuth access_token for
+    Flow — see flow_batchexecute_client.py). Unlike the reCAPTCHA token, this
+    triple is reusable across many generate calls without keeping the CDP tab
+    open, so it only needs to be re-captured when Google eventually invalidates
+    it (session expiry), not before every single call.
+    """
+    pid = str(profile_id or "").strip()
+    if not pid or not fsid or not bl or not at:
+        return
+    with SessionLocal() as db:
+        row = db.get(FlowProfile, pid)
+        if not row:
+            row = FlowProfile(profile_id=pid)
+            db.add(row)
+        row.flow_project_id = str(project_id or "").strip() or row.flow_project_id
+        row.flow_fsid = str(fsid)
+        row.flow_bl = str(bl)
+        row.flow_at = str(at)
+        row.flow_session_captured_at = _utcnow()
+        row.updated_at = _utcnow()
+        db.commit()
+    logger.debug("batchexecute session saved profile=%s", pid[:12])
+
+
+def get_batchexecute_session(profile_id: str) -> Optional[dict[str, str]]:
+    """Return the cached {project_id, fsid, bl, at} for this profile, or None if
+    never captured. Callers are responsible for handling stale/rejected sessions
+    (re-capture via a live CDP tab) — this layer does not track a TTL because the
+    real expiry behavior has not been characterized yet."""
+    row = get_profile_row(profile_id)
+    if not row or not row.flow_fsid or not row.flow_bl or not row.flow_at or not row.flow_project_id:
+        return None
+    return {
+        "project_id": row.flow_project_id,
+        "fsid": row.flow_fsid,
+        "bl": row.flow_bl,
+        "at": row.flow_at,
+    }
+
+
 
 
 
@@ -531,7 +582,26 @@ def profile_direct_lane_ready(profile_id: str) -> bool:
 
         return False
 
-    return has_stored_cookies(pid) and bool(get_stored_access_token(pid))
+    if has_stored_cookies(pid) and bool(get_stored_access_token(pid)):
+        return True
+
+    # Google stopped issuing OAuth access_token for Flow (moved off labs.google's
+    # NextAuth session) — a profile with cookies but a linked CDP slot can still
+    # generate via a live CDP tab driving batchexecute (flow_batchexecute_client.py).
+    # NOTE: this only checks a CDP slot is *configured* for the profile, not that it
+    # is currently reachable — cdp_endpoint_alive() is a blocking network call and
+    # must never run on the hot path that renders the profile list (it previously
+    # froze the whole dashboard by blocking the async event loop). The actual
+    # liveness check happens lazily inside gen_image_via_batchexecute() when a job
+    # is dispatched, which is the only place that can afford the network round trip.
+    if not has_stored_cookies(pid):
+        return False
+    try:
+        from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
+
+        return get_flow_cdp_slot(pid) is not None
+    except Exception:
+        return False
 
 
 

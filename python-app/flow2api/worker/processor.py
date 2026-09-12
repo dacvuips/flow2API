@@ -68,6 +68,17 @@ def _task_prompt(row: Any, params: dict[str, Any]) -> str:
     return str(params.get("prompt") or getattr(row, "prompt", "") or "")
 
 
+def _is_batchexecute_session_recovery_failure(exc: Exception) -> bool:
+    """True if exc is (or wraps) BatchExecuteSessionRecoveryFailed — raised by
+    flow_sdk._call_with_401_retry when a CDP-only lane profile's session
+    expired and re-capturing it also failed (its CDP tab isn't reachable)."""
+    from flow2api.services.flow_batchexecute_client import (
+        BatchExecuteSessionRecoveryFailed,
+    )
+
+    return isinstance(exc, BatchExecuteSessionRecoveryFailed)
+
+
 def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
     """frame = startImage[/endImage]; component = referenceImages."""
     explicit = str(params.get("video_mode") or "").strip().lower()
@@ -85,6 +96,20 @@ def _resolve_video_mode(req_type: str, params: dict[str, Any]) -> str:
 
 def _variant_count(params: dict[str, Any]) -> int:
     return max(1, min(int(params.get("variant_count") or 1), 4))
+
+
+def _video_duration_s(params: dict[str, Any]) -> int | None:
+    """4/6/8s duration for the regular Veo lanes (t2v/i2v/i2v_fl/r2v) — same
+    dashboard field ("video_duration_s") the Omni Flash branch already reads,
+    just not previously wired up for the non-Omni lanes. None (unset) lets
+    the callee default to 8s, Flow's own default when no duration is chosen."""
+    raw = params.get("video_duration_s")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class RequestCancelled(RuntimeError):
@@ -657,7 +682,26 @@ class WorkerController:
         if profile_id in self._project_by_profile:
             return self._project_by_profile[profile_id]
         client = get_flow_client()
-        project_id = await flow_sdk.ensure_project(client)
+        # CDP-only lane has no access_token, so the tRPC project.createProject call
+        # inside flow_sdk.ensure_project() would hit the same dead labs.google auth
+        # as the REST API. Prefer the project id already cached alongside this
+        # profile's batchexecute session (f.sid/bl/at) in the DB — that's the
+        # normal, CDP-closed path. Only fall back to reading a live CDP tab (and
+        # re-capturing the session) when nothing is cached yet.
+        if client.has_cdp_only_lane():
+            from flow2api.services.flow_profile_service import get_batchexecute_session
+
+            cached = get_batchexecute_session(profile_id)
+            if cached:
+                project_id = cached["project_id"]
+            else:
+                from flow2api.services.flow_batchexecute_client import (
+                    get_project_id_from_cdp_tab,
+                )
+
+                project_id = await get_project_id_from_cdp_tab(profile_id)
+        else:
+            project_id = await flow_sdk.ensure_project(client)
         self._project_by_profile[profile_id] = project_id
         return project_id
 
@@ -1129,6 +1173,23 @@ class WorkerController:
                             str(retry_params.get("profile_id") or "-")[:12],
                         )
                         return
+                if _is_batchexecute_session_recovery_failure(exc):
+                    # CDP-only lane's session expired (401) and re-capturing it
+                    # failed too — almost certainly because the profile's CDP
+                    # tab isn't open/reachable right now. Rather than fail the
+                    # task outright, treat it like any other account-level
+                    # problem: switch to another profile that's ready, so the
+                    # rest of the queue doesn't wait on this one profile's CDP
+                    # coming back. The switched-off profile stays eligible for
+                    # auto-CDP recovery (flow_cdp_auto.py) same as any other
+                    # account error.
+                    self._handle_profile_error_switch(
+                        rid,
+                        retry_params,
+                        msg,
+                        label="batchexecute_session_expired",
+                    )
+                    return
                 if is_profile_account_switch_failure(exc, msg, api_trace):
                     switch_label = "account_error"
                     low = str(msg or "").lower()
@@ -1279,17 +1340,23 @@ class WorkerController:
         client = get_flow_client()
         if not client.connected and not client.has_direct_lane():
             raise RuntimeError("extension_not_connected")
-        if not client.connected and client.has_direct_lane():
-            refreshed = await client.ensure_token_fresh()
-            if not refreshed or not client.flow_key:
-                raise RuntimeError(
-                    "offline_auth_expired: Profile offline — không refresh được token từ cookies DB. "
-                    "Mở Chrome profile và bấm Get Connection Status."
-                )
-        elif not client.flow_key:
-            refreshed = await client.ensure_token_fresh()
-            if not refreshed or not client.flow_key:
-                raise RuntimeError("no_flow_token")
+        # CDP-only lane (cookies + CDP slot, no OAuth access_token — Google stopped
+        # issuing those for Flow) generates via flow_batchexecute_client driving a
+        # live browser tab, so it never needs/gets a fresh access_token here. Forcing
+        # ensure_token_fresh() for these profiles always fails against the dead
+        # labs.google auth/session endpoint and requeues the job in an infinite loop.
+        if not client.has_cdp_only_lane():
+            if not client.connected and client.has_direct_lane():
+                refreshed = await client.ensure_token_fresh()
+                if not refreshed or not client.flow_key:
+                    raise RuntimeError(
+                        "offline_auth_expired: Profile offline — không refresh được token từ cookies DB. "
+                        "Mở Chrome profile và bấm Get Connection Status."
+                    )
+            elif not client.flow_key:
+                refreshed = await client.ensure_token_fresh()
+                if not refreshed or not client.flow_key:
+                    raise RuntimeError("no_flow_token")
         if not client.paygate_tier:
             await client.fetch_paygate_tier()
 
@@ -1586,6 +1653,7 @@ class WorkerController:
                     aspect_ratio=params.get("aspect_ratio", "16:9"),
                     video_quality=get_video_quality(params, "fast"),
                     variant_count=vc,
+                    duration_s=_video_duration_s(params),
                 )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1717,6 +1785,7 @@ class WorkerController:
                 aspect_ratio=aspect_ratio,
                 video_quality=video_quality,
                 variant_count=vc,
+                duration_s=_video_duration_s(params),
             )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1737,6 +1806,7 @@ class WorkerController:
                 or params.get("reference_audio")
                 or params.get("referenceAudio")
                 or params.get("reference_audio_media_id"),
+                duration_s=_video_duration_s(params),
             )
             await self._poll_video(rid, raw, project_id)
             return
@@ -1763,6 +1833,7 @@ class WorkerController:
                 start_media_id=start_id,
                 end_media_id=end_id,
                 variant_count=vc,
+                duration_s=_video_duration_s(params),
             )
         else:
             start_id = await self._resolve_start_media_id(
@@ -1776,10 +1847,31 @@ class WorkerController:
                 video_quality=video_quality,
                 start_media_id=start_id,
                 variant_count=vc,
+                duration_s=_video_duration_s(params),
             )
         await self._poll_video(rid, raw, project_id)
 
     async def _poll_video(self, rid: str, submit_raw: dict, project_id: str) -> None:
+        # CDP-only lane (flow_sdk.gen_*_video already submitted, polled, and
+        # resolved the URL via batchexecute — see its "_batchexecute_done"
+        # comment) — nothing left to do here but write the already-finished
+        # result, skipping the REST-shaped operations/media parsing below
+        # entirely since submit_raw won't have that shape.
+        if isinstance(submit_raw, dict) and submit_raw.get("_batchexecute_done"):
+            row_done = activity.get_request(rid)
+            done_params = json.loads(row_done.params_json or "{}") if row_done else {}
+            result = {
+                "video_urls": submit_raw.get("video_urls") or [],
+                "media_ids": submit_raw.get("media_ids") or [],
+                "project_id": project_id,
+                "profile_id": done_params.get("profile_id"),
+            }
+            if row_done:
+                result = await persist_task_result(rid, result, row_done.type)
+            activity.update_request(rid, status="done", result=result, error=None)
+            events.publish("request_finished", {"id": rid, "status": "done"})
+            return
+
         client = get_flow_client()
         operations = flow_sdk.extract_video_operations(submit_raw)
         if not operations:

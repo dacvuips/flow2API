@@ -210,6 +210,29 @@ async def open_flow_login(slot_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "attach_failed"}
 
 
+async def get_slot_cookies(slot_id: str, *, url: str = "https://flow.google.com/") -> dict[str, Any]:
+    """Đọc cookie thô từ CDP context (không lưu DB) — dùng để debug / gọi API ngoài."""
+    async with _slot_lock(slot_id):
+        async for slot, _browser, context, _page in _agen_page(slot_id):
+            try:
+                cookies = await context.cookies(url)
+            except TypeError:
+                cookies = await context.cookies()
+            except Exception as exc:
+                raise RuntimeError(f"cookies_read_failed: {exc}") from exc
+            from flow2api.services.cookie_service import build_cookie_header
+
+            return {
+                "ok": True,
+                "slot_id": slot.id,
+                "url": url,
+                "cookies": cookies,
+                "cookie_header": build_cookie_header(cookies),
+                "count": len(cookies or []),
+            }
+        return {"ok": False, "error": "attach_failed"}
+
+
 async def logout_flow(slot_id: str) -> dict[str, Any]:
     """Clear Google/Labs session cookies in the CDP browser (keeps user-data dir)."""
     async with _slot_lock(slot_id):
