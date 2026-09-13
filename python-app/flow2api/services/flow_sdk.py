@@ -1354,29 +1354,38 @@ async def gen_text(
     (Gemini text / vision / audio on Flow — screenplay, image or audio analysis).
     """
     # CDP-only lane — see gen_image's comment for why. Only plain text-in/
-    # text-out has been captured over batchexecute so far (no multi-turn
-    # contents, image/audio input, or JSON schema/structured output — that
-    # last one doesn't even exist in Flow's own UI, so there's no real request
-    # to capture its field shape from). Reject those explicitly rather than
-    # silently ignoring them.
+    # text-out plus JSON-schema output has been captured over batchexecute so
+    # far — no multi-turn contents or image/audio input (those would need
+    # their own captures to get the field shapes right). Reject those
+    # explicitly rather than silently ignoring them.
+    #
+    # JSON schema: verified from a live capture (2026-09-13) that Flow's own
+    # "Prop Writer" tool has NO dedicated responseSchema/generationConfig
+    # field over batchexecute — it just appends the schema as plain-English
+    # instructions to the system instruction text ("Return a JSON object with
+    # this structure: {...}") and parses the model's text output itself. So
+    # this lane does the same instead of rejecting schema/force_json/mime.
     if not client.flow_key:
         if contents or image_base64s or audio_base64s:
             raise RuntimeError(
                 "batchexecute_gen_text_unsupported: multi-turn contents / image / audio "
                 "input chưa hỗ trợ cho profile không có access_token."
             )
-        json_schema = coerce_json_schema(schema)
-        mime = str(response_mime_type or "").strip()
-        if json_schema or force_json or mime.lower() in ("application/json", "json"):
-            raise RuntimeError(
-                "batchexecute_gen_text_schema_unsupported: JSON schema/structured output "
-                "chưa hỗ trợ cho profile không có access_token (tính năng này không tồn tại "
-                "trên UI Flow nên chưa xác định được cấu trúc request đúng)."
-            )
         from flow2api.services.flow_batchexecute_client import gen_text_via_batchexecute
 
         sys_text = coerce_system_instruction(system_instruction)
-        return await _call_with_401_retry(
+        json_schema = coerce_json_schema(schema)
+        mime = str(response_mime_type or "").strip()
+        wants_json = bool(json_schema) or force_json or mime.lower() in ("application/json", "json")
+        if wants_json:
+            schema_hint = (
+                f"\n\nReturn a JSON object with this structure:\n{json.dumps(json_schema, ensure_ascii=False, indent=2)}"
+                if json_schema
+                else "\n\nReturn ONLY a valid JSON object — no markdown fences, no extra text."
+            )
+            sys_text = (sys_text + schema_hint).strip()
+
+        result = await _call_with_401_retry(
             client.profile_id,
             lambda: gen_text_via_batchexecute(
                 profile_id=client.profile_id,
@@ -1387,6 +1396,22 @@ async def gen_text(
                 applet_version_id=str(applet_version_id or DEFAULT_TEXT_APPLET_VERSION_ID),
             ),
         )
+        text = str(result.get("text") or "")
+        parsed = _try_parse_json_object(text) if wants_json else None
+        if wants_json and parsed is None:
+            raise RuntimeError(
+                "batchexecute_gen_text_json_parse_failed: model không trả JSON hợp lệ "
+                f"(text bắt đầu bằng: {text[:120]!r})"
+            )
+        return {
+            "text": text,
+            "json": parsed,
+            "raw": result,
+            "usage": {},
+            "model": str(model or DEFAULT_TEXT_MODEL).strip() or DEFAULT_TEXT_MODEL,
+            "thinking_level": str(thinking_level or DEFAULT_TEXT_THINKING_LEVEL),
+            "thought_signature": result.get("thought_signature"),
+        }
 
     user_text = str(prompt or "").strip()
     image_parts = _inline_image_parts(image_base64s)
