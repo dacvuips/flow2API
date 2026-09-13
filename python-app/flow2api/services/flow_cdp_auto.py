@@ -1475,24 +1475,38 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             # Google đã bỏ OAuth access_token cho Flow — credential sống hiện tại là
             # cookies + f.sid/bl/at (batchexecute). Đợi project URL xuất hiện rồi capture
             # cùng phiên với cookies vừa sync, tránh lệch session gây 401.
-            meta["step"] = "capture_batchexecute"
-            batch = await _wait_and_capture_batchexecute(page, slot_id)
-            if not batch.get("ok") and not sync.get("email") and not sync.get("token_refreshed"):
-                raise RuntimeError(
-                    batch.get("error")
-                    or sync.get("message")
-                    or "sync_incomplete — không lấy được cookies/fsid-bl-at lẫn access_token"
-                )
+            # Center chỉ dùng để giải reCAPTCHA (không nhận job/generate) — không cần
+            # tạo project Flow hay lưu fsid/bl/at, bỏ qua bước này cho role center.
+            is_center = (slot.role or "bridge") == "center"
+            batch: dict[str, Any] = {"ok": False, "skipped": "center_role"}
+            if not is_center:
+                meta["step"] = "capture_batchexecute"
+                batch = await _wait_and_capture_batchexecute(page, slot_id)
+                if not batch.get("ok") and not sync.get("email") and not sync.get("token_refreshed"):
+                    raise RuntimeError(
+                        batch.get("error")
+                        or sync.get("message")
+                        or "sync_incomplete — không lấy được cookies/fsid-bl-at lẫn access_token"
+                    )
 
-            meta["step"] = "close"
-            close = system_ops.close_flow_cdp_slot(slot_id)
+            close = None
+            if is_center:
+                # Captcha Center phải luôn có 1 tab flow.google.com/project/... sống
+                # để mint_captcha_token() gọi window.grecaptcha.enterprise.execute
+                # bất kỳ lúc nào job Gen cần — đóng Chrome ở đây sẽ làm mọi lần mint
+                # sau đó fail với no_center_available (không có auto-launch on-demand
+                # cho center như Gen). Giữ nguyên cửa sổ mở.
+                meta["step"] = "keep_open"
+            else:
+                meta["step"] = "close"
+                close = system_ops.close_flow_cdp_slot(slot_id)
 
             # Cookie/session đã ghi DB trước khi đóng — chỉ nhường process Chrome thoát
             meta["step"] = "wait_db"
             await asyncio.sleep(1.0)
 
             job_cfg = None
-            if (slot.role or "bridge") != "center":
+            if not is_center:
                 job_cfg = apply_job_parallel_for_profile(slot.profile_id())
 
             result = {
@@ -1512,8 +1526,14 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                 "job_parallel": job_cfg,
                 "message": (
                     f"Xong {slot_id} · sync OK"
-                    + (" · fsid/bl/at OK" if batch.get("ok") else " · fsid/bl/at chưa lấy được")
-                    + " · CDP đã đóng"
+                    + (
+                        " · giữ CDP mở (Captcha Center)"
+                        if is_center
+                        else (
+                            (" · fsid/bl/at OK" if batch.get("ok") else " · fsid/bl/at chưa lấy được")
+                            + " · CDP đã đóng"
+                        )
+                    )
                     + (
                         f" · Song song={job_cfg.get('max_concurrent')} · Nhận job"
                         if job_cfg and job_cfg.get("ok")
