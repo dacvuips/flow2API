@@ -374,6 +374,10 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
     return session["project_id"]
 
 
+_TRANSPORT_RETRY_ATTEMPTS = 3
+_TRANSPORT_RETRY_BACKOFF_S = 1.5
+
+
 async def _post_batchexecute_http(
     *,
     cookie_header: str,
@@ -385,7 +389,16 @@ async def _post_batchexecute_http(
 ) -> tuple[int, str]:
     """Send the batchexecute request as a plain HTTP call — no browser needed at
     all for this part, since the session cookie + f.sid/bl/at (cached in DB) plus
-    a freshly minted reCAPTCHA token are everything Google's endpoint checks."""
+    a freshly minted reCAPTCHA token are everything Google's endpoint checks.
+
+    Retries a few times on bare network/transport failures (ReadError,
+    ConnectError, timeouts — a dropped connection or transient DNS/TLS hiccup
+    talking to Google, not an account/auth problem) since those otherwise crash
+    the whole task uncleanly with an unhelpful bare exception-class name on the
+    dashboard (see worker/processor.py's "task died uncleanly" safety net).
+    Does not retry HTTP error status codes — those are handled by callers
+    inspecting `status` (401 triggers a session re-capture, etc).
+    """
     import httpx
 
     reqid = str(int(time.time() * 1000) % 9_000_000 + 1_000_000)
@@ -408,9 +421,26 @@ async def _post_batchexecute_http(
         "user-agent": _USER_AGENT,
         "x-same-domain": "1",
     }
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.post(url, content=body, headers=headers)
-        return resp.status_code, resp.text
+    last_exc: Exception | None = None
+    for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                resp = await client.post(url, content=body, headers=headers)
+                return resp.status_code, resp.text
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "batchexecute transport error (attempt %s/%s): %s — retry sau %.1fs",
+                attempt,
+                _TRANSPORT_RETRY_ATTEMPTS,
+                type(exc).__name__,
+                _TRANSPORT_RETRY_BACKOFF_S,
+            )
+            await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_S)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _decode_batchexecute_response(body_text: str, rpcid: str) -> dict[str, Any]:
