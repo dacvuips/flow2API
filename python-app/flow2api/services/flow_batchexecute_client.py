@@ -53,6 +53,11 @@ from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
 
 logger = logging.getLogger(__name__)
 
+# httpx's own request logger prints the full URL on every call (rpcids/bl/
+# f.sid/_reqid query string, very long) — muted so the short label logged
+# below (e.g. "video-start-img -> HTTP 200") is what shows up instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 _FLOW_PROJECT_URL_RE = re.compile(r"/project/([0-9a-fA-F-]{36})")
 
 # A profile can have many tasks running concurrently (e.g. several gen_image
@@ -184,6 +189,28 @@ _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
+
+# Tên ngắn gọn theo rpcid cho log — thay vì httpx tự log nguyên URL dài
+# (…/batchexecute?rpcids=…&source-path=…&bl=…&f.sid=…&_reqid=…). Đặt ở đây
+# thay vì cạnh từng RPCID_* vì dùng để tra ngược tại log-time, sau khi mọi
+# hằng số đã định nghĩa.
+_RPCID_LABELS = {
+    RPCID_GEN_IMAGE: "image-generate",
+    RPCID_UPLOAD_IMAGE: "image-upload",
+    RPCID_GET_MEDIA_URL: "media-resolve-url",
+    RPCID_GEN_R2V_VIDEO: "video-reference",
+    RPCID_GEN_T2V_VIDEO: "video-text",
+    RPCID_GEN_I2V_VIDEO: "video-start-img",
+    RPCID_GEN_I2V_FL_VIDEO: "video-start-end-img",
+    RPCID_UPSAMPLE_VIDEO: "video-upsample",
+    RPCID_UPSAMPLE_IMAGE: "image-upsample",
+    RPCID_POLL_VIDEO: "video-poll",
+    RPCID_GEN_TEXT: "text-generate",
+}
+
+
+def _rpcid_label(rpcid: str) -> str:
+    return _RPCID_LABELS.get(rpcid, rpcid)
 
 
 class BatchExecuteError(RuntimeError):
@@ -386,6 +413,7 @@ async def _post_batchexecute_http(
     session: dict[str, str],
     params_json: str,
     timeout_s: float = 60.0,
+    log_each_call: bool = True,
 ) -> tuple[int, str]:
     """Send the batchexecute request as a plain HTTP call — no browser needed at
     all for this part, since the session cookie + f.sid/bl/at (cached in DB) plus
@@ -401,6 +429,7 @@ async def _post_batchexecute_http(
     """
     import httpx
 
+    label = _rpcid_label(rpcid)
     reqid = str(int(time.time() * 1000) % 9_000_000 + 1_000_000)
     url = (
         f"{_BATCHEXECUTE_URL}?rpcids={rpcid}"
@@ -426,6 +455,13 @@ async def _post_batchexecute_http(
         try:
             async with httpx.AsyncClient(timeout=timeout_s) as client:
                 resp = await client.post(url, content=body, headers=headers)
+                if log_each_call:
+                    logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
+                else:
+                    # video-poll gọi lặp lại mỗi vài giây tới khi xong — logger
+                    # riêng của caller (poll_video_via_batchexecute) tóm tắt 1
+                    # dòng khi kết thúc thay vì spam 1 dòng mỗi lần poll.
+                    logger.debug("batchexecute %s -> HTTP %s", label, resp.status_code)
                 return resp.status_code, resp.text
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
@@ -1220,13 +1256,17 @@ async def poll_video_via_batchexecute(
 
     deadline = time.monotonic() + max_wait_s
     last_error = "timeout_waiting_for_video"
+    started = time.monotonic()
+    polls = 0
     while time.monotonic() < deadline:
+        polls += 1
         status, body_text = await _post_batchexecute_http(
             cookie_header=cookie_header,
             rpcid=RPCID_POLL_VIDEO,
             project_id=cached["project_id"],
             session=cached,
             params_json=params_json,
+            log_each_call=False,
         )
         if status != 200:
             last_error = f"http_{status}: {body_text[:300]}"
@@ -1237,15 +1277,32 @@ async def poll_video_via_batchexecute(
             else:
                 video_status = _decode_poll_video_status(decoded["data"])
                 if video_status == _VIDEO_STATUS_DONE:
+                    logger.info(
+                        "batchexecute video-poll done sau %s lần (%.1fs)",
+                        polls,
+                        time.monotonic() - started,
+                    )
                     return await resolve_media_url_via_batchexecute(
                         profile_id=profile_id, media_id=media_id
                     )
                 if video_status == _VIDEO_STATUS_FAILED:
                     reason = _decode_poll_video_failure_reason(decoded["data"])
+                    logger.info(
+                        "batchexecute video-poll failed sau %s lần (%.1fs): %s",
+                        polls,
+                        time.monotonic() - started,
+                        reason,
+                    )
                     raise BatchExecuteError(f"video_generation_failed: {reason}")
                 last_error = f"still_processing (status={video_status})"
         await asyncio.sleep(poll_interval_s)
 
+    logger.info(
+        "batchexecute video-poll timeout sau %s lần (%.1fs): %s",
+        polls,
+        time.monotonic() - started,
+        last_error,
+    )
     raise BatchExecuteError(f"poll_video_failed: {last_error}")
 
 

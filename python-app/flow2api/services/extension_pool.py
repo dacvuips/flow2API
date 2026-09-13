@@ -1475,6 +1475,7 @@ class ExtensionPool:
         credit_required: bool = False,
         request_type: str | None = None,
     ) -> list[ExtensionSession]:
+        from flow2api.services.flow_cdp_settings import is_captcha_center_profile
         from flow2api.services.flow_client import profile_accepts_request_type
         from flow2api.services.worker_settings import (
             get_profile_max_concurrent,
@@ -1484,6 +1485,10 @@ class ExtensionPool:
         out: list[ExtensionSession] = []
         for session in self.ready_sessions():
             if exclude and session.profile_id in exclude:
+                continue
+            # Captcha Center chỉ mint reCAPTCHA cho Gen khác — không bao giờ tự
+            # nhận job Image/Video, kể cả nếu dispatch_enabled bị bật nhầm qua UI.
+            if is_captcha_center_profile(session.profile_id):
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
                 continue
@@ -1563,6 +1568,7 @@ class ExtensionPool:
         request_type: str | None = None,
     ) -> Optional[str]:
         """Next profile in stable ring order; idle first; *current* only after full cycle."""
+        from flow2api.services.flow_cdp_settings import is_captcha_center_profile
         from flow2api.services.flow_client import (
             profile_accepts_request_type,
             profile_media_pick_priority,
@@ -1576,6 +1582,9 @@ class ExtensionPool:
         eligible: list[ExtensionSession] = []
         for session in self.ready_sessions():
             if session.profile_id.startswith("_"):
+                continue
+            # Captcha Center không tự nhận job Image/Video — xem _sessions_with_capacity.
+            if is_captcha_center_profile(session.profile_id):
                 continue
             if not is_profile_dispatch_enabled(session.profile_id):
                 continue
