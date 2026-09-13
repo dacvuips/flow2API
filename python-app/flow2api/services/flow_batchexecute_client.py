@@ -375,7 +375,7 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
 
 
 _TRANSPORT_RETRY_ATTEMPTS = 3
-_TRANSPORT_RETRY_BACKOFF_S = 1.5
+_TRANSPORT_RETRY_BACKOFF_S = 3.0
 
 
 async def _post_batchexecute_http(

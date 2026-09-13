@@ -16,6 +16,7 @@ so pairing it with tokens minted here lets Gen CDP stay closed most of the time.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from flow2api.services import system_ops
@@ -24,6 +25,12 @@ from flow2api.services.flow_cdp_settings import list_flow_cdp_slots
 logger = logging.getLogger(__name__)
 
 _RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+
+# Nhiều job Gen mint captcha đồng thời qua cùng Center → mỗi job tự
+# connect_over_cdp riêng, không khoá tuần tự → nhiều lần navigate/goto chồng
+# nhau trên cùng browser gây tích tụ tab flow.google.com dư (Flow SPA tự mở
+# tab mới khi phát hiện điều hướng chồng chéo). Khoá 1 mint tại một thời điểm.
+_MINT_LOCK = asyncio.Lock()
 
 
 class CaptchaCenterError(RuntimeError):
@@ -85,6 +92,11 @@ async def mint_captcha_token(*, action: str) -> str:
     markers between mints otherwise accumulate and depress the risk score.
     """
     _require_playwright()
+    async with _MINT_LOCK:
+        return await _mint_captcha_token_locked(action=action)
+
+
+async def _mint_captcha_token_locked(*, action: str) -> str:
     slot = _pick_center_slot()
     if not slot:
         raise CaptchaCenterError(
@@ -98,6 +110,19 @@ async def mint_captcha_token(*, action: str) -> str:
         browser = await pw.chromium.connect_over_cdp(slot.cdp_url())
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await _find_project_page(context)
+
+        # Dọn tab flow.google.com dư tích tụ từ các lần mint/navigate trước —
+        # chỉ giữ tab đang dùng, tránh cửa sổ Center phình to theo thời gian.
+        if len(context.pages) > 1:
+            for extra in list(context.pages):
+                if extra is page:
+                    continue
+                if "flow.google.com" not in (extra.url or ""):
+                    continue
+                try:
+                    await extra.close()
+                except Exception:
+                    pass
 
         token = await page.evaluate(
             """async ({ siteKey, action, timeoutMs }) => {
