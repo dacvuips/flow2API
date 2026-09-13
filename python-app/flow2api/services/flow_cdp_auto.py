@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -109,7 +110,7 @@ def _slots_with_email() -> list[dict[str, Any]]:
 
 
 def _profile_token_meta(profile_id: str) -> dict[str, Any]:
-    from flow2api.services.flow_profile_service import token_public_fields
+    from flow2api.services.flow_profile_service import token_public_fields, get_batchexecute_session
     from flow2api.services.worker_settings import is_profile_dispatch_enabled
     from flow2api.services.extension_pool import get_extension_pool
 
@@ -137,12 +138,17 @@ def _profile_token_meta(profile_id: str) -> dict[str, Any]:
     rem_real = meta.get("token_remaining_seconds_real")
     if rem_real is None:
         rem_real = rem
+    # Google đã bỏ OAuth access_token cho Flow — credential sống chính là cookies +
+    # f.sid/bl/at (batchexecute). Có session này thì coi slot "khỏe" dù access_token
+    # (legacy) đã hết/missing, tránh scheduler liên tục mở lại slot vẫn dùng tốt.
+    has_batch_session = bool(pid and get_batchexecute_session(pid))
     return {
         "token_remaining_seconds": rem,
         "token_remaining_seconds_real": rem_real,
         "token_hours_left": meta.get("token_hours_left"),
         "token_status": meta.get("token_status"),
         "access_token_expires_at": meta.get("access_token_expires_at"),
+        "has_batch_session": has_batch_session,
         "dispatch_enabled": dispatch,
         "accepting_jobs": accepting,
         # Standby = có trong danh sách auto nhưng đang ngưng nhận job → sẵn sàng được mở khi lỗi tài khoản
@@ -269,7 +275,15 @@ def _is_cycle_busy(slot_id: str) -> bool:
 
 
 def _slot_token_dead(s: dict[str, Any]) -> bool:
-    """True nếu token DB coi như hết / không dùng được cho gen."""
+    """True nếu profile không còn credential dùng được để gen.
+
+    Credential sống hiện tại là cookies + f.sid/bl/at (batchexecute) — có
+    `has_batch_session` thì coi là khỏe dù access_token OAuth (legacy, Google
+    đã ngừng cấp cho Flow) báo expired/missing. Chỉ fallback về access_token
+    TTL cho slot chưa từng capture batchexecute session (mới thêm / chưa auto).
+    """
+    if s.get("has_batch_session"):
+        return False
     status = str(s.get("token_status") or "").strip().lower()
     if status in ("expired", "missing", "no-session"):
         return True
@@ -1175,6 +1189,89 @@ async def _flow_session_ready(page) -> bool:
     return False
 
 
+_PROJECT_URL_RE = re.compile(r"/project/([0-9a-fA-F-]{36})")
+
+
+async def _read_wiz_session(page) -> dict[str, str] | None:
+    """Read the f.sid/bl/at triple Flow's own JS embeds (window.WIZ_global_data).
+
+    Same fields flow_batchexecute_client.py reads to authenticate batchexecute
+    RPC calls — Google stopped issuing OAuth access_token for Flow, so this
+    triple (plus session cookies) is now the only living generate credential.
+    """
+    try:
+        wiz = await page.evaluate(
+            """() => {
+                const d = window.WIZ_global_data || {};
+                return { fsid: d['FdrFJe'], bl: d['cfb2h'], at: d['SNlM0e'] };
+            }"""
+        )
+    except Exception:
+        return None
+    fsid, bl, at = (wiz or {}).get("fsid"), (wiz or {}).get("bl"), (wiz or {}).get("at")
+    if not fsid or not bl or not at:
+        return None
+    return {"fsid": str(fsid), "bl": str(bl), "at": str(at)}
+
+
+async def _capture_batchexecute_from_page(slot_id: str, page) -> dict[str, Any]:
+    """Sau khi vào project Flow (URL có /project/<uuid>): đọc fsid/bl/at, lưu DB.
+
+    Cookies đã được `sync_session` lưu cùng lúc trong cycle này (same page/context),
+    nên cookie + fsid/bl/at khớp cùng một phiên — tránh lỗi 401 do mix session cũ/mới.
+    """
+    from flow2api.services.flow_profile_service import save_batchexecute_session
+
+    try:
+        url = str(page.url or "")
+    except Exception:
+        url = ""
+    m = _PROJECT_URL_RE.search(url)
+    if not m:
+        return {"ok": False, "error": "no_project_in_url", "url": url}
+    project_id = m.group(1)
+
+    wiz = await _read_wiz_session(page)
+    if not wiz:
+        return {"ok": False, "error": "missing_wiz_global_data"}
+
+    slot = get_flow_cdp_slot(slot_id)
+    pid = slot.profile_id() if slot else slot_id
+    save_batchexecute_session(
+        pid,
+        project_id=project_id,
+        fsid=wiz["fsid"],
+        bl=wiz["bl"],
+        at=wiz["at"],
+    )
+    return {"ok": True, "project_id": project_id, **wiz}
+
+
+async def _wait_and_capture_batchexecute(
+    page, slot_id: str, *, timeout_s: float = 15.0
+) -> dict[str, Any]:
+    """Đợi tab vào project (URL /project/<uuid>) rồi capture fsid/bl/at.
+
+    Sau khi bấm «Dự án mới» URL cần một nhịp để chuyển sang /project/<uuid>;
+    profile đã có project sẵn có thể đã ở đó ngay. Không raise — cycle vẫn
+    được coi thành công nếu cookies đã sync (batch capture thất bại chỉ log).
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last: dict[str, Any] = {"ok": False, "error": "timeout"}
+    while True:
+        last = await _capture_batchexecute_from_page(slot_id, page)
+        if last.get("ok"):
+            return last
+        if time.monotonic() >= deadline:
+            _log(
+                "info",
+                f"{slot_id}: chưa lấy được fsid/bl/at ({last.get('error')})",
+                slot_id=slot_id,
+            )
+            return last
+        await page.wait_for_timeout(300)
+
+
 _CREATE_CTA_TEXTS = [
     "Create with Google Flow",
     "Tạo bằng Google Flow",
@@ -1374,13 +1471,23 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             sync = await sync_session(slot_id, page=page, context=context, skip_goto=True)
             if not sync.get("ok"):
                 raise RuntimeError(sync.get("message") or sync.get("error") or "sync_failed")
-            if not sync.get("email") and not sync.get("token_refreshed"):
-                raise RuntimeError(sync.get("message") or "sync_incomplete")
+
+            # Google đã bỏ OAuth access_token cho Flow — credential sống hiện tại là
+            # cookies + f.sid/bl/at (batchexecute). Đợi project URL xuất hiện rồi capture
+            # cùng phiên với cookies vừa sync, tránh lệch session gây 401.
+            meta["step"] = "capture_batchexecute"
+            batch = await _wait_and_capture_batchexecute(page, slot_id)
+            if not batch.get("ok") and not sync.get("email") and not sync.get("token_refreshed"):
+                raise RuntimeError(
+                    batch.get("error")
+                    or sync.get("message")
+                    or "sync_incomplete — không lấy được cookies/fsid-bl-at lẫn access_token"
+                )
 
             meta["step"] = "close"
             close = system_ops.close_flow_cdp_slot(slot_id)
 
-            # Cookie/token đã ghi DB trước khi đóng — chỉ nhường process Chrome thoát
+            # Cookie/session đã ghi DB trước khi đóng — chỉ nhường process Chrome thoát
             meta["step"] = "wait_db"
             await asyncio.sleep(1.0)
 
@@ -1400,10 +1507,13 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                     "token_refreshed": sync.get("token_refreshed"),
                     "cookies_count": sync.get("cookies_count"),
                 },
+                "batchexecute": batch,
                 "close": close,
                 "job_parallel": job_cfg,
                 "message": (
-                    f"Xong {slot_id} · sync OK · CDP đã đóng"
+                    f"Xong {slot_id} · sync OK"
+                    + (" · fsid/bl/at OK" if batch.get("ok") else " · fsid/bl/at chưa lấy được")
+                    + " · CDP đã đóng"
                     + (
                         f" · Song song={job_cfg.get('max_concurrent')} · Nhận job"
                         if job_cfg and job_cfg.get("ok")
@@ -1566,27 +1676,16 @@ async def _check_expired_receiving_gens() -> None:
         watch_key = f"expired_watch:{pid}"
         if _fail_cooldown_until.get(watch_key, 0) > now:
             continue
-        status = str(s.get("token_status") or "").strip().lower()
-        rem = s.get("token_remaining_seconds_real")
-        if rem is None:
-            rem = s.get("token_remaining_seconds")
-        try:
-            rem_n = float(rem) if rem is not None else None
-        except (TypeError, ValueError):
-            rem_n = None
-        expired = status in ("expired", "missing", "no-session") or (
-            rem_n is not None and rem_n <= 0
-        )
-        if not expired:
+        if not _slot_token_dead(s):
             continue
         # Chống spam: 2 phút / profile
         _fail_cooldown_until[watch_key] = now + 120.0
+        status = str(s.get("token_status") or "").strip().lower()
         _log(
             "info",
             (
                 f"token_expired (canh lịch): {sid} ({s.get('email') or pid}) "
-                f"status={status or '—'} rem={rem_n if rem_n is not None else '—'} "
-                f"→ Ngừng job + mở CDP kế"
+                f"status={status or '—'} → Ngừng job + mở CDP kế"
             ),
             slot_id=sid,
         )
