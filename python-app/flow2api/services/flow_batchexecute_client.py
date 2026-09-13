@@ -414,6 +414,7 @@ async def _post_batchexecute_http(
     params_json: str,
     timeout_s: float = 60.0,
     log_each_call: bool = True,
+    applet_id: str = "",
 ) -> tuple[int, str]:
     """Send the batchexecute request as a plain HTTP call — no browser needed at
     all for this part, since the session cookie + f.sid/bl/at (cached in DB) plus
@@ -431,9 +432,16 @@ async def _post_batchexecute_http(
 
     label = _rpcid_label(rpcid)
     reqid = str(int(time.time() * 1000) % 9_000_000 + 1_000_000)
+    source_path = f"/project/{project_id}"
+    if applet_id:
+        # Applet-scoped rpcs (e.g. agJzFb/gen_text "Prop Writer" tool) are
+        # called from a /project/<id>/tool/<appletId>?mode=APP page — Google
+        # rejects (rpc_error [3]) without the /tool/<appletId> suffix here,
+        # verified from a live capture.
+        source_path += f"/tool/{applet_id}"
     url = (
         f"{_BATCHEXECUTE_URL}?rpcids={rpcid}"
-        f"&source-path={urllib.parse.quote('/project/' + project_id)}"
+        f"&source-path={urllib.parse.quote(source_path)}"
         f"&bl={urllib.parse.quote(session['bl'])}&f.sid={urllib.parse.quote(session['fsid'])}"
         f"&hl=en-US&_reqid={reqid}&rt=c"
     )
@@ -1615,6 +1623,23 @@ async def upsample_image_via_batchexecute(
     return _decode_upsample_image_response(body_text)
 
 
+def _build_gen_text_image_part(image_base64: str) -> list[Any] | None:
+    """One image element of the contents array: [null, [mimeType, rawBase64]]."""
+    s = str(image_base64 or "").strip()
+    if not s:
+        return None
+    mime = "image/jpeg"
+    if s.startswith("data:"):
+        head = s.split(",", 1)[0]
+        part = head.split(";", 1)[0]
+        if part.startswith("data:") and len(part) > 5:
+            mime = part[5:] or mime
+    data = _strip_data_url(s).strip()
+    if not data:
+        return None
+    return [None, [mime, data]]
+
+
 def _build_gen_text_params(
     *,
     prompt: str,
@@ -1623,13 +1648,16 @@ def _build_gen_text_params(
     applet_id: str,
     applet_version_id: str,
     recaptcha_token: str,
+    image_base64s: list[str] | None = None,
 ) -> str:
     """Build params for RPCID_GEN_TEXT (Gemini text generation, the "Prop
     Writer" tool). Field order verified from a live capture — a flat
     16-element positional array, mostly null:
     [0] modelName
     [1..8] null (unused/reserved)
-    [9] contents = [[[[promptText]], "user"]]
+    [9] contents = [[[[promptText], imagePart, imagePart, ...], "user"]]
+        — each imagePart is [null, [mimeType, rawBase64]], appended in order
+        right after the prompt element (verified from a 3-image live capture).
     [10] null
     [11] systemInstruction = [[[sysText]]]
     [12] [null, null, thinkingLevelCode] — only level 2 observed so far
@@ -1639,7 +1667,12 @@ def _build_gen_text_params(
     """
     params: list[Any] = [None] * 16
     params[0] = model
-    params[9] = [[[[prompt]], "user"]]
+    content_items: list[Any] = [[prompt]]
+    for raw in image_base64s or []:
+        part = _build_gen_text_image_part(raw)
+        if part is not None:
+            content_items.append(part)
+    params[9] = [[content_items, "user"]]
     if system_instruction:
         params[11] = [[[system_instruction]]]
     params[12] = [None, None, 2]
@@ -1673,15 +1706,17 @@ async def gen_text_via_batchexecute(
     model: str = DEFAULT_TEXT_MODEL_BE,
     applet_id: str,
     applet_version_id: str,
+    image_base64s: list[str] | None = None,
 ) -> dict[str, Any]:
     """Generate text via Gemini (the "Prop Writer" tool's batchexecute rpc).
 
     Unlike the other batchexecute calls, this one is scoped to a specific
     applet/tool instance (`applet_id`/`applet_version_id`), not a project —
     verified from a live capture on a /project/<id>/tool/<appletId>?mode=APP
-    page. Only plain text-in/text-out has been captured so far — no
-    image/audio input, JSON schema, or multi-turn contents support yet (those
-    would need their own captures to get the field shapes right).
+    page. Image input (`image_base64s`) is supported and verified from a
+    live 3-image capture; audio input, JSON schema, or multi-turn contents
+    still aren't (those would need their own captures to get the field
+    shapes right).
     """
     from flow2api.services.flow_captcha_center import mint_captcha_token
     from flow2api.services.flow_profile_service import get_batchexecute_session
@@ -1703,6 +1738,7 @@ async def gen_text_via_batchexecute(
         applet_id=applet_id,
         applet_version_id=applet_version_id,
         recaptcha_token=recaptcha_token,
+        image_base64s=image_base64s,
     )
 
     status, body_text = await _post_batchexecute_http(
@@ -1712,6 +1748,7 @@ async def gen_text_via_batchexecute(
         session=cached,
         params_json=params_json,
         timeout_s=120.0,
+        applet_id=applet_id,
     )
     if status != 200:
         raise BatchExecuteError(f"http_{status}: {body_text[:300]}")

@@ -1353,11 +1353,12 @@ async def gen_text(
     Text generation via aisandbox-pa ``/v1/flow:generateContent``
     (Gemini text / vision / audio on Flow — screenplay, image or audio analysis).
     """
-    # CDP-only lane — see gen_image's comment for why. Only plain text-in/
-    # text-out plus JSON-schema output has been captured over batchexecute so
-    # far — no multi-turn contents or image/audio input (those would need
-    # their own captures to get the field shapes right). Reject those
-    # explicitly rather than silently ignoring them.
+    # CDP-only lane — see gen_image's comment for why. Image input is
+    # supported (verified from a live 3-image capture, 2026-09-13) — each
+    # image is appended as its own [null,[mimeType,base64]] element right
+    # after the prompt in the contents array. Multi-turn contents / audio
+    # input still aren't captured, so those are rejected explicitly rather
+    # than silently ignored.
     #
     # JSON schema: verified from a live capture (2026-09-13) that Flow's own
     # "Prop Writer" tool has NO dedicated responseSchema/generationConfig
@@ -1366,9 +1367,9 @@ async def gen_text(
     # this structure: {...}") and parses the model's text output itself. So
     # this lane does the same instead of rejecting schema/force_json/mime.
     if not client.flow_key:
-        if contents or image_base64s or audio_base64s:
+        if contents or audio_base64s:
             raise RuntimeError(
-                "batchexecute_gen_text_unsupported: multi-turn contents / image / audio "
+                "batchexecute_gen_text_unsupported: multi-turn contents / audio "
                 "input chưa hỗ trợ cho profile không có access_token."
             )
         from flow2api.services.flow_batchexecute_client import gen_text_via_batchexecute
@@ -1385,6 +1386,8 @@ async def gen_text(
             )
             sys_text = (sys_text + schema_hint).strip()
 
+        images = [str(b64) for b64 in (image_base64s or []) if b64][:TEXT_MAX_IMAGES]
+
         result = await _call_with_401_retry(
             client.profile_id,
             lambda: gen_text_via_batchexecute(
@@ -1394,6 +1397,7 @@ async def gen_text(
                 model=str(model or DEFAULT_TEXT_MODEL).strip() or DEFAULT_TEXT_MODEL,
                 applet_id=str(applet_id or DEFAULT_TEXT_APPLET_ID),
                 applet_version_id=str(applet_version_id or DEFAULT_TEXT_APPLET_VERSION_ID),
+                image_base64s=images,
             ),
         )
         text = str(result.get("text") or "")
