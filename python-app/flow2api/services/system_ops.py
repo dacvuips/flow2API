@@ -896,8 +896,11 @@ def _cdp_load_unpacked_extension(cdp_url: str, ext_path: str | Path) -> dict[str
 def launch_flow_cdp_slot(slot_id: str, *, start_url: str | None = None) -> dict[str, Any]:
     """Open Chrome CDP for one Flow pool slot (dedicated user-data under flow_cdp_slots/).
 
-    Extension chỉ gắn cho CDP Captcha Center. CDP Gen (bridge) chỉ cần cookie/token
-    qua Sync — không load extension.
+    Extension không còn được gắn cho bất kỳ role nào (kể cả Captcha Center) —
+    luồng batchexecute mới tự mint reCAPTCHA + tự sync cookies qua Playwright
+    (flow_captcha_center.py / flow_cdp_control.py) trực tiếp trên CDP tab, nên
+    extension's long-poll/tab-management (center-loop.js) chỉ còn tranh chấp
+    cùng trang/tab và tự tạo thêm tab flow.google.com/about — đã bị bỏ.
     """
     from flow2api.services.flow_cdp_settings import get_flow_cdp_slot
 
@@ -913,22 +916,12 @@ def launch_flow_cdp_slot(slot_id: str, *, start_url: str | None = None) -> dict[
     user_data.mkdir(parents=True, exist_ok=True)
     cdp_url = slot.cdp_url()
     port = int(slot.port)
-    # Chỉ Captcha Center cần extension; Gen CDP sync cookie rồi gen Direct HTTP.
-    need_extension = (slot.role or "bridge") == "center"
-    ext_dir = _staged_flow_extension_dir() if need_extension else None
+    need_extension = False
+    ext_dir = None
 
     if cdp_endpoint_alive(cdp_url):
         ext_load = None
-        if need_extension and ext_dir:
-            ext_load = _cdp_load_unpacked_extension(cdp_url, ext_dir)
-        already_msg = f"Flow CDP {slot.id} đã chạy tại {cdp_url}."
-        if need_extension:
-            if ext_load and ext_load.get("ok"):
-                already_msg += " Extension OK."
-            elif ext_load:
-                already_msg += f" Extension lỗi: {ext_load.get('error')}"
-        else:
-            already_msg += " (Gen — không gắn extension)."
+        already_msg = f"Flow CDP {slot.id} đã chạy tại {cdp_url} (không gắn extension)."
         return {
             "ok": True,
             "already_running": True,
@@ -996,21 +989,8 @@ def launch_flow_cdp_slot(slot_id: str, *, start_url: str | None = None) -> dict[
             time.sleep(1.0)
             ext_load = _cdp_load_unpacked_extension(cdp_url, ext_dir)
 
-    role_hint = "Captcha Center" if need_extension else "Gen"
-    if need_extension:
-        if alive and ext_load and ext_load.get("ok"):
-            ext_msg = " Extension đã cài (CDP). Mở popup chọn mode Captcha Center."
-        elif alive and ext_dir and ext_load and not ext_load.get("ok"):
-            ext_msg = (
-                f" Extension chưa load được: {ext_load.get('error')}. "
-                "Thử đóng CDP rồi Mở lại, hoặc Load unpacked thủ công từ storage/flow_cdp_extension."
-            )
-        elif alive and not ext_dir:
-            ext_msg = " (Không tìm thấy thư mục extension — set FLOW2API_EXTENSION)."
-        else:
-            ext_msg = ""
-    else:
-        ext_msg = " Sync cookie/token để gen Direct HTTP (không cần extension)." if alive else ""
+    role_hint = "Captcha Center" if (slot.role or "bridge") == "center" else "Gen"
+    ext_msg = " Sync cookie/session (fsid/bl/at) — không cần extension." if alive else ""
     return {
         "ok": alive,
         "slot_id": slot.id,
