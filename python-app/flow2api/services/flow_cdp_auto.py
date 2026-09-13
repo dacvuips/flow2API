@@ -1436,6 +1436,26 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = context.pages[0] if context.pages else await context.new_page()
 
+            # Đóng bớt tab dư (tích lũy khi Chrome mở lại trước khi tiến trình cũ
+            # thoát hẳn — Browser.close CDP không đợi OS process thoát, launch kế
+            # tiếp gộp thêm tab thay vì cửa sổ sạch) — chỉ giữ tab đang dùng.
+            if len(context.pages) > 1:
+                extra_closed = 0
+                for extra in list(context.pages):
+                    if extra is page:
+                        continue
+                    try:
+                        await extra.close()
+                        extra_closed += 1
+                    except Exception:
+                        pass
+                if extra_closed:
+                    _log(
+                        "info",
+                        f"{slot_id}: đã đóng {extra_closed} tab dư (Chrome mở chồng)",
+                        slot_id=slot_id,
+                    )
+
             meta["step"] = "clear_cookies"
             # Xóa toàn bộ cookie Flow trước — không đụng Google login
             cleared = await _clear_synced_cookies(context, slot_id)
