@@ -411,6 +411,10 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
 
 _TRANSPORT_RETRY_ATTEMPTS = 3
 _TRANSPORT_RETRY_BACKOFF_S = 3.0
+# Kết nối không lên được (DNS/refused/mạng chết) nên fail nhanh — không cần
+# chờ hết timeout_s (60-120s) như timeout đọc dữ liệu thực sự. Tách riêng để
+# 1 lần retry tốn tối đa ~10s thay vì cả timeout_s khi ConnectError lặp lại.
+_CONNECT_TIMEOUT_S = 10.0
 
 _shared_http_client: Any = None
 _shared_http_client_lock: asyncio.Lock | None = None
@@ -496,7 +500,12 @@ async def _post_batchexecute_http(
     last_exc: Exception | None = None
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
         try:
-            resp = await client.post(url, content=body, headers=headers, timeout=timeout_s)
+            resp = await client.post(
+                url,
+                content=body,
+                headers=headers,
+                timeout=httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT_S),
+            )
             if log_each_call:
                 logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
             else:
