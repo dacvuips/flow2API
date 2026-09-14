@@ -1421,10 +1421,12 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
         },
     )
 
+    launch_failed = False
     try:
         meta["step"] = "launch"
         launch = system_ops.launch_flow_cdp_slot(slot_id, start_url=flow_url)
         if not launch.get("ok"):
+            launch_failed = True
             raise RuntimeError(launch.get("message") or launch.get("error") or "launch_failed")
 
         meta["step"] = "attach"
@@ -1570,10 +1572,16 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                 pass
     except Exception as exc:
         _log("error", f"{slot_id}: {exc}", slot_id=slot_id)
-        try:
-            system_ops.close_flow_cdp_slot(slot_id)
-        except Exception:
-            pass
+        # Chỉ đóng CDP khi launch thất bại (chưa có Chrome sống để giữ).
+        # Lỗi giữa cycle (sync/capture timeout, Cloudflare, chưa login xong...)
+        # là tạm thời — đóng CDP ở đây tạo vòng lặp mở/đóng liên tục vì
+        # ensure_gen_slots_for_parallel sẽ mở lại ngay sau cooldown rồi lỗi
+        # tiếp nếu nguyên nhân gốc còn. Giữ Chrome mở để cycle/refresh sau retry.
+        if launch_failed:
+            try:
+                system_ops.close_flow_cdp_slot(slot_id)
+            except Exception:
+                pass
         return {"ok": False, "slot_id": slot_id, "error": str(exc)}
     finally:
         _running.pop(slot_id, None)
