@@ -71,6 +71,9 @@ _MAX_LOGS = 80
 _fail_cooldown_until: dict[str, float] = {}  # slot_id -> unix ts
 _FAIL_COOLDOWN_S = 15 * 60
 _success_cooldown_until: dict[str, float] = {}  # slot_id -> unix ts (sau sync thành công)
+_gen_last_fsid_refresh: dict[str, float] = {}  # slot_id -> unix ts lần reload fsid gần nhất
+_FSID_REFRESH_INTERVAL_S = 5 * 60
+_fsid_refresh_inflight: set[str] = set()
 
 
 def _log(level: str, message: str, **extra: Any) -> None:
@@ -1509,21 +1512,18 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                         or "sync_incomplete — không lấy được cookies/fsid-bl-at lẫn access_token"
                     )
 
+            # Giữ CDP mở cho cả Gen lẫn Center — không đóng Chrome sau sync nữa.
+            # Center cần tab sống để mint_captcha_token(); Gen giữ mở để
+            # _fsid_refresh_loop tự reload định kỳ lấy fsid/bl/at mới, tránh
+            # hết hạn fsid mà không phải mở lại CDP + clear cookie từ đầu.
             close = None
-            if is_center:
-                # Captcha Center phải luôn có 1 tab flow.google.com/project/... sống
-                # để mint_captcha_token() gọi window.grecaptcha.enterprise.execute
-                # bất kỳ lúc nào job Gen cần — đóng Chrome ở đây sẽ làm mọi lần mint
-                # sau đó fail với no_center_available (không có auto-launch on-demand
-                # cho center như Gen). Giữ nguyên cửa sổ mở.
-                meta["step"] = "keep_open"
-            else:
-                meta["step"] = "close"
-                close = system_ops.close_flow_cdp_slot(slot_id)
+            meta["step"] = "keep_open"
+            if not is_center:
+                _gen_last_fsid_refresh[slot_id] = time.time()
 
-            # Cookie/session đã ghi DB trước khi đóng — chỉ nhường process Chrome thoát
+            # Cookie/session đã ghi DB — không cần chờ Chrome thoát nữa
             meta["step"] = "wait_db"
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.2)
 
             job_cfg = None
             if not is_center:
@@ -1551,7 +1551,7 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                         if is_center
                         else (
                             (" · fsid/bl/at OK" if batch.get("ok") else " · fsid/bl/at chưa lấy được")
-                            + " · CDP đã đóng"
+                            + " · giữ CDP mở (tự reload lấy fsid mới ~5p)"
                         )
                     )
                     + (
@@ -1735,6 +1735,92 @@ async def _check_expired_receiving_gens() -> None:
             _log("error", f"token_expired watch {sid}: {exc}", slot_id=sid)
 
 
+async def _refresh_fsid_for_slot(slot_id: str) -> dict[str, Any]:
+    """Reload page trên CDP Gen đang mở để lấy fsid/bl/at mới (không clear cookie/UI click).
+
+    CDP không còn bị đóng sau mỗi cycle sync — cookies vẫn sống trong Chrome,
+    chỉ có window.WIZ_global_data (fsid) hết hạn theo thời gian. Reload lại
+    trang project hiện tại là đủ để Flow tự cấp fsid mới cùng session cookie.
+    """
+    slot = get_flow_cdp_slot(slot_id)
+    if not slot:
+        return {"ok": False, "error": "slot_not_found"}
+    if not system_ops.cdp_endpoint_alive(slot.cdp_url()):
+        return {"ok": False, "error": "cdp_unreachable"}
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        return {"ok": False, "error": f"playwright_not_installed: {exc}"}
+
+    pw = await async_playwright().start()
+    try:
+        browser = await pw.chromium.connect_over_cdp(slot.cdp_url())
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            await page.reload(wait_until="commit", timeout=45_000)
+        except Exception as exc:
+            return {"ok": False, "error": f"reload_failed: {exc}"}
+        await _wait_session_or_timeout(page, timeout_s=10.0)
+        result = await _wait_and_capture_batchexecute(page, slot_id, timeout_s=15.0)
+        return result
+    finally:
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+
+
+async def _refresh_expired_fsid_gens() -> None:
+    """Mỗi ~5 phút: reload CDP Gen đang mở (accepting) để lấy fsid/bl/at mới.
+
+    Chỉ áp dụng cho slot còn CDP sống + không đang trong 1 cycle mở/sync khác
+    (tránh đụng độ connect_over_cdp / clear cookie).
+    """
+    now = time.time()
+    for s in ordered_auto_slots():
+        if not s.get("enabled"):
+            continue
+        if (s.get("role") or "bridge") == "center":
+            continue
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        if _is_cycle_busy(sid) or sid in _fsid_refresh_inflight:
+            continue
+        last = _gen_last_fsid_refresh.get(sid, 0.0)
+        if now - last < _FSID_REFRESH_INTERVAL_S:
+            continue
+        slot = get_flow_cdp_slot(sid)
+        if not slot or not system_ops.cdp_endpoint_alive(slot.cdp_url()):
+            continue
+        _gen_last_fsid_refresh[sid] = now
+        _fsid_refresh_inflight.add(sid)
+
+        async def _run(slot_id: str = sid) -> None:
+            try:
+                result = await _refresh_fsid_for_slot(slot_id)
+                if result.get("ok"):
+                    _log("info", f"{slot_id}: reload lấy fsid mới OK", slot_id=slot_id)
+                else:
+                    _log(
+                        "info",
+                        f"{slot_id}: reload lấy fsid mới thất bại ({result.get('error')})",
+                        slot_id=slot_id,
+                    )
+            except Exception as exc:
+                _log("error", f"{slot_id}: refresh fsid exception: {exc}", slot_id=slot_id)
+            finally:
+                _fsid_refresh_inflight.discard(slot_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_run())
+        except RuntimeError:
+            _fsid_refresh_inflight.discard(sid)
+
+
 async def _scheduler_tick() -> None:
     """Scheduler: canh token hết hạn trên Gen đang nhận job → mở CDP kế + bù song song."""
     cfg = get_flow_cdp_auto_settings()
@@ -1745,6 +1831,7 @@ async def _scheduler_tick() -> None:
         if until <= now:
             _fail_cooldown_until.pop(sid, None)
     await _check_expired_receiving_gens()
+    await _refresh_expired_fsid_gens()
     # Bù số Gen nếu < Song song Gen CDP (token chết lặng / restart / miss fill)
     try:
         ensure_gen_slots_for_parallel(reason="scheduler_tick")
