@@ -97,6 +97,36 @@ async def _call_with_401_retry(profile_id: str, call: Any) -> Any:
                 f"still_failing_after_recapture profile={profile_id[:12]}: {retry_exc}"
             ) from retry_exc
 
+
+_MEDIA_NOT_FOUND_RETRY_DELAYS_S = (1.5, 3.0)
+
+
+async def _retry_media_not_found(profile_id: str, call: Any) -> Any:
+    """Retry a batchexecute video-gen call a couple of times on `rpc_error: [5]`
+    (Google's bare gRPC NOT_FOUND) right after an image upload — the just-uploaded
+    startImage/referenceImage media id isn't always indexed yet on Google's side
+    by the time the video-gen call references it, so the very next call can 404
+    even though the upload itself returned HTTP 200.
+    """
+    from flow2api.services.flow_batchexecute_client import BatchExecuteError
+
+    last_exc: BatchExecuteError | None = None
+    for attempt, delay in enumerate((0.0, *_MEDIA_NOT_FOUND_RETRY_DELAYS_S)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await call()
+        except BatchExecuteError as exc:
+            if "rpc_error: [5]" not in str(exc):
+                raise
+            last_exc = exc
+            logger.info(
+                "batchexecute media not found (likely not indexed yet) profile=%s attempt=%d — retrying",
+                profile_id[:12],
+                attempt + 1,
+            )
+    raise last_exc
+
 IMAGE_MODELS = {
     "NANO_BANANA_PRO": "GEM_PIX_2",
     "NANO_BANANA_2": "NARWHAL",
@@ -2178,13 +2208,16 @@ async def gen_video_start_image(
         )
 
         async def _do() -> dict:
-            media_id = await gen_i2v_video_via_batchexecute(
-                profile_id=client.profile_id,
-                project_id=project_id,
-                prompt=prompt,
-                start_media_id=start_media_id,
-                aspect_ratio=aspect_ratio,
-                duration_s=duration_s,
+            media_id = await _retry_media_not_found(
+                client.profile_id,
+                lambda: gen_i2v_video_via_batchexecute(
+                    profile_id=client.profile_id,
+                    project_id=project_id,
+                    prompt=prompt,
+                    start_media_id=start_media_id,
+                    aspect_ratio=aspect_ratio,
+                    duration_s=duration_s,
+                ),
             )
             url = await poll_video_via_batchexecute(
                 profile_id=client.profile_id, media_id=media_id
@@ -2229,14 +2262,17 @@ async def gen_video_start_end_image(
         )
 
         async def _do() -> dict:
-            media_id = await gen_i2v_fl_video_via_batchexecute(
-                profile_id=client.profile_id,
-                project_id=project_id,
-                prompt=prompt,
-                start_media_id=start_media_id,
-                end_media_id=end_media_id,
-                aspect_ratio=aspect_ratio,
-                duration_s=duration_s,
+            media_id = await _retry_media_not_found(
+                client.profile_id,
+                lambda: gen_i2v_fl_video_via_batchexecute(
+                    profile_id=client.profile_id,
+                    project_id=project_id,
+                    prompt=prompt,
+                    start_media_id=start_media_id,
+                    end_media_id=end_media_id,
+                    aspect_ratio=aspect_ratio,
+                    duration_s=duration_s,
+                ),
             )
             url = await poll_video_via_batchexecute(
                 profile_id=client.profile_id, media_id=media_id
@@ -2289,14 +2325,17 @@ async def gen_multi_image_video(
         )
 
         async def _do() -> dict:
-            media_id = await gen_r2v_video_via_batchexecute(
-                profile_id=client.profile_id,
-                project_id=project_id,
-                prompt=prompt,
-                reference_media_ids=reference_media_ids,
-                aspect_ratio=aspect_ratio,
-                voice=voice_id or None,
-                duration_s=duration_s,
+            media_id = await _retry_media_not_found(
+                client.profile_id,
+                lambda: gen_r2v_video_via_batchexecute(
+                    profile_id=client.profile_id,
+                    project_id=project_id,
+                    prompt=prompt,
+                    reference_media_ids=reference_media_ids,
+                    aspect_ratio=aspect_ratio,
+                    voice=voice_id or None,
+                    duration_s=duration_s,
+                ),
             )
             url = await poll_video_via_batchexecute(
                 profile_id=client.profile_id, media_id=media_id
