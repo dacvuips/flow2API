@@ -746,16 +746,21 @@ def _build_gen_r2v_video_params(
     prompt: str,
     reference_media_ids: list[str],
     model_key: str,
+    aspect_ratio: str,
     recaptcha_token: str,
     voice: str | None = None,
 ) -> str:
     """Build params for RPCID_GEN_R2V_VIDEO ("Video Thành Phần" — reference
     images, no start/end frame). Field order verified from a live capture:
-    item = [promptWrapper, [[null, mediaId], ...], modelKey, 2, null,
+    item = [promptWrapper, [[null, mediaId], ...], modelKey, aspectCode, null,
             [null,null,null,null, uuid1, uuid2]]
     params = [[item], project_ctx, [uuid3, 2]]
     — the reCAPTCHA token lives in project_ctx, NOT nested inside item (unlike
     image generation, where it's duplicated in both places).
+
+    aspectCode uses the same VIDEO_ASPECT_CODE mapping as t2v (16:9 -> 2,
+    9:16 -> 1) — previously hard-coded to 2, which silently forced every
+    reference-image video to 16:9 regardless of the requested aspect ratio.
 
     With a voice: verified from a live capture with narration enabled — two
     extra trailing fields appear on item: [..., null, [[voiceName]]], and the
@@ -767,6 +772,7 @@ def _build_gen_r2v_video_params(
     uuid1 = str(uuid.uuid4()).upper()
     uuid2 = str(uuid.uuid4()).upper()
     uuid3 = str(uuid.uuid4()).upper()
+    aspect_code = VIDEO_ASPECT_CODE.get(aspect_ratio, VIDEO_ASPECT_CODE["16:9"])
 
     project_ctx = [
         None, 22, None, None, None, project_id,
@@ -777,7 +783,7 @@ def _build_gen_r2v_video_params(
         [None, None, [[[prompt]]]],
         reference_images,
         model_key,
-        2,
+        aspect_code,
         None,
         [None, None, None, None, uuid1, uuid2],
     ]
@@ -861,6 +867,7 @@ async def gen_r2v_video_via_batchexecute(
     project_id: str | None,
     prompt: str,
     reference_media_ids: list[str],
+    aspect_ratio: str = "16:9",
     duration_s: int | None = None,
     video_model_key: str | None = None,
     voice: str | None = None,
@@ -888,6 +895,7 @@ async def gen_r2v_video_via_batchexecute(
             prompt=prompt,
             reference_media_ids=reference_media_ids,
             model_key=model_key,
+            aspect_ratio=aspect_ratio,
             recaptcha_token=token,
             voice=voice,
         ),
@@ -967,21 +975,27 @@ def _build_gen_i2v_video_params(
     prompt: str,
     start_media_id: str,
     model_key: str,
+    aspect_ratio: str,
     recaptcha_token: str,
 ) -> str:
     """Build params for RPCID_GEN_I2V_VIDEO (single start-frame image). Field
     order verified from a live capture:
-    item = [promptWrapper, modelKey, 2, null,
+    item = [promptWrapper, modelKey, aspectCode, null,
             [null, startMediaId, null, null, null, cropBox],
             [null,null,null,null, uuid1, uuid2]]
     params = [[item], project_ctx, [uuid3, 2]]
     cropBox is [x0, null, x1, y1]-ish normalized coordinates the UI sends when
     the user crops the start image — omitted here (null) to use the full image,
     same as REST's startImage:{mediaId} with no separate crop field.
+
+    aspectCode uses the same VIDEO_ASPECT_CODE mapping as t2v (16:9 -> 2,
+    9:16 -> 1) — previously hard-coded to 2, which silently forced every
+    start-image video to 16:9 regardless of the requested aspect ratio.
     """
     uuid1 = str(uuid.uuid4()).upper()
     uuid2 = str(uuid.uuid4()).upper()
     uuid3 = str(uuid.uuid4()).upper()
+    aspect_code = VIDEO_ASPECT_CODE.get(aspect_ratio, VIDEO_ASPECT_CODE["16:9"])
 
     project_ctx = [
         None, 22, None, None, None, project_id,
@@ -990,7 +1004,7 @@ def _build_gen_i2v_video_params(
     item = [
         [None, None, [[[prompt]]]],
         model_key,
-        2,
+        aspect_code,
         None,
         [None, start_media_id, None, None, None, None],
         [None, None, None, None, uuid1, uuid2],
@@ -1005,6 +1019,7 @@ async def gen_i2v_video_via_batchexecute(
     project_id: str | None,
     prompt: str,
     start_media_id: str,
+    aspect_ratio: str = "16:9",
     duration_s: int | None = None,
     video_model_key: str | None = None,
 ) -> str:
@@ -1024,6 +1039,7 @@ async def gen_i2v_video_via_batchexecute(
             prompt=prompt,
             start_media_id=start_media_id,
             model_key=model_key,
+            aspect_ratio=aspect_ratio,
             recaptcha_token=token,
         ),
     )
@@ -1036,20 +1052,26 @@ def _build_gen_i2v_fl_video_params(
     start_media_id: str,
     end_media_id: str,
     model_key: str,
+    aspect_ratio: str,
     recaptcha_token: str,
 ) -> str:
     """Build params for RPCID_GEN_I2V_FL_VIDEO (start + end frame images, aka
     "interpolation"). Field order verified from a live capture — identical to
     i2v's item shape with one extra field for the end image, in between the
     start-image field and the trailing uuid field:
-    item = [promptWrapper, modelKey, 2, null,
+    item = [promptWrapper, modelKey, aspectCode, null,
             [null, startMediaId, null, null, null, cropBox],
             [null, endMediaId, null, null, null, cropBox],
             [null,null,null,null, uuid1, uuid2]]
+
+    aspectCode uses the same VIDEO_ASPECT_CODE mapping as t2v (16:9 -> 2,
+    9:16 -> 1) — previously hard-coded to 2, which silently forced every
+    start+end-frame video to 16:9 regardless of the requested aspect ratio.
     """
     uuid1 = str(uuid.uuid4()).upper()
     uuid2 = str(uuid.uuid4()).upper()
     uuid3 = str(uuid.uuid4()).upper()
+    aspect_code = VIDEO_ASPECT_CODE.get(aspect_ratio, VIDEO_ASPECT_CODE["16:9"])
 
     project_ctx = [
         None, 22, None, None, None, project_id,
@@ -1058,7 +1080,7 @@ def _build_gen_i2v_fl_video_params(
     item = [
         [None, None, [[[prompt]]]],
         model_key,
-        2,
+        aspect_code,
         None,
         [None, start_media_id, None, None, None, None],
         [None, end_media_id, None, None, None, None],
@@ -1075,6 +1097,7 @@ async def gen_i2v_fl_video_via_batchexecute(
     prompt: str,
     start_media_id: str,
     end_media_id: str,
+    aspect_ratio: str = "16:9",
     duration_s: int | None = None,
     video_model_key: str | None = None,
 ) -> str:
@@ -1095,6 +1118,7 @@ async def gen_i2v_fl_video_via_batchexecute(
             start_media_id=start_media_id,
             end_media_id=end_media_id,
             model_key=model_key,
+            aspect_ratio=aspect_ratio,
             recaptcha_token=token,
         ),
     )

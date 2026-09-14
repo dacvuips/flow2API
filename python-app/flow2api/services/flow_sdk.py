@@ -2182,6 +2182,7 @@ async def gen_video_start_image(
                 project_id=project_id,
                 prompt=prompt,
                 start_media_id=start_media_id,
+                aspect_ratio=aspect_ratio,
                 duration_s=duration_s,
             )
             url = await poll_video_via_batchexecute(
@@ -2233,6 +2234,7 @@ async def gen_video_start_end_image(
                 prompt=prompt,
                 start_media_id=start_media_id,
                 end_media_id=end_media_id,
+                aspect_ratio=aspect_ratio,
                 duration_s=duration_s,
             )
             url = await poll_video_via_batchexecute(
@@ -2291,6 +2293,7 @@ async def gen_multi_image_video(
                 project_id=project_id,
                 prompt=prompt,
                 reference_media_ids=reference_media_ids,
+                aspect_ratio=aspect_ratio,
                 voice=voice_id or None,
                 duration_s=duration_s,
             )
