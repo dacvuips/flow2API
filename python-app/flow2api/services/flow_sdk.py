@@ -3402,7 +3402,25 @@ def extract_media_poll_failure_error(data: dict) -> str:
     return ""
 
 
+_CONTENT_POLICY_ERROR_MARKERS = (
+    "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED",
+    "PROMINENT_PERSON",
+    "PUBLIC_ERROR_IP_INPUT_IMAGE",
+    "IP_PROHIBITED",
+    "PUBLIC_ERROR_AUDIO_FILTERED",
+    "AUDIO_GENERATION_FILTERED",
+    "PUBLIC_ERROR_MINOR",
+    "PUBLIC_ERROR_SAFETY_FILTERED",
+    "PUBLIC_ERROR_INPUT_IMAGE_SAFETY",
+    "SAFETY_FILTERED",
+)
+
+
 def _payload_has_prominent_people_filter(payload: Any) -> bool:
+    """Despite the name (kept for callers), this now matches any Google Flow
+    content-policy rejection code — prominent-people, IP/copyright, audio
+    filter, safety filter, minor detection, etc. All of these mean the
+    generation was refused for policy reasons and must never be retried."""
     if payload is None:
         return False
     if isinstance(payload, dict):
@@ -3410,10 +3428,7 @@ def _payload_has_prominent_people_filter(payload: Any) -> bool:
     else:
         text = str(payload)
     upper = text.upper()
-    return (
-        "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in upper
-        or "PROMINENT_PERSON" in upper
-    )
+    return any(marker in upper for marker in _CONTENT_POLICY_ERROR_MARKERS)
 
 
 def is_prominent_people_filter_failure(

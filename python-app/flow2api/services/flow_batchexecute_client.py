@@ -412,6 +412,32 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
 _TRANSPORT_RETRY_ATTEMPTS = 3
 _TRANSPORT_RETRY_BACKOFF_S = 3.0
 
+_shared_http_client: Any = None
+_shared_http_client_lock: asyncio.Lock | None = None
+
+
+async def _get_shared_http_client() -> Any:
+    """Lazily create one long-lived httpx.AsyncClient reused across every
+    batchexecute call, instead of opening a fresh TCP+TLS connection (and
+    connection pool) per call. Google's endpoint is called very frequently
+    (video-poll alone hits it every few seconds per running job) — reusing
+    HTTP/1.1 keep-alive connections cuts down on the ReadError/ConnectError/
+    RemoteProtocolError transport failures seen when each call pays for a
+    brand new handshake."""
+    global _shared_http_client, _shared_http_client_lock
+    import httpx
+
+    if _shared_http_client is not None:
+        return _shared_http_client
+    if _shared_http_client_lock is None:
+        _shared_http_client_lock = asyncio.Lock()
+    async with _shared_http_client_lock:
+        if _shared_http_client is None:
+            _shared_http_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+            )
+        return _shared_http_client
+
 
 async def _post_batchexecute_http(
     *,
@@ -466,19 +492,19 @@ async def _post_batchexecute_http(
         "user-agent": _USER_AGENT,
         "x-same-domain": "1",
     }
+    client = await _get_shared_http_client()
     last_exc: Exception | None = None
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.post(url, content=body, headers=headers)
-                if log_each_call:
-                    logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
-                else:
-                    # video-poll gọi lặp lại mỗi vài giây tới khi xong — logger
-                    # riêng của caller (poll_video_via_batchexecute) tóm tắt 1
-                    # dòng khi kết thúc thay vì spam 1 dòng mỗi lần poll.
-                    logger.debug("batchexecute %s -> HTTP %s", label, resp.status_code)
-                return resp.status_code, resp.text
+            resp = await client.post(url, content=body, headers=headers, timeout=timeout_s)
+            if log_each_call:
+                logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
+            else:
+                # video-poll gọi lặp lại mỗi vài giây tới khi xong — logger
+                # riêng của caller (poll_video_via_batchexecute) tóm tắt 1
+                # dòng khi kết thúc thay vì spam 1 dòng mỗi lần poll.
+                logger.debug("batchexecute %s -> HTTP %s", label, resp.status_code)
+            return resp.status_code, resp.text
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
             if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
