@@ -184,6 +184,14 @@ IMAGE_ASPECT_CODE = {
     "9:16": 2,
 }
 
+# Aspect code cho video (slot thứ 3 của item trong RPCID_GEN_*_VIDEO) — verified
+# từ live capture: t2v 9:16 -> item[2]=1, t2v 16:9 -> item[2]=2 (khác bộ mã với
+# IMAGE_ASPECT_CODE, vốn dùng số riêng cho ảnh).
+VIDEO_ASPECT_CODE = {
+    "16:9": 2,
+    "9:16": 1,
+}
+
 _BATCHEXECUTE_URL = "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute"
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -891,17 +899,22 @@ def _build_gen_t2v_video_params(
     project_id: str,
     prompt: str,
     model_key: str,
+    aspect_ratio: str,
     recaptcha_token: str,
 ) -> str:
     """Build params for RPCID_GEN_T2V_VIDEO (text only, no images). Field order
     verified from a live capture — identical to r2v's item shape minus the
     reference-images field:
-    item = [promptWrapper, modelKey, 2, null, [null,null,null,null,uuid1,uuid2]]
+    item = [promptWrapper, modelKey, aspectCode, null, [null,null,null,null,uuid1,uuid2]]
     params = [[item], project_ctx, [uuid3, 2]]
+    aspectCode confirmed from two live captures: 16:9 -> 2, 9:16 -> 1 (see
+    VIDEO_ASPECT_CODE) — previously hard-coded to 2, which silently forced
+    every batchexecute video to 16:9 regardless of the requested aspect ratio.
     """
     uuid1 = str(uuid.uuid4()).upper()
     uuid2 = str(uuid.uuid4()).upper()
     uuid3 = str(uuid.uuid4()).upper()
+    aspect_code = VIDEO_ASPECT_CODE.get(aspect_ratio, VIDEO_ASPECT_CODE["16:9"])
 
     project_ctx = [
         None, 22, None, None, None, project_id,
@@ -910,7 +923,7 @@ def _build_gen_t2v_video_params(
     item = [
         [None, None, [[[prompt]]]],
         model_key,
-        2,
+        aspect_code,
         None,
         [None, None, None, None, uuid1, uuid2],
     ]
@@ -923,6 +936,7 @@ async def gen_t2v_video_via_batchexecute(
     profile_id: str,
     project_id: str | None,
     prompt: str,
+    aspect_ratio: str = "16:9",
     duration_s: int | None = None,
     video_model_key: str | None = None,
 ) -> str:
@@ -941,6 +955,7 @@ async def gen_t2v_video_via_batchexecute(
             project_id=pid,
             prompt=prompt,
             model_key=model_key,
+            aspect_ratio=aspect_ratio,
             recaptcha_token=token,
         ),
     )

@@ -2120,6 +2120,7 @@ async def gen_text_video(
                 profile_id=client.profile_id,
                 project_id=project_id,
                 prompt=prompt,
+                aspect_ratio=aspect_ratio,
                 duration_s=duration_s,
             )
             url = await poll_video_via_batchexecute(
