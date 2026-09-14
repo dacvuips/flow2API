@@ -1130,6 +1130,7 @@ async def upsample_video_via_batchexecute(
     project_id: str | None,
     media_id: str,
     generation_id: str,
+    aspect_ratio: str = "16:9",
 ) -> str:
     """Submit a request to upsample an existing video to 1080p.
 
@@ -1139,6 +1140,11 @@ async def upsample_video_via_batchexecute(
     look it up via poll_video_via_batchexecute if only the media id is on hand.
     Returns the upsampled media id (source id + "_upsampled" suffix) to pass to
     poll_video_via_batchexecute / resolve_media_url_via_batchexecute.
+
+    `aspect_ratio` must match the source video's own aspect ratio (item[2] uses
+    the same VIDEO_ASPECT_CODE as the gen_*_video RPCs) — it was previously
+    hard-coded to 2 (16:9), which silently stretched every 9:16 source video
+    to 16:9 when upsampled.
     """
     from flow2api.services.flow_captcha_center import mint_captcha_token
     from flow2api.services.flow_profile_service import get_batchexecute_session
@@ -1161,9 +1167,10 @@ async def upsample_video_via_batchexecute(
         None, 22, None, None, None, effective_project_id,
         None, None, None, None, [recaptcha_token, 1],
     ]
+    aspect_code = VIDEO_ASPECT_CODE.get(aspect_ratio, VIDEO_ASPECT_CODE["16:9"])
     item: list[Any] = [None] * 32
     item[0] = [None, media_id]
-    item[2] = 2
+    item[2] = aspect_code
     item[4] = [None, generation_id, None, None, uuid1]
     item[6] = 2
     item[31] = UPSAMPLE_MODEL_KEY
