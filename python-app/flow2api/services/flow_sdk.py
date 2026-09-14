@@ -1838,6 +1838,7 @@ async def upsample_video(
                 project_id=project_id,
                 media_id=media_id,
                 generation_id=generation_id,
+                aspect_ratio=aspect_ratio,
             )
             url = await poll_video_via_batchexecute(
                 profile_id=client.profile_id, media_id=upsampled_media_id
