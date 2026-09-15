@@ -869,7 +869,7 @@ class WorkerController:
         slots = pool.available_job_slots()
         if slots <= 0 or not pool.has_available_profile():
             return 0
-        rows = activity.next_queued_batch(max(slots * 2, slots))
+        rows = await asyncio.to_thread(activity.next_queued_batch, max(slots * 2, slots))
         started_this_round = 0
         for row in rows:
             if started_this_round >= slots:
@@ -889,7 +889,9 @@ class WorkerController:
                     await asyncio.sleep(wait_s)
             row_params.pop("retry_not_before", None)
             row_params["running_started_at"] = datetime.utcnow().isoformat() + "Z"
-            activity.update_request(row.id, status="running", params=row_params)
+            await asyncio.to_thread(
+                activity.update_request, row.id, status="running", params=row_params
+            )
             events.publish("request_started", {"id": row.id})
             self._running_since[row.id] = time.monotonic()
             self._running[row.id] = asyncio.create_task(self._run_job(row.id))
@@ -904,7 +906,7 @@ class WorkerController:
         client = None
         began_trace = False
         try:
-            row = activity.get_request(rid)
+            row = await asyncio.to_thread(activity.get_request, rid)
             if not row:
                 return
             if row.status != "running":
@@ -935,12 +937,13 @@ class WorkerController:
             except RequestCancelled:
                 end_api_trace(rid)
                 began_trace = False
-                cur = activity.get_request(rid)
+                cur = await asyncio.to_thread(activity.get_request, rid)
                 if cur and cur.status == "queued":
                     raise
                 append_request_log(rid, "worker", "Job canceled", level="warn")
                 if cur and cur.status == "running":
-                    activity.update_request(
+                    await asyncio.to_thread(
+                        activity.update_request,
                         rid,
                         status="failed: canceled",
                         error="canceled",
@@ -950,13 +953,14 @@ class WorkerController:
             except asyncio.CancelledError:
                 end_api_trace(rid)
                 began_trace = False
-                cur = activity.get_request(rid)
+                cur = await asyncio.to_thread(activity.get_request, rid)
                 if cur and (
                     cur.status == "queued" or cur.status.startswith("failed:")
                 ):
                     raise
                 if cur and cur.status == "running":
-                    activity.update_request(
+                    await asyncio.to_thread(
+                        activity.update_request,
                         rid,
                         status=f"failed: {TASK_TIMEOUT_ERROR}",
                         error=TASK_TIMEOUT_ERROR_MSG,
@@ -971,7 +975,7 @@ class WorkerController:
                     events.publish("request_finished", {"id": rid, "status": "failed"})
                 raise
             except Exception as exc:
-                cur = activity.get_request(rid)
+                cur = await asyncio.to_thread(activity.get_request, rid)
                 if cur and (
                     cur.status.startswith("failed:")
                     or cur.error in (TASK_TIMEOUT_ERROR, TASK_TIMEOUT_ERROR_MSG, "canceled")
@@ -980,7 +984,7 @@ class WorkerController:
                 api_trace = end_api_trace(rid)
                 began_trace = False
                 msg = format_api_error(exc).strip() or "unknown_error"
-                cur = activity.get_request(rid)
+                cur = await asyncio.to_thread(activity.get_request, rid)
                 retry_params = json.loads(cur.params_json or "{}") if cur else {}
                 recaptcha_retry = int(retry_params.get("recaptcha_retry_count") or 0)
                 if flow_sdk.is_recaptcha_error(msg) and recaptcha_retry < RECAPTCHA_RETRY_MAX:
@@ -1149,7 +1153,8 @@ class WorkerController:
                         retry_params["http_524_retry_count"] = http_524_retry + 1
                         retry_params["retry_not_before"] = time.time() + delay_s
                         retry_params.pop("running_started_at", None)
-                        activity.update_request(
+                        await asyncio.to_thread(
+                            activity.update_request,
                             rid, status="queued", params=retry_params, error=None
                         )
                         events.publish(
@@ -1226,7 +1231,8 @@ class WorkerController:
                         retry_params["http_429_retry_count"] = http_429_retry + 1
                         retry_params["retry_not_before"] = time.time() + delay_s
                         retry_params.pop("running_started_at", None)
-                        activity.update_request(
+                        await asyncio.to_thread(
+                            activity.update_request,
                             rid, status="queued", params=retry_params, error=None
                         )
                         events.publish(
@@ -1290,7 +1296,8 @@ class WorkerController:
                         fail_result["api_last_response"] = compact_api_response(
                             exc.raw, exc.step or "api_error"
                         )
-                activity.update_request(
+                await asyncio.to_thread(
+                    activity.update_request,
                     rid,
                     status=f"failed: {display_msg}",
                     error=display_msg,
@@ -1321,15 +1328,15 @@ class WorkerController:
             self._cancelled.discard(rid)
             self._running_since.pop(rid, None)
             try:
-                cur_after = activity.get_request(rid)
+                cur_after = await asyncio.to_thread(activity.get_request, rid)
                 if cur_after and cur_after.status != "queued":
-                    activity.maybe_strip_heavy_params(rid)
+                    await asyncio.to_thread(activity.maybe_strip_heavy_params, rid)
             except Exception as exc:
                 logger.warning("strip heavy params failed rid=%s: %s", rid[:8], exc)
 
     async def _process_one(self, rid: str) -> None:
         self._raise_if_cancelled(rid)
-        row = activity.get_request(rid)
+        row = await asyncio.to_thread(activity.get_request, rid)
         if not row:
             return
         params = json.loads(row.params_json or "{}")
@@ -1395,7 +1402,9 @@ class WorkerController:
                 or formatted.get("media_id"),
             }
             result = await persist_task_result(rid, result, req_type)
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1428,7 +1437,9 @@ class WorkerController:
                 "upsampled_media_id": formatted.get("upsampled_media_id"),
             }
             result = await persist_task_result(rid, result, req_type)
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1516,7 +1527,9 @@ class WorkerController:
             sig = str(raw.get("thought_signature") or "").strip()
             if sig:
                 result["thought_signature"] = sig
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1570,7 +1583,9 @@ class WorkerController:
                 params.pop("trpc_401_retry_count", None)
                 params.pop("retry_not_before", None)
                 self._persist_params(rid, params)
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1626,7 +1641,9 @@ class WorkerController:
                 "modelKey": audio_model,
             }
             result = await persist_task_result(rid, result, req_type)
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1683,7 +1700,7 @@ class WorkerController:
         video_mode: str,
         req_type: str,
     ) -> None:
-        row = activity.get_request(rid)
+        row = await asyncio.to_thread(activity.get_request, rid)
         prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
         duration_s = int(
@@ -1773,7 +1790,7 @@ class WorkerController:
         video_mode: str,
         req_type: str,
     ) -> None:
-        row = activity.get_request(rid)
+        row = await asyncio.to_thread(activity.get_request, rid)
         prompt = _task_prompt(row, params) if row else str(params.get("prompt") or "")
         aspect_ratio = params.get("aspect_ratio", "16:9")
         video_quality = get_video_quality(params, "fast")
@@ -1860,7 +1877,7 @@ class WorkerController:
         # result, skipping the REST-shaped operations/media parsing below
         # entirely since submit_raw won't have that shape.
         if isinstance(submit_raw, dict) and submit_raw.get("_batchexecute_done"):
-            row_done = activity.get_request(rid)
+            row_done = await asyncio.to_thread(activity.get_request, rid)
             done_params = json.loads(row_done.params_json or "{}") if row_done else {}
             result = {
                 "video_urls": submit_raw.get("video_urls") or [],
@@ -1870,7 +1887,9 @@ class WorkerController:
             }
             if row_done:
                 result = await persist_task_result(rid, result, row_done.type)
-            activity.update_request(rid, status="done", result=result, error=None)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
             return
 
@@ -1900,7 +1919,7 @@ class WorkerController:
         source_workflow_id = flow_sdk.extract_workflow_id_from_submit(submit_raw)
 
         async def _finish(urls: list[str], media: list[str], **extra: Any) -> None:
-            row_done = activity.get_request(rid)
+            row_done = await asyncio.to_thread(activity.get_request, rid)
             done_params = (
                 json.loads(row_done.params_json or "{}") if row_done else {}
             )
@@ -1930,8 +1949,10 @@ class WorkerController:
                     or done_params.pop("trpc_401_retry_count", None) is not None
                     or done_params.pop("retry_not_before", None) is not None
                 ):
-                    activity.update_request(rid, params=done_params)
-            activity.update_request(rid, status="done", result=result, error=None)
+                    await asyncio.to_thread(activity.update_request, rid, params=done_params)
+            await asyncio.to_thread(
+                activity.update_request, rid, status="done", result=result, error=None
+            )
             events.publish("request_finished", {"id": rid, "status": "done"})
 
         workflow_mode = all(op.get("_workflow_mode") for op in operations)
