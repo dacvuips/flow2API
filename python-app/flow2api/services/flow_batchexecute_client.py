@@ -447,8 +447,17 @@ async def _get_shared_http_client() -> Any:
         _shared_http_client_lock = asyncio.Lock()
     async with _shared_http_client_lock:
         if _shared_http_client is None:
+            # flow.google.com trả cả IPv4 và IPv6 — anyio (network backend của
+            # httpcore) luôn ưu tiên thử IPv6 trước (Happy Eyeballs). Log thực
+            # tế cho thấy connect_tcp.started → .failed cách nhau đúng bằng
+            # connect timeout (TCP SYN gửi đi, không bao giờ nhận SYN-ACK) —
+            # dấu hiệu route cụ thể (rất có thể IPv6) bị drop âm thầm, không
+            # phải do phần mềm/firewall trên máy (đã xác nhận). local_address
+            #="0.0.0.0" buộc bind socket nguồn qua IPv4, loại IPv6 khỏi mọi
+            # lần thử kết nối — nếu đúng nguyên nhân, lỗi này sẽ hết hẳn.
             _shared_http_client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+                transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
             )
         return _shared_http_client
 
