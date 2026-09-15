@@ -1389,7 +1389,12 @@ async def poll_video_via_batchexecute(
                     )
                     raise BatchExecuteError(f"video_generation_failed: {reason}")
                 last_error = f"still_processing (status={video_status})"
-        await asyncio.sleep(poll_interval_s)
+        # Video hiếm khi xong trong vài giây đầu, nhưng khi xong sớm thì
+        # thường xong nhanh — poll dồn dập (2s) trong ~30s đầu để bắt kịp
+        # các job nhanh, sau đó giãn về poll_interval_s cho phần đuôi dài.
+        elapsed = time.monotonic() - started
+        sleep_s = min(2.0, poll_interval_s) if elapsed < 30.0 else poll_interval_s
+        await asyncio.sleep(sleep_s)
 
     logger.info(
         "batchexecute video-poll timeout sau %s lần (%.1fs): %s",

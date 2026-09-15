@@ -1523,10 +1523,6 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
             if not is_center:
                 _gen_last_fsid_refresh[slot_id] = time.time()
 
-            # Cookie/session đã ghi DB — không cần chờ Chrome thoát nữa
-            meta["step"] = "wait_db"
-            await asyncio.sleep(0.2)
-
             job_cfg = None
             if not is_center:
                 job_cfg = apply_job_parallel_for_profile(slot.profile_id())
