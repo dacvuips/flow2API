@@ -420,6 +420,11 @@ _TRANSPORT_RETRY_BACKOFF_S = 3.0
 # chờ hết timeout_s (60-120s) như timeout đọc dữ liệu thực sự. Tách riêng để
 # 1 lần retry tốn tối đa ~10s thay vì cả timeout_s khi ConnectError lặp lại.
 _CONNECT_TIMEOUT_S = 10.0
+# Thời gian tối đa chờ lấy được 1 connection slot từ pool dùng chung khi
+# nhiều profile chạy song song — httpx mặc định dùng timeout_s (60-120s) cho
+# việc này nếu không set riêng, khiến job "treo" âm thầm chờ pool thay vì
+# fail nhanh và được retry/requeue như một lỗi mạng thật sự.
+_POOL_TIMEOUT_S = 15.0
 
 _shared_http_client: Any = None
 _shared_http_client_lock: asyncio.Lock | None = None
@@ -509,7 +514,9 @@ async def _post_batchexecute_http(
                 url,
                 content=body,
                 headers=headers,
-                timeout=httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT_S),
+                timeout=httpx.Timeout(
+                    timeout_s, connect=_CONNECT_TIMEOUT_S, pool=_POOL_TIMEOUT_S
+                ),
             )
             if log_each_call:
                 logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)

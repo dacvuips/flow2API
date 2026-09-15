@@ -72,7 +72,7 @@ _fail_cooldown_until: dict[str, float] = {}  # slot_id -> unix ts
 _FAIL_COOLDOWN_S = 15 * 60
 _success_cooldown_until: dict[str, float] = {}  # slot_id -> unix ts (sau sync thành công)
 _gen_last_fsid_refresh: dict[str, float] = {}  # slot_id -> unix ts lần reload fsid gần nhất
-_FSID_REFRESH_INTERVAL_S = 5 * 60
+_FSID_REFRESH_INTERVAL_S = 3 * 60
 _fsid_refresh_inflight: set[str] = set()
 
 
@@ -1577,7 +1577,7 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                         if is_center
                         else (
                             (" · fsid/bl/at OK" if batch.get("ok") else " · fsid/bl/at chưa lấy được")
-                            + " · giữ CDP mở (tự reload lấy fsid mới ~5p)"
+                            + " · giữ CDP mở (tự reload lấy fsid mới ~3p)"
                         )
                     )
                     + (
@@ -1819,7 +1819,8 @@ async def _refresh_fsid_for_slot(slot_id: str) -> dict[str, Any]:
 
 
 async def _refresh_expired_fsid_gens() -> None:
-    """Mỗi ~5 phút: reload CDP Gen đang mở (accepting) để lấy fsid/bl/at mới.
+    """Mỗi ~3 phút: reload CDP Gen đang mở (accepting) để lấy fsid/bl/at mới —
+    chủ động refresh trước khi hết hạn thay vì chờ 401 mới re-capture.
 
     Chỉ áp dụng cho slot còn CDP sống + không đang trong 1 cycle mở/sync khác
     (tránh đụng độ connect_over_cdp / clear cookie).
