@@ -509,6 +509,24 @@ async def _post_batchexecute_http(
     client = await _get_shared_http_client()
     last_exc: Exception | None = None
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
+        # Đo DNS resolve riêng biệt trước mỗi lần thử — nếu request sau đó vẫn
+        # timeout, log sẽ cho biết được là do DNS chậm (resolver của máy/Windows)
+        # hay do TCP connect/TLS handshake thật sự bị chặn, thay vì chỉ biết
+        # chung chung "ConnectTimeout" không rõ bước nào.
+        dns_ms: float | None = None
+        try:
+            dns_started = time.monotonic()
+            await asyncio.get_running_loop().getaddrinfo("flow.google.com", 443)
+            dns_ms = (time.monotonic() - dns_started) * 1000
+        except Exception as dns_exc:
+            dns_ms = -1.0
+            logger.warning(
+                "batchexecute DNS resolve lỗi (attempt %s/%s): %s",
+                attempt,
+                _TRANSPORT_RETRY_ATTEMPTS,
+                dns_exc,
+            )
+        req_started = time.monotonic()
         try:
             resp = await client.post(
                 url,
@@ -528,13 +546,17 @@ async def _post_batchexecute_http(
             return resp.status_code, resp.text
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
+            req_ms = (time.monotonic() - req_started) * 1000
             if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
                 break
             logger.warning(
-                "batchexecute transport error (attempt %s/%s): %s — retry sau %.1fs",
+                "batchexecute transport error (attempt %s/%s): %s — "
+                "dns=%.0fms request=%.0fms — retry sau %.1fs",
                 attempt,
                 _TRANSPORT_RETRY_ATTEMPTS,
                 type(exc).__name__,
+                dns_ms,
+                req_ms,
                 _TRANSPORT_RETRY_BACKOFF_S,
             )
             await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_S)
