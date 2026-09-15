@@ -1749,6 +1749,11 @@ async def _refresh_fsid_for_slot(slot_id: str) -> dict[str, Any]:
     CDP không còn bị đóng sau mỗi cycle sync — cookies vẫn sống trong Chrome,
     chỉ có window.WIZ_global_data (fsid) hết hạn theo thời gian. Reload lại
     trang project hiện tại là đủ để Flow tự cấp fsid mới cùng session cookie.
+
+    Nếu tab hiện tại không còn ở flow.google.com/project/<uuid> (vd bị điều
+    hướng lạc trang, crash về about:blank, ...), reload() chỉ load lại đúng
+    trang trắng đó và sẽ luôn thất bại với no_project_in_url — cần goto lại
+    project URL đã lưu (hoặc flow_url mặc định) thay vì reload.
     """
     slot = get_flow_cdp_slot(slot_id)
     if not slot:
@@ -1767,7 +1772,16 @@ async def _refresh_fsid_for_slot(slot_id: str) -> dict[str, Any]:
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
         try:
-            await page.reload(wait_until="commit", timeout=45_000)
+            cur = str(page.url or "")
+        except Exception:
+            cur = ""
+        try:
+            if _PROJECT_URL_RE.search(cur) or "flow.google.com" in cur.lower():
+                await page.reload(wait_until="commit", timeout=45_000)
+            else:
+                cfg = get_flow_cdp_auto_settings()
+                flow_url = str(cfg.flow_url or _DEFAULT_FLOW_URL).strip() or _DEFAULT_FLOW_URL
+                await page.goto(flow_url, wait_until="commit", timeout=60_000)
         except Exception as exc:
             return {"ok": False, "error": f"reload_failed: {exc}"}
         await _wait_session_or_timeout(page, timeout_s=10.0)

@@ -248,10 +248,11 @@ def _extract_project_id(url: str) -> str | None:
 
 
 async def _ensure_flow_cdp_running(profile_id: str, cdp: str) -> None:
-    """Launch Chrome for this profile's CDP slot if it isn't already running.
-    Chrome is normally kept closed between session captures (see
-    capture_batchexecute_session's finally block) to save resources — this is
-    what brings it back up on demand instead of requiring it be opened by hand.
+    """Launch Chrome for this profile's CDP slot if it isn't already running
+    (e.g. the profile isn't under CDP Auto and has no Chrome up yet) — brings
+    it up on demand instead of requiring it be opened by hand. Session capture
+    no longer closes Chrome afterwards (see capture_batchexecute_session), so
+    this mainly matters the first time a profile is used.
     launch_flow_cdp_slot is a blocking sync call, so it runs off-thread."""
     if system_ops.cdp_endpoint_alive(cdp):
         return
@@ -269,13 +270,15 @@ async def _ensure_flow_cdp_running(profile_id: str, cdp: str) -> None:
 
 async def _attach_flow_page(profile_id: str):
     """Return (playwright, browser, context, page) attached to the profile's CDP slot,
-    with the page already sitting on a Flow project (not the landing page).
+    with the page already sitting on a Flow project (not the landing page) and
+    freshly reloaded so window.WIZ_global_data holds a just-minted fsid/bl/at
+    rather than whatever was left over from the tab's last navigation.
 
-    Chrome for this profile may currently be closed (it's closed automatically
-    after each successful capture — see capture_batchexecute_session) — this
-    launches it on demand, and if the tab that comes up is sitting on the bare
-    flow.google.com landing page rather than a project, navigates it to the
-    last known project id cached in the DB for this profile."""
+    Chrome for this profile may currently be closed if it isn't under CDP
+    Auto — this launches it on demand, and if the tab that comes up is
+    sitting on the bare flow.google.com landing page rather than a project,
+    navigates it to the last known project id cached in the DB for this
+    profile."""
     from playwright.async_api import async_playwright
 
     slot = get_flow_cdp_slot(profile_id)
@@ -294,7 +297,9 @@ async def _attach_flow_page(profile_id: str):
             raise BatchExecuteError(
                 f"no_flow_tab: {profile_id} — mở tab flow.google.com đã login trước."
             )
-        if not _extract_project_id(page.url):
+        if _extract_project_id(page.url):
+            await page.reload(wait_until="domcontentloaded")
+        else:
             from flow2api.services.flow_profile_service import get_batchexecute_session
 
             cached = get_batchexecute_session(profile_id)
@@ -326,12 +331,12 @@ async def _read_page_session(page) -> dict[str, str]:
 
 
 async def capture_batchexecute_session(profile_id: str) -> dict[str, str]:
-    """One-time capture: launch Chrome for this profile's CDP slot if needed,
-    attach to its Flow tab, read its project id + f.sid/bl/at, persist them to
-    the DB, then close Chrome again. gen_image_via_batchexecute (and friends)
-    read the cached session from the DB, so Chrome only needs to be alive for
-    the brief window this function runs — kept closed the rest of the time to
-    save resources across many idle profiles.
+    """Launch Chrome for this profile's CDP slot if needed, attach to its Flow
+    tab, read its project id + f.sid/bl/at, persist them to the DB. Chrome is
+    left running afterwards — CDP Auto (flow_cdp_auto.py) manages its own
+    lifecycle (keeps it open, reloads periodically for a fresh fsid), and
+    closing it here would fight that. gen_image_via_batchexecute (and
+    friends) read the cached session from the DB.
 
     Also re-saves the browser's current cookies alongside the session triple.
     Cookies and f.sid/at must come from the SAME moment — mixing a fresh f.sid/at
@@ -364,15 +369,15 @@ async def capture_batchexecute_session(profile_id: str) -> dict[str, str]:
         )
         return {"project_id": project_id, **session}
     finally:
+        # Không đóng CDP sau capture — CDP Auto (flow_cdp_auto.py) giữ Chrome
+        # mở liên tục và tự reload lấy fsid mới định kỳ; đóng CDP ở đây (như
+        # trước) xung đột với model đó, khiến Gen tưởng như "tự tắt CDP" mỗi
+        # khi một request gặp 401 và trigger recapture.
         if pw is not None:
             try:
                 await pw.stop()
             except Exception:
                 pass
-        try:
-            await asyncio.to_thread(system_ops.close_flow_cdp_slot, profile_id)
-        except Exception as exc:
-            logger.debug("close_flow_cdp_slot failed profile=%s: %s", profile_id, exc)
 
 
 async def recapture_session_coalesced(profile_id: str) -> dict[str, str]:
