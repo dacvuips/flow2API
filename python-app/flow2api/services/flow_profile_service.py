@@ -24,7 +24,7 @@ from flow2api.config import (
 
 )
 
-from flow2api.db.models import FlowProfile, SessionLocal
+from flow2api.db.models import FlowProfile, FsidSessionHistory, SessionLocal
 
 from flow2api.services.token_cipher import decrypt_token, encrypt_token
 
@@ -354,6 +354,7 @@ def save_batchexecute_session(
             row = FlowProfile(profile_id=pid)
             db.add(row)
         row.flow_project_id = str(project_id or "").strip() or row.flow_project_id
+        fsid_changed = row.flow_fsid != str(fsid)
         row.flow_fsid = str(fsid)
         row.flow_bl = str(bl)
         row.flow_at = str(at)
@@ -361,6 +362,117 @@ def save_batchexecute_session(
         row.updated_at = _utcnow()
         db.commit()
     logger.debug("batchexecute session saved profile=%s", pid[:12])
+    if fsid_changed:
+        _start_fsid_session(pid, fsid=str(fsid))
+
+
+_FSID_HISTORY_KEEP_PER_PROFILE = 5
+
+
+def _start_fsid_session(profile_id: str, *, fsid: str) -> None:
+    """Bắt đầu track 1 phiên fsid mới — đóng phiên đang mở (nếu có) với
+    end_reason="refreshed" trước (fsid đổi do CDP Auto tự reload định kỳ,
+    không phải do lỗi), rồi mở bản ghi mới. Cuốn chiếu: chỉ giữ
+    _FSID_HISTORY_KEEP_PER_PROFILE bản gần nhất cho profile này."""
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return
+    now = _utcnow()
+    with SessionLocal() as db:
+        open_row = (
+            db.query(FsidSessionHistory)
+            .filter(
+                FsidSessionHistory.profile_id == pid,
+                FsidSessionHistory.ended_at.is_(None),
+            )
+            .order_by(FsidSessionHistory.id.desc())
+            .first()
+        )
+        if open_row:
+            open_row.ended_at = now
+            open_row.end_reason = "refreshed"
+            open_row.duration_seconds = int((now - open_row.started_at).total_seconds())
+        db.add(
+            FsidSessionHistory(
+                profile_id=pid,
+                fsid=str(fsid or "")[:64] or None,
+                started_at=now,
+            )
+        )
+        db.commit()
+        old_ids = [
+            r.id
+            for r in db.query(FsidSessionHistory.id)
+            .filter(FsidSessionHistory.profile_id == pid)
+            .order_by(FsidSessionHistory.id.desc())
+            .offset(_FSID_HISTORY_KEEP_PER_PROFILE)
+            .all()
+        ]
+        if old_ids:
+            db.query(FsidSessionHistory).filter(FsidSessionHistory.id.in_(old_ids)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+
+
+def end_fsid_session(profile_id: str, *, reason: str = "401") -> None:
+    """Đóng phiên fsid đang mở của profile (nếu có) — gọi khi phát hiện 401
+    (session hết hạn thật sự), ghi lại thời điểm kết thúc + thời lượng sống."""
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return
+    now = _utcnow()
+    with SessionLocal() as db:
+        open_row = (
+            db.query(FsidSessionHistory)
+            .filter(
+                FsidSessionHistory.profile_id == pid,
+                FsidSessionHistory.ended_at.is_(None),
+            )
+            .order_by(FsidSessionHistory.id.desc())
+            .first()
+        )
+        if not open_row:
+            return
+        open_row.ended_at = now
+        open_row.end_reason = str(reason or "401")
+        open_row.duration_seconds = int((now - open_row.started_at).total_seconds())
+        db.commit()
+
+
+def list_fsid_sessions(profile_id: str) -> list[dict[str, Any]]:
+    """5 bản ghi fsid gần nhất của profile (mới nhất trước), kèm thời lượng
+    sống — phiên đang mở (chưa 401) có ended_at=None, duration_seconds tính
+    tới hiện tại."""
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return []
+    now = _utcnow()
+    with SessionLocal() as db:
+        rows = (
+            db.query(FsidSessionHistory)
+            .filter(FsidSessionHistory.profile_id == pid)
+            .order_by(FsidSessionHistory.id.desc())
+            .limit(_FSID_HISTORY_KEEP_PER_PROFILE)
+            .all()
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            duration = r.duration_seconds
+            if duration is None and r.started_at:
+                duration = int((now - r.started_at).total_seconds())
+            out.append(
+                {
+                    "id": r.id,
+                    "fsid": r.fsid,
+                    "started_at": r.started_at.isoformat() if r.started_at else None,
+                    "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+                    "duration_seconds": duration,
+                    "end_reason": r.end_reason,
+                    "is_open": r.ended_at is None,
+                }
+            )
+        return out
 
 
 def get_batchexecute_session(profile_id: str) -> Optional[dict[str, str]]:

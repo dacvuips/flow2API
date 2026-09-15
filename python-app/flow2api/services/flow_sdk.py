@@ -83,6 +83,12 @@ async def _call_with_401_retry(profile_id: str, call: Any) -> Any:
             str(exc)[:60],
         )
         try:
+            from flow2api.services.flow_profile_service import end_fsid_session
+
+            end_fsid_session(profile_id, reason="401")
+        except Exception:
+            logger.debug("end_fsid_session failed profile=%s", profile_id[:12], exc_info=True)
+        try:
             await recapture_session_coalesced(profile_id)
         except Exception as recapture_exc:
             raise BatchExecuteSessionRecoveryFailed(

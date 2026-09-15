@@ -318,6 +318,25 @@ async def flow_cdp_get_cookies(
     return result
 
 
+@router.get("/slots/{slot_id}/fsid-history")
+async def flow_cdp_fsid_history(slot_id: str, _: int = Depends(auth_key_id)):
+    """5 phiên fsid gần nhất của slot này (start = capture thành công, end =
+    401 hoặc tự refresh), kèm tổng thời gian sống cộng dồn."""
+    from flow2api.services.flow_profile_service import list_fsid_sessions
+
+    slot = get_flow_cdp_slot(slot_id)
+    if not slot:
+        raise HTTPException(404, "slot_not_found")
+    sessions = list_fsid_sessions(slot.profile_id())
+    total_seconds = sum(int(s.get("duration_seconds") or 0) for s in sessions)
+    return {
+        "ok": True,
+        "slot_id": slot_id,
+        "sessions": sessions,
+        "total_duration_seconds": total_seconds,
+    }
+
+
 @router.post("/slots/{slot_id}/logout")
 async def flow_cdp_logout(slot_id: str, _: int = Depends(auth_key_id)):
     try:

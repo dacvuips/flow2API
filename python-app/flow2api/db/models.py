@@ -94,6 +94,23 @@ class FlowProfile(Base):
     )
 
 
+class FsidSessionHistory(Base):
+    """Vòng đời 1 phiên fsid/bl/at của 1 profile — bắt đầu khi capture thành
+    công, kết thúc khi phát hiện 401 (session hết hạn). Cuốn chiếu: chỉ giữ
+    5 bản ghi gần nhất mỗi profile — xem end_fsid_session/start_fsid_session
+    trong flow_profile_service.py."""
+
+    __tablename__ = "flow_fsid_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[str] = mapped_column(String(128), index=True)
+    fsid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
