@@ -109,6 +109,9 @@ VIDEO_POLL_MEDIA_MAX = int(os.environ.get("FLOW2API_VIDEO_POLL_MEDIA_MAX", "20")
 # get_media downloads can be multi-MB over slow paths; 60s was cutting mid-transfer.
 GET_MEDIA_TIMEOUT_S = float(os.environ.get("FLOW2API_GET_MEDIA_TIMEOUT_S", "180"))
 RECAPTCHA_RETRY_MAX = int(os.environ.get("FLOW2API_RECAPTCHA_RETRY_MAX", "5"))
+# ConnectTimeout/524/502/504 — lỗi mạng/gateway tạm thời, không phải lỗi tài
+# khoản: requeue giữ nguyên profile thay vì đổi/ẩn profile hay báo lỗi ngay.
+GATEWAY_TIMEOUT_RETRY_MAX = int(os.environ.get("FLOW2API_GATEWAY_TIMEOUT_RETRY_MAX", "3"))
 # Flow ya29 token TTL in DB (Veo3Studio cookieTokenService defaults).
 FLOW_ACCESS_TOKEN_TTL_S = int(os.environ.get("FLOW2API_FLOW_TOKEN_TTL_S", str(55 * 60)))
 FLOW_ACCESS_TOKEN_FALLBACK_TTL_S = int(

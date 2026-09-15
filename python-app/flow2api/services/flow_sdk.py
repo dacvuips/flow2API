@@ -2687,6 +2687,13 @@ def is_gateway_timeout_failure(
     probe = exc if exc is not None else RuntimeError(str(msg or ""))
     if is_http_524_failure(probe, msg, api_trace):
         return True
+    # httpx.ConnectTimeout/ReadTimeout/TransportError often str() to an empty
+    # message, so format_api_error() falls back to the bare class name
+    # ("ConnectTimeout", no space) — the string checks below expect "CONNECT
+    # TIMEOUT" with a space and miss it. Check the exception type directly
+    # first so this doesn't depend on message formatting at all.
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
     text = str(msg or "").strip().upper()
     if not text and exc is not None:
         text = str(exc).strip().upper()
@@ -2696,7 +2703,14 @@ def is_gateway_timeout_failure(
         return True
     if "GATEWAY TIMEOUT" in text or "GATEWAY TIME" in text:
         return True
-    if "READ TIMEOUT" in text or "CONNECT TIMEOUT" in text or "READTIMEOUT" in text:
+    if (
+        "READ TIMEOUT" in text
+        or "CONNECT TIMEOUT" in text
+        or "READTIMEOUT" in text
+        or "CONNECTTIMEOUT" in text
+        or "CONNECTERROR" in text
+        or "CONNECT ERROR" in text
+    ):
         return True
     if isinstance(exc, FlowApiError):
         raw = exc.raw

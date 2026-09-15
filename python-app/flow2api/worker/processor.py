@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from flow2api.config import (
+    GATEWAY_TIMEOUT_RETRY_MAX,
     IMAGE_POLL_MAX,
     POLICY_REJECTION_ERROR_MSG,
     POLL_INTERVAL_S,
@@ -1139,10 +1140,11 @@ class WorkerController:
                     )
                     return
                 if is_gateway_timeout_failure(exc, msg, api_trace):
-                    # 524/502/504/timeout = Cloudflare/origin — không phải lỗi tài khoản.
-                    # Retry cùng profile, không ngừng job / không ẩn profile.
+                    # 524/502/504/ConnectTimeout = mạng/gateway tạm thời — không phải
+                    # lỗi tài khoản. Requeue giữ nguyên profile, không đổi/ẩn profile,
+                    # không báo lỗi ngay ở lần đầu.
                     http_524_retry = int(retry_params.get("http_524_retry_count") or 0)
-                    if http_524_retry < RECAPTCHA_RETRY_MAX:
+                    if http_524_retry < GATEWAY_TIMEOUT_RETRY_MAX:
                         delay_s = flow_sdk.recaptcha_retry_delay(http_524_retry)
                         retry_params["http_524_retry_count"] = http_524_retry + 1
                         retry_params["retry_not_before"] = time.time() + delay_s
@@ -1158,7 +1160,7 @@ class WorkerController:
                             "worker",
                             (
                                 f"HTTP timeout/524 — giữ profile, retry "
-                                f"{http_524_retry + 1}/{RECAPTCHA_RETRY_MAX} "
+                                f"{http_524_retry + 1}/{GATEWAY_TIMEOUT_RETRY_MAX} "
                                 f"sau {delay_s:.1f}s"
                             ),
                             level="warn",
@@ -1167,7 +1169,7 @@ class WorkerController:
                         logger.warning(
                             "HTTP timeout/524 retry %s/%s rid=%s — chờ %.1fs, profile=%s",
                             http_524_retry + 1,
-                            RECAPTCHA_RETRY_MAX,
+                            GATEWAY_TIMEOUT_RETRY_MAX,
                             rid[:8],
                             delay_s,
                             str(retry_params.get("profile_id") or "-")[:12],

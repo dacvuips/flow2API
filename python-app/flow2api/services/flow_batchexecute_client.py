@@ -414,7 +414,7 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
     return session["project_id"]
 
 
-_TRANSPORT_RETRY_ATTEMPTS = 3
+_TRANSPORT_RETRY_ATTEMPTS = 10
 _TRANSPORT_RETRY_BACKOFF_S = 3.0
 # Kết nối không lên được (DNS/refused/mạng chết) nên fail nhanh — không cần
 # chờ hết timeout_s (60-120s) như timeout đọc dữ liệu thực sự. Tách riêng để
