@@ -3,10 +3,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
+
+if sys.platform == "win32":
+    # ProactorEventLoop (mặc định asyncio trên Windows) không hủy TCP connect()
+    # đang treo kịp thời — khi kernel không trả quyền điều khiển ngay, một
+    # connect timeout cấu hình 10s trong thực tế có thể mất 15-35s mới thực
+    # sự raise (quan sát được qua log httpx.ConnectTimeout kèm request=Xms
+    # vượt xa timeout đã đặt). SelectorEventLoop hủy I/O chính xác hơn nhiều.
+    # Đánh đổi: không hỗ trợ asyncio subprocess trên Windows — app này không
+    # dùng create_subprocess_exec/shell ở đâu (chỉ subprocess.run đồng bộ qua
+    # asyncio.to_thread), nên an toàn.
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
