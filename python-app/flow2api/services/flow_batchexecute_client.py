@@ -526,6 +526,16 @@ async def _post_batchexecute_http(
                 _TRANSPORT_RETRY_ATTEMPTS,
                 dns_exc,
             )
+        # httpcore hỗ trợ extensions["trace"] — callback nhận từng bước network
+        # thật (connect_tcp.started/complete, start_tls.started/complete, ...)
+        # kèm timestamp, để biết chính xác request bị "treo" ở bước nào thay vì
+        # chỉ có tổng thời gian. Chỉ log ra khi request này thất bại (tránh spam
+        # log ở mọi request thành công).
+        trace_events: list[tuple[float, str, dict]] = []
+
+        async def _trace_cb(name: str, info: dict) -> None:
+            trace_events.append((time.monotonic(), name, info))
+
         req_started = time.monotonic()
         try:
             resp = await client.post(
@@ -535,6 +545,7 @@ async def _post_batchexecute_http(
                 timeout=httpx.Timeout(
                     timeout_s, connect=_CONNECT_TIMEOUT_S, pool=_POOL_TIMEOUT_S
                 ),
+                extensions={"trace": _trace_cb},
             )
             if log_each_call:
                 logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
@@ -547,16 +558,20 @@ async def _post_batchexecute_http(
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
             req_ms = (time.monotonic() - req_started) * 1000
+            steps = ", ".join(
+                f"{name}@{(ts - req_started) * 1000:.0f}ms" for ts, name, _info in trace_events
+            )
             if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
                 break
             logger.warning(
                 "batchexecute transport error (attempt %s/%s): %s — "
-                "dns=%.0fms request=%.0fms — retry sau %.1fs",
+                "dns=%.0fms request=%.0fms steps=[%s] — retry sau %.1fs",
                 attempt,
                 _TRANSPORT_RETRY_ATTEMPTS,
                 type(exc).__name__,
                 dns_ms,
                 req_ms,
+                steps or "none",
                 _TRANSPORT_RETRY_BACKOFF_S,
             )
             await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_S)
