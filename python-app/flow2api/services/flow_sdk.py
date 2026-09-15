@@ -2694,13 +2694,6 @@ def is_gateway_timeout_failure(
     # first so this doesn't depend on message formatting at all.
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
         return True
-    # batchexecute calls now go through page.evaluate(fetch(...)) in the
-    # profile's own CDP tab (flow_batchexecute_client._post_batchexecute_http)
-    # instead of httpx — network/timeout failures there surface as
-    # _CdpFetchError wrapping the JS fetch() error name (AbortError on our
-    # own timeout, TypeError: Failed to fetch on a dropped connection, etc).
-    if type(exc).__name__ == "_CdpFetchError":
-        return True
     text = str(msg or "").strip().upper()
     if not text and exc is not None:
         text = str(exc).strip().upper()
@@ -2717,12 +2710,6 @@ def is_gateway_timeout_failure(
         or "CONNECTTIMEOUT" in text
         or "CONNECTERROR" in text
         or "CONNECT ERROR" in text
-        or "ABORTERROR" in text
-        or "FAILED TO FETCH" in text
-        or "NETWORKERROR" in text
-        or "NS_ERROR_NET" in text
-        or "CDP_NOT_RUNNING" in text
-        or "NO_FLOW_TAB" in text
     ):
         return True
     if isinstance(exc, FlowApiError):

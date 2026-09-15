@@ -416,105 +416,45 @@ async def get_project_id_from_cdp_tab(profile_id: str) -> str:
 
 _TRANSPORT_RETRY_ATTEMPTS = 10
 _TRANSPORT_RETRY_BACKOFF_S = 3.0
-# 1 lần fetch() trong tab không được treo vô hạn nếu mạng của Chrome đó chết —
-# giữ ngắn để 1 attempt fail nhanh thay vì đợi cả timeout_s.
-_FETCH_TIMEOUT_S = 20.0
+# Kết nối không lên được (DNS/refused/mạng chết) nên fail nhanh — không cần
+# chờ hết timeout_s (60-120s) như timeout đọc dữ liệu thực sự. Tách riêng để
+# 1 lần retry tốn tối đa ~10s thay vì cả timeout_s khi ConnectError lặp lại.
+_CONNECT_TIMEOUT_S = 10.0
+# Thời gian tối đa chờ lấy được 1 connection slot từ pool dùng chung khi
+# nhiều profile chạy song song — httpx mặc định dùng timeout_s (60-120s) cho
+# việc này nếu không set riêng, khiến job "treo" âm thầm chờ pool thay vì
+# fail nhanh và được retry/requeue như một lỗi mạng thật sự.
+_POOL_TIMEOUT_S = 15.0
 
-# Gửi batchexecute request qua chính tab CDP của profile (page.evaluate +
-# fetch trong ngữ cảnh trang) thay vì httpx riêng của Python — dùng đúng
-# network stack + cookie của Chrome thật, tránh lệch route/DNS/TLS giữa máy
-# chủ Python và trình duyệt. Đổi lại: cần CDP của profile đang mở sẵn (CDP
-# Auto giữ) — không tự launch Chrome mới cho mỗi request, và mỗi tab xử lý
-# JS/fetch tuần tự nên kém song song hơn connection pool httpx cũ.
-#
-# 1 kết nối playwright (browser + page) được cache và tái sử dụng cho mỗi
-# profile giữa nhiều lần gọi — poll_video_via_batchexecute một mình có thể
-# gọi hàng chục lần cho 1 video, mở/đóng connect_over_cdp mỗi lần sẽ rất chậm.
-_cdp_page_cache: dict[str, tuple[Any, Any, Any]] = {}  # profile_id -> (playwright, browser, page)
-_cdp_page_cache_locks: dict[str, asyncio.Lock] = {}
+_shared_http_client: Any = None
+_shared_http_client_lock: asyncio.Lock | None = None
 
 
-def _cdp_page_cache_lock(profile_id: str) -> asyncio.Lock:
-    lock = _cdp_page_cache_locks.get(profile_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cdp_page_cache_locks[profile_id] = lock
-    return lock
+async def _get_shared_http_client() -> Any:
+    """Lazily create one long-lived httpx.AsyncClient reused across every
+    batchexecute call, instead of opening a fresh TCP+TLS connection (and
+    connection pool) per call. Google's endpoint is called very frequently
+    (video-poll alone hits it every few seconds per running job) — reusing
+    HTTP/1.1 keep-alive connections cuts down on the ReadError/ConnectError/
+    RemoteProtocolError transport failures seen when each call pays for a
+    brand new handshake."""
+    global _shared_http_client, _shared_http_client_lock
+    import httpx
 
-
-async def _get_cdp_page_for_profile(profile_id: str):
-    """Trả về Playwright Page đã attach sẵn vào tab flow.google.com CDP của
-    profile này — tái sử dụng kết nối đã cache nếu còn sống, không reload/
-    navigate (khác _attach_flow_page, dùng cho capture session). Không tự
-    launch Chrome — nếu CDP không mở/không sẵn sàng thì báo lỗi rõ ràng để
-    caller biết cần mở CDP (CDP Auto hoặc tay) trước."""
-    async with _cdp_page_cache_lock(profile_id):
-        cached = _cdp_page_cache.get(profile_id)
-        if cached is not None:
-            _pw, _browser, page = cached
-            try:
-                if not page.is_closed():
-                    return page
-            except Exception:
-                pass
-            _cdp_page_cache.pop(profile_id, None)
-            try:
-                await _pw.stop()
-            except Exception:
-                pass
-
-        from playwright.async_api import async_playwright
-
-        slot = get_flow_cdp_slot(profile_id)
-        if not slot:
-            raise BatchExecuteError(f"cdp_slot_not_found: {profile_id}")
-        cdp = slot.cdp_url()
-        if not system_ops.cdp_endpoint_alive(cdp):
-            raise BatchExecuteError(
-                f"cdp_not_running: {profile_id} — mở CDP cho profile này trước "
-                "(CDP Auto hoặc mở tay), không tự launch cho mỗi request."
+    if _shared_http_client is not None:
+        return _shared_http_client
+    if _shared_http_client_lock is None:
+        _shared_http_client_lock = asyncio.Lock()
+    async with _shared_http_client_lock:
+        if _shared_http_client is None:
+            _shared_http_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
             )
-
-        pw = await async_playwright().start()
-        try:
-            browser = await pw.chromium.connect_over_cdp(cdp)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            pages = [p for p in context.pages if "flow.google.com" in (p.url or "")]
-            page = pages[0] if pages else None
-            if page is None:
-                raise BatchExecuteError(
-                    f"no_flow_tab: {profile_id} — chưa có tab flow.google.com đang mở."
-                )
-        except Exception:
-            await pw.stop()
-            raise
-        _cdp_page_cache[profile_id] = (pw, browser, page)
-        return page
-
-
-async def _invalidate_cdp_page_cache(profile_id: str) -> None:
-    """Bỏ kết nối đã cache cho profile này — gọi khi phát hiện nó đã chết
-    (tab đóng, browser disconnect) để lần gọi kế tiếp attach lại từ đầu."""
-    async with _cdp_page_cache_lock(profile_id):
-        cached = _cdp_page_cache.pop(profile_id, None)
-        if cached is None:
-            return
-        pw, _browser, _page = cached
-        try:
-            await pw.stop()
-        except Exception:
-            pass
-
-
-class _CdpFetchError(RuntimeError):
-    """fetch() trong tab thất bại vì lý do mạng (không phải lỗi HTTP status) —
-    tương đương httpx.TransportError/TimeoutException, được retry loop bắt
-    giống như cũ."""
+        return _shared_http_client
 
 
 async def _post_batchexecute_http(
     *,
-    profile_id: str,
     cookie_header: str,
     rpcid: str,
     project_id: str,
@@ -524,13 +464,9 @@ async def _post_batchexecute_http(
     log_each_call: bool = True,
     applet_id: str = "",
 ) -> tuple[int, str]:
-    """Send the batchexecute request via page.evaluate(fetch(...)) inside the
-    profile's own CDP tab — uses Chrome's real network stack and the tab's
-    own cookies (browsers won't let fetch() set a Cookie header manually, so
-    `cookie_header` is unused here; kept in the signature since some callers
-    still pass it for logging/back-compat) instead of a separate Python HTTP
-    client. Avoids any mismatch between the Python process's network route
-    and the browser's.
+    """Send the batchexecute request as a plain HTTP call — no browser needed at
+    all for this part, since the session cookie + f.sid/bl/at (cached in DB) plus
+    a freshly minted reCAPTCHA token are everything Google's endpoint checks.
 
     Retries a few times on bare network/transport failures (ReadError,
     ConnectError, timeouts — a dropped connection or transient DNS/TLS hiccup
@@ -540,7 +476,7 @@ async def _post_batchexecute_http(
     Does not retry HTTP error status codes — those are handled by callers
     inspecting `status` (401 triggers a session re-capture, etc).
     """
-    del cookie_header  # browser tự gắn cookie của tab — không set thủ công được qua fetch()
+    import httpx
 
     label = _rpcid_label(rpcid)
     reqid = str(int(time.time() * 1000) % 9_000_000 + 1_000_000)
@@ -562,74 +498,46 @@ async def _post_batchexecute_http(
     )
     body = f"f.req={urllib.parse.quote(freq)}&at={urllib.parse.quote(session['at'])}&"
 
-    # fetch() chạy trong ngữ cảnh trang flow.google.com nên browser tự thêm
-    # cookie/origin/referer/user-agent đúng — chỉ cần set content-type và
-    # x-same-domain giống Flow's own JS làm.
-    fetch_js = """
-        async ({url, body, timeoutMs}) => {
-            const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), timeoutMs);
-            try {
-                const resp = await fetch(url, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: {
-                        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                        'x-same-domain': '1',
-                    },
-                    body,
-                    signal: ctrl.signal,
-                });
-                const text = await resp.text();
-                return {ok: true, status: resp.status, text};
-            } catch (e) {
-                return {ok: false, error: String((e && e.name) || 'FetchError') + ': ' + String((e && e.message) || e)};
-            } finally {
-                clearTimeout(t);
-            }
-        }
-    """
-
+    headers = {
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "cookie": cookie_header,
+        "origin": "https://flow.google.com",
+        "referer": f"https://flow.google.com/project/{project_id}",
+        "user-agent": _USER_AGENT,
+        "x-same-domain": "1",
+    }
+    client = await _get_shared_http_client()
     last_exc: Exception | None = None
     for attempt in range(1, _TRANSPORT_RETRY_ATTEMPTS + 1):
         try:
-            page = await _get_cdp_page_for_profile(profile_id)
-            result = await page.evaluate(
-                fetch_js,
-                {"url": url, "body": body, "timeoutMs": int(_FETCH_TIMEOUT_S * 1000)},
+            resp = await client.post(
+                url,
+                content=body,
+                headers=headers,
+                timeout=httpx.Timeout(
+                    timeout_s, connect=_CONNECT_TIMEOUT_S, pool=_POOL_TIMEOUT_S
+                ),
             )
-            if not result.get("ok"):
-                raise _CdpFetchError(str(result.get("error") or "unknown_fetch_error"))
-            status = int(result["status"])
-            text = str(result.get("text") or "")
             if log_each_call:
-                logger.info("batchexecute %s -> HTTP %s", label, status)
+                logger.info("batchexecute %s -> HTTP %s", label, resp.status_code)
             else:
                 # video-poll gọi lặp lại mỗi vài giây tới khi xong — logger
                 # riêng của caller (poll_video_via_batchexecute) tóm tắt 1
                 # dòng khi kết thúc thay vì spam 1 dòng mỗi lần poll.
-                logger.debug("batchexecute %s -> HTTP %s", label, status)
-            return status, text
-        except _CdpFetchError as exc:
+                logger.debug("batchexecute %s -> HTTP %s", label, resp.status_code)
+            return resp.status_code, resp.text
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
-        except BatchExecuteError:
-            raise
-        except Exception as exc:
-            # Playwright/CDP-level failure (tab đóng, browser disconnect, target
-            # crashed...) — coi như connection chết, bỏ cache để lần retry kế
-            # tiếp attach lại từ đầu thay vì lặp lại lỗi tương tự.
-            last_exc = exc
-            await _invalidate_cdp_page_cache(profile_id)
-        if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
-            break
-        logger.warning(
-            "batchexecute transport error (attempt %s/%s): %s — retry sau %.1fs",
-            attempt,
-            _TRANSPORT_RETRY_ATTEMPTS,
-            type(last_exc).__name__,
-            _TRANSPORT_RETRY_BACKOFF_S,
-        )
-        await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_S)
+            if attempt >= _TRANSPORT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "batchexecute transport error (attempt %s/%s): %s — retry sau %.1fs",
+                attempt,
+                _TRANSPORT_RETRY_ATTEMPTS,
+                type(exc).__name__,
+                _TRANSPORT_RETRY_BACKOFF_S,
+            )
+            await asyncio.sleep(_TRANSPORT_RETRY_BACKOFF_S)
     assert last_exc is not None
     raise last_exc
 
@@ -783,7 +691,6 @@ async def upload_image_via_batchexecute(
         recaptcha_token=recaptcha_token,
     )
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=RPCID_UPLOAD_IMAGE,
         project_id=effective_project_id,
@@ -857,7 +764,6 @@ async def resolve_media_url_via_batchexecute(
     last_error: str = "unknown_error"
     for attempt in range(max(1, retries)):
         status, body_text = await _post_batchexecute_http(
-            profile_id=profile_id,
             cookie_header=cookie_header,
             rpcid=RPCID_GET_MEDIA_URL,
             project_id=cached["project_id"],
@@ -985,7 +891,6 @@ async def _submit_video_request(
     params_json = build_params(effective_project_id, recaptcha_token)
 
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=rpcid,
         project_id=effective_project_id,
@@ -1321,7 +1226,6 @@ async def upsample_video_via_batchexecute(
     )
 
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=RPCID_UPSAMPLE_VIDEO,
         project_id=effective_project_id,
@@ -1404,7 +1308,6 @@ async def get_video_generation_id(*, profile_id: str, media_id: str) -> str:
 
     params_json = json.dumps([None, None, [[media_id]]], separators=(",", ":"), ensure_ascii=False)
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=RPCID_POLL_VIDEO,
         project_id=cached["project_id"],
@@ -1459,7 +1362,6 @@ async def poll_video_via_batchexecute(
     while time.monotonic() < deadline:
         polls += 1
         status, body_text = await _post_batchexecute_http(
-            profile_id=profile_id,
             cookie_header=cookie_header,
             rpcid=RPCID_POLL_VIDEO,
             project_id=cached["project_id"],
@@ -1552,7 +1454,6 @@ async def gen_image_via_batchexecute(
             image_media_ids=image_media_ids,
         )
         status, body_text = await _post_batchexecute_http(
-            profile_id=profile_id,
             cookie_header=cookie_header,
             rpcid=RPCID_GEN_IMAGE,
             project_id=effective_project_id,
@@ -1807,7 +1708,6 @@ async def upsample_image_via_batchexecute(
     )
 
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=RPCID_UPSAMPLE_IMAGE,
         project_id=cached["project_id"],
@@ -1940,7 +1840,6 @@ async def gen_text_via_batchexecute(
     )
 
     status, body_text = await _post_batchexecute_http(
-        profile_id=profile_id,
         cookie_header=cookie_header,
         rpcid=RPCID_GEN_TEXT,
         project_id=cached["project_id"],
