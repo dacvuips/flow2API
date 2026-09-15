@@ -998,23 +998,6 @@ class ExtensionSession:
         finally:
             self._pending.pop(req_id, None)
 
-    async def test_connection(self) -> dict[str, Any]:
-        """Refresh ya29 via auth/session and persist (Veo3Studio POST /profiles/:id/test)."""
-        result = await self.refresh_flow_token(force=True)
-        if not result.get("ok"):
-            return {
-                "success": False,
-                "error": result.get("error") or "TOKEN_REFRESH_FAILED",
-            }
-        meta = self.to_public_dict()
-        return {
-            "success": True,
-            "message": "Connection successful! Access token retrieved and cached.",
-            "expires_at": meta.get("access_token_expires_at"),
-            "token_status": meta.get("token_status"),
-            "method": result.get("method"),
-        }
-
     async def ensure_token_fresh(self) -> bool:
         from flow2api.config import FLOW_ACCESS_TOKEN_REFRESH_BEFORE_S
         from flow2api.services.flow_profile_service import (

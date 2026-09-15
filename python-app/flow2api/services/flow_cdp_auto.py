@@ -1320,11 +1320,18 @@ async def _wait_session_or_timeout(page, *, timeout_s: float) -> bool:
         await page.wait_for_timeout(180)
 
 
-async def _navigate_flow_ui(page, slot_id: str, *, flow_url: str) -> dict[str, Any]:
+async def _navigate_flow_ui(
+    page, slot_id: str, *, flow_url: str, skip_new_project: bool = False
+) -> dict[str, Any]:
     """Sau clear session Flow: poll CTA / SSO / New project — có token là dừng.
 
     Landing: pill «Create with Google Flow». Trong app: chip «+ Dự án mới».
     Sau khi bấm New project: không click thêm, chỉ chờ session-token.
+
+    skip_new_project=True khi caller đã goto thẳng tới project_id cũ đã lưu
+    trong DB (thay vì landing) — bấm «Dự án mới» ở đây sẽ tạo project MỚI và
+    ghi đè project cũ đang muốn giữ, nên bỏ nhóm CTA đó; vẫn giữ signin/create
+    phòng khi trang bị redirect về landing/sign-in ngoài ý muốn.
     """
     del flow_url  # reload đã làm ở cycle; không goto lại ở đây
     try:
@@ -1353,7 +1360,7 @@ async def _navigate_flow_ui(page, slot_id: str, *, flow_url: str) -> dict[str, A
         groups: list[tuple[str, list[str]]] = []
         if not clicked_create:
             groups.append(("create", _CREATE_CTA_TEXTS))
-        if not clicked_new:
+        if not clicked_new and not skip_new_project:
             groups.append(("new", _NEW_PROJECT_TEXTS))
         if not signed and not clicked_create:
             groups.append(("signin", _SIGN_IN_TEXTS))
@@ -1473,13 +1480,34 @@ async def run_auto_cycle_for_slot(slot_id: str) -> dict[str, Any]:
                 cur = str(page.url or "")
             except Exception:
                 cur = ""
-            if "labs.google" in cur.lower() or "flow" in cur.lower():
+
+            # Đã từng capture project_id cho profile này → quay lại đúng project
+            # cũ thay vì vào landing rồi bấm CTA (luôn tạo project MỚI). Cookie
+            # Flow vừa bị xoá ở trên nên trang có thể tự redirect về sign-in nếu
+            # cần — _navigate_flow_ui bên dưới vẫn xử lý bước đó bình thường.
+            is_center_role = (slot.role or "bridge") == "center"
+            known_project_id: str | None = None
+            if not is_center_role:
+                from flow2api.services.flow_profile_service import get_batchexecute_session
+
+                cached_session = get_batchexecute_session(slot.profile_id())
+                known_project_id = (cached_session or {}).get("project_id") or None
+
+            if known_project_id:
+                await page.goto(
+                    f"https://flow.google.com/project/{known_project_id}",
+                    wait_until="commit",
+                    timeout=60_000,
+                )
+            elif "labs.google" in cur.lower() or "flow" in cur.lower():
                 await page.reload(wait_until="commit", timeout=45_000)
             else:
                 await page.goto(flow_url, wait_until="commit", timeout=60_000)
 
             meta["step"] = "navigate_ui"
-            nav = await _navigate_flow_ui(page, slot_id, flow_url=flow_url)
+            nav = await _navigate_flow_ui(
+                page, slot_id, flow_url=flow_url, skip_new_project=bool(known_project_id)
+            )
             clicked_create = nav.get("clicked_create")
             clicked_new = nav.get("clicked_new")
 
