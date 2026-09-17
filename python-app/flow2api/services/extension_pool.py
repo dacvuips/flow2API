@@ -934,10 +934,49 @@ class ExtensionSession:
             logger.warning("fetch_paygate_tier failed profile=%s: %s", self.profile_id[:8], exc)
             return None
 
+    async def _refresh_via_cdp_slot(self) -> dict[str, Any] | None:
+        """If this profile is backed by a live Flow CDP slot, read auth/session
+        straight from the Chrome tab (cookies in DB may be stale/revoked but the
+        browser session itself is still logged in)."""
+        from flow2api.services.flow_cdp_settings import get_flow_cdp_slot_by_profile_id
+
+        slot = get_flow_cdp_slot_by_profile_id(self.profile_id)
+        if not slot:
+            return None
+        try:
+            from flow2api.services.flow_cdp_control import sync_session
+
+            result = await sync_session(slot.id)
+        except Exception as exc:
+            logger.warning(
+                "refresh via cdp slot failed profile=%s slot=%s: %s",
+                self.profile_id[:12],
+                slot.id,
+                exc,
+            )
+            return {"ok": False, "error": f"cdp_sync_failed:{exc}"}
+        if not result.get("ok"):
+            return {"ok": False, "error": str(result.get("error") or "cdp_sync_failed")}
+        if not result.get("token_refreshed"):
+            return {
+                "ok": False,
+                "error": str(result.get("token_error") or "cdp_sync_no_token"),
+            }
+        from flow2api.services.flow_profile_service import get_stored_access_token
+
+        token = get_stored_access_token(self.profile_id) or ""
+        return {
+            "ok": bool(token),
+            "flowKey": token,
+            "email": result.get("email"),
+            "method": "cdp_slot_sync",
+        }
+
     async def refresh_flow_token(self, *, force: bool = False) -> dict[str, Any]:
         from flow2api.services.cookie_service import has_stored_cookies
         from flow2api.services.cookie_token_service import refresh_access_token_from_cookies
 
+        cookie_result: dict[str, Any] | None = None
         if has_stored_cookies(self.profile_id):
             cookie_result = await refresh_access_token_from_cookies(self.profile_id, force=force)
             if cookie_result.get("ok"):
@@ -946,8 +985,24 @@ class ExtensionSession:
                     self._browser_flow_key = token
                     self.token_captured_at = time.time()
                 return cookie_result
-            if not self._ws:
+
+        # Cookies trong DB đã stale/rỗng (Google revoke) — nếu profile này có 1 CDP
+        # slot Chrome đang mở sẵn thì đọc thẳng auth/session từ tab sống thay vì
+        # phụ thuộc extension (không còn dùng extension nữa).
+        cdp_result = await self._refresh_via_cdp_slot()
+        if cdp_result is not None:
+            if cdp_result.get("ok"):
+                token = str(cdp_result.get("flowKey") or "").strip()
+                if token:
+                    self._browser_flow_key = token
+                    self.token_captured_at = time.time()
+                return cdp_result
+            if cookie_result is not None:
                 return cookie_result
+            return cdp_result
+
+        if cookie_result is not None and not self._ws:
+            return cookie_result
 
         if not self._ws:
             return {"ok": False, "error": "extension_not_connected"}

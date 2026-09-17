@@ -227,6 +227,16 @@ def get_flow_cdp_slot(slot_id: str) -> FlowCdpSlot | None:
     return None
 
 
+def get_flow_cdp_slot_by_profile_id(profile_id: str) -> FlowCdpSlot | None:
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None
+    for s in list_flow_cdp_slots():
+        if s.id == pid or s.profile_id() == pid:
+            return s
+    return None
+
+
 def is_captcha_center_profile(profile_id: str) -> bool:
     """True nếu profile_id thuộc 1 Flow CDP slot role=center — Captcha Center
     chỉ mint reCAPTCHA cho các Gen khác, không tự nhận job Image/Video."""

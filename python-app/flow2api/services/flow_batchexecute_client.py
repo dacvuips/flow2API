@@ -1377,7 +1377,7 @@ async def poll_video_via_batchexecute(
     *,
     profile_id: str,
     media_id: str,
-    max_wait_s: float = 300.0,
+    max_wait_s: float = 120.0,
     poll_interval_s: float = 5.0,
 ) -> str:
     """Poll a submitted video generation until done, then resolve its URL.
