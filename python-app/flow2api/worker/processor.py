@@ -1143,6 +1143,43 @@ class WorkerController:
                         failed_profile[:12] or "-",
                     )
                     return
+                if "rpc_error: [5]" in msg:
+                    # Bare gRPC NOT_FOUND — startImage/referenceImage chưa được
+                    # Google index kịp (đã retry nội bộ ở _retry_media_not_found
+                    # nhưng vẫn còn NOT_FOUND). Không phải lỗi tài khoản — giữ
+                    # nguyên profile, requeue với backoff để thử lại sau.
+                    rpc5_retry = int(retry_params.get("rpc5_not_found_retry_count") or 0)
+                    if rpc5_retry < RECAPTCHA_RETRY_MAX:
+                        delay_s = flow_sdk.recaptcha_retry_delay(rpc5_retry)
+                        retry_params["rpc5_not_found_retry_count"] = rpc5_retry + 1
+                        retry_params["retry_not_before"] = time.time() + delay_s
+                        retry_params.pop("running_started_at", None)
+                        await asyncio.to_thread(
+                            activity.update_request,
+                            rid, status="queued", params=retry_params, error=None
+                        )
+                        events.publish(
+                            "request_finished", {"id": rid, "status": "queued"}
+                        )
+                        append_request_log(
+                            rid,
+                            "worker",
+                            (
+                                f"Media chưa được index (rpc_error 5) — giữ profile, "
+                                f"retry {rpc5_retry + 1}/{RECAPTCHA_RETRY_MAX} sau {delay_s:.1f}s"
+                            ),
+                            level="warn",
+                            profile_id=str(retry_params.get("profile_id") or "") or None,
+                        )
+                        logger.warning(
+                            "rpc_error[5] media not found retry %s/%s rid=%s — chờ %.1fs, profile=%s",
+                            rpc5_retry + 1,
+                            RECAPTCHA_RETRY_MAX,
+                            rid[:8],
+                            delay_s,
+                            str(retry_params.get("profile_id") or "-")[:12],
+                        )
+                        return
                 if is_gateway_timeout_failure(exc, msg, api_trace):
                     # 524/502/504/ConnectTimeout = mạng/gateway tạm thời — không phải
                     # lỗi tài khoản. Requeue giữ nguyên profile, không đổi/ẩn profile,
@@ -1182,19 +1219,40 @@ class WorkerController:
                         return
                 if _is_batchexecute_session_recovery_failure(exc):
                     # CDP-only lane's session expired (401) and re-capturing it
-                    # failed too — almost certainly because the profile's CDP
-                    # tab isn't open/reachable right now. Rather than fail the
-                    # task outright, treat it like any other account-level
-                    # problem: switch to another profile that's ready, so the
-                    # rest of the queue doesn't wait on this one profile's CDP
-                    # coming back. The switched-off profile stays eligible for
-                    # auto-CDP recovery (flow_cdp_auto.py) same as any other
-                    # account error.
-                    self._handle_profile_error_switch(
+                    # failed too — most likely the profile's CDP tab isn't
+                    # open/reachable right now. Keep the task on this profile
+                    # and requeue with backoff instead of switching profiles —
+                    # the profile will recover its own f.sid session (CDP auto
+                    # recovery / next open) and can pick the task back up.
+                    session_retry = int(retry_params.get("batchexec_session_retry_count") or 0)
+                    delay_s = flow_sdk.recaptcha_retry_delay(session_retry)
+                    retry_params["batchexec_session_retry_count"] = session_retry + 1
+                    retry_params["retry_not_before"] = time.time() + delay_s
+                    retry_params.pop("running_started_at", None)
+                    await asyncio.to_thread(
+                        activity.update_request,
+                        rid, status="queued", params=retry_params, error=None
+                    )
+                    events.publish(
+                        "request_finished", {"id": rid, "status": "queued"}
+                    )
+                    failed_profile = str(retry_params.get("profile_id") or "").strip()
+                    append_request_log(
                         rid,
-                        retry_params,
-                        msg,
-                        label="batchexecute_session_expired",
+                        "worker",
+                        (
+                            f"Session hết hạn (401) — giữ profile, chờ lấy lại "
+                            f"fsid rồi retry {session_retry + 1} sau {delay_s:.1f}s"
+                        ),
+                        level="warn",
+                        profile_id=failed_profile or None,
+                    )
+                    logger.warning(
+                        "batchexecute session expired, keep profile retry %s rid=%s — chờ %.1fs, profile=%s",
+                        session_retry + 1,
+                        rid[:8],
+                        delay_s,
+                        failed_profile[:12] or "-",
                     )
                     return
                 if is_profile_account_switch_failure(exc, msg, api_trace):

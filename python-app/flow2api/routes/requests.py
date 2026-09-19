@@ -362,6 +362,15 @@ async def cancel_all_requests(_=Depends(_auth_key_id)):
     return {"canceled": len(ids), "ids": ids}
 
 
+@router.delete("/finished")
+async def clear_finished_requests_route(_=Depends(_auth_key_id)):
+    from flow2api.services.task_retention import clear_finished_requests
+
+    deleted, ids = clear_finished_requests()
+    events.publish("request_finished", {"id": "", "status": "cleared"})
+    return {"deleted": deleted, "ids": ids}
+
+
 @router.post("/{request_id}/retry")
 async def retry_request(request_id: str, api_key_id: int = Depends(_auth_key_id)):
     row = activity.get_request(request_id)

@@ -220,6 +220,11 @@ UPSAMPLE_IMAGE_PATH = "/v1/flow/upsampleImage"
 VIDEO_RESOLUTION_1080P = "VIDEO_RESOLUTION_1080P"
 VIDEO_UPSAMPLE_MODEL_KEY = "veo_3_1_upsampler_1080p"
 VEO_UPSAMPLE_RECREATE_SOURCE_ERROR = "Veo error: please recreate the original video"
+IMAGE_UPSAMPLE_SOURCE_NOT_FOUND_ERROR = "video upsample không còn nằm trên hệ thống"
+VIDEO_UPSAMPLE_GENERATION_ID_NOT_FOUND_ERROR = (
+    "generation_id_not_found_in_poll_response: video không còn nằm trên hệ thống, "
+    "không thể tham chiếu để upsample"
+)
 
 OMNI_FLASH_QUALITY = "omni_flash"
 OMNI_EDIT_MODEL_KEY = "abra_edit"
@@ -1735,12 +1740,20 @@ async def upsample_image(
         )
 
         target = "4k" if "4K" in target_resolution.upper() else "2k"
-        encoded = await _call_with_401_retry(
-            client.profile_id,
-            lambda: upsample_image_via_batchexecute(
-                profile_id=client.profile_id, media_id=media_id, target=target
-            ),
-        )
+        try:
+            encoded = await _call_with_401_retry(
+                client.profile_id,
+                lambda: upsample_image_via_batchexecute(
+                    profile_id=client.profile_id, media_id=media_id, target=target
+                ),
+            )
+        except Exception as exc:
+            if "rpc_error: [3]" in str(exc):
+                raise FlowApiError(
+                    IMAGE_UPSAMPLE_SOURCE_NOT_FOUND_ERROR,
+                    step="image_upsample_submit",
+                ) from exc
+            raise
         return {"encoded_image": encoded}
 
     tier = _require_tier(client)
@@ -1866,9 +1879,17 @@ async def upsample_video(
         )
 
         async def _do() -> dict:
-            generation_id = await get_video_generation_id(
-                profile_id=client.profile_id, media_id=media_id
-            )
+            try:
+                generation_id = await get_video_generation_id(
+                    profile_id=client.profile_id, media_id=media_id
+                )
+            except Exception as exc:
+                if "generation_id_not_found_in_poll_response" in str(exc):
+                    raise FlowApiError(
+                        VIDEO_UPSAMPLE_GENERATION_ID_NOT_FOUND_ERROR,
+                        step="video_upsample_submit",
+                    ) from exc
+                raise
             upsampled_media_id = await upsample_video_via_batchexecute(
                 profile_id=client.profile_id,
                 project_id=project_id,

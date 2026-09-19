@@ -291,6 +291,35 @@ def purge_old_requests(keep: int | None = None) -> int:
     return deleted
 
 
+def clear_finished_requests() -> tuple[int, list[str]]:
+    """Delete every request row (+ its media/input files) that is NOT queued
+    or running — i.e. completed/failed/canceled tasks. Used by the dashboard's
+    "Xóa dữ liệu ảnh/video" button. Returns (deleted_count, deleted_ids)."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(RequestRecord)
+            .filter(~RequestRecord.status.in_(_ACTIVE_STATUSES))
+            .all()
+        )
+        if not rows:
+            return 0, []
+        ids: list[str] = []
+        for row in rows:
+            media_ids = collect_request_media_ids(row)
+            _purge_row_files(row, media_ids, delete_inputs=True)
+            ids.append(row.id)
+            db.delete(row)
+        db.commit()
+        logger.info("cleared %s finished task row(s) via manual clear", len(ids))
+        return len(ids), ids
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def purge_storage(
     media_keep: int | None = None,
     meta_keep: int | None = None,
